@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Black">
+    <option name="sdkName" value="Python 3.9" />
+  </component>
+  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.10.20 (sftp://rag_official@172.18.218.245:22/home/rag_official/.conda/envs/lab_rag_app/bin/python3.10)" project-jdk-type="Python SDK" />
+</project>

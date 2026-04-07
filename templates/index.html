@@ -1,0 +1,1109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LAB-403 RAG 知识库内部问答系统</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+    <!-- MathJax：用于渲染 LaTeX 数学公式 -->
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']]
+            },
+            svg: {
+                fontCache: 'global'
+            },
+            options: {
+                skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
+            }
+        };
+    </script>
+    <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+    <style>
+        :root {
+            --bg: #f4f7fb;
+            --panel: #ffffff;
+            --border: #e5e7eb;
+            --text: #111827;
+            --subtext: #6b7280;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --assistant-bg: #f8fafc;
+            --user-bg: #eaf2ff;
+            --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+            --radius: 16px;
+            /* 页面各部分高度常量 */
+            --page-v-padding: 44px;       /* margin-top(20) + padding-bottom(24) */
+            --header-height: 120px;        /* header 估算高度（含 margin-bottom:18px） */
+            --footer-height: 36px;         /* footer-note 估算高度（含 margin-top:18px） */
+            /* 左右两栏可用高度 */
+            --columns-height: calc(100vh - var(--page-v-padding) - var(--header-height) - var(--footer-height));
+        }
+        * {
+            box-sizing: border-box;
+        }
+        html, body {
+            height: 100%;
+            margin: 0;
+        }
+        body {
+            font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+            color: var(--text);
+            background: var(--bg);
+        }
+        .page {
+            max-width: 1680px;
+            margin: 20px auto;
+            padding: 0 20px 24px;
+            display: flex;
+            flex-direction: column;
+            min-height: calc(100vh - 40px);
+        }
+        .header {
+            background: linear-gradient(135deg, #eef5ff, #ffffff);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 24px 28px;
+            box-shadow: var(--shadow);
+            margin-bottom: 18px;
+            flex: 0 0 auto;
+        }
+        .header h1 {
+            margin: 0 0 10px;
+            font-size: 30px;
+            color: #0f172a;
+        }
+        .header p {
+            margin: 0;
+            color: var(--subtext);
+            line-height: 1.7;
+            font-size: 15px;
+        }
+        /* =============================================
+           核心布局：两列等高，高度由 CSS 变量控制
+           ============================================= */
+        .layout {
+            display: grid;
+            grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+            gap: 18px;
+            /* 两栏高度固定为可用高度，不随内容撑开 */
+            height: var(--columns-height);
+            min-height: 480px;
+            flex: 1 1 auto;
+        }
+        /* ---------- 左栏：flex 列，高度固定，子卡片分配空间 ---------- */
+        .left-column {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+            height: 100%;   /* 等于 layout 的 height */
+            overflow: hidden; /* 不让左栏整体溢出 */
+        }
+        /* ---------- 右栏：整列滚动，高度固定 ---------- */
+        .right-column {
+            min-width: 0;
+            height: 100%;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding-right: 4px;
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+        /* =============================================
+           左栏内三张卡片的伸缩策略
+           ============================================= */
+        /* 提问面板：固定收缩，不伸展 */
+        .card-question {
+            flex: 0 0 auto;
+        }
+        /* 当前回答：优先占用较多空间，内部滚动 */
+        .card-answer {
+            flex: 2 1 0;
+            min-height: 120px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        /* 历史对话：占用剩余空间，内部滚动 */
+        .card-history {
+            flex: 1 1 0;
+            min-height: 80px;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        /* card-answer 和 card-history 的 card-body 需要撑满并滚动 */
+        .card-answer .card-body,
+        .card-history .card-body {
+            flex: 1 1 0;
+            min-height: 0;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        /* =============================================
+           通用卡片样式
+           ============================================= */
+        .card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            min-width: 0;
+        }
+        /* 右栏卡片不参与 flex 伸缩，随内容自然高度 */
+        .right-column .card {
+            flex: 0 0 auto;
+        }
+        .card-header {
+            padding: 18px 20px;
+            border-bottom: 1px solid var(--border);
+            font-weight: 700;
+            font-size: 17px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex: 0 0 auto;
+        }
+        .card-body {
+            padding: 18px 20px;
+            min-width: 0;
+        }
+        .input-wrap {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        textarea {
+            width: 100%;
+            min-height: 140px;
+            resize: vertical;
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 16px;
+            font-size: 16px;
+            line-height: 1.75;
+            outline: none;
+            transition: border-color .2s, box-shadow .2s;
+        }
+        textarea:focus {
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 4px rgba(37,99,235,.12);
+        }
+        .btn-row {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        button {
+            appearance: none;
+            border: none;
+            border-radius: 12px;
+            padding: 11px 18px;
+            font-size: 15px;
+            cursor: pointer;
+            transition: all .2s;
+        }
+        .btn-primary {
+            background: var(--primary);
+            color: #fff;
+        }
+        .btn-primary:hover {
+            background: var(--primary-hover);
+        }
+        .btn-primary:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+        .btn-secondary {
+            background: #eef2ff;
+            color: #374151;
+        }
+        .btn-secondary:hover {
+            background: #e0e7ff;
+        }
+        .btn-danger {
+            background: var(--danger);
+            color: #fff;
+        }
+        .btn-danger:hover {
+            background: var(--danger-hover);
+        }
+        .status {
+            min-height: 24px;
+            margin-top: 4px;
+            font-size: 14px;
+        }
+        .status.loading { color: #b45309; }
+        .status.error { color: var(--danger); }
+        /* 当前回答：充满父级 card-body 并滚动 */
+        .answer-box {
+            flex: 1 1 0;
+            min-height: 0;
+            overflow-y: auto;
+            padding-right: 6px;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            font-size: 16px;
+            line-height: 1.85;
+        }
+        /* 历史对话：充满父级 card-body 并滚动 */
+        .chat-list {
+            flex: 1 1 0;
+            min-height: 0;
+            overflow-y: auto;
+            padding-right: 6px;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+        .msg {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+        .msg-label {
+            font-size: 13px;
+            color: var(--subtext);
+            margin-bottom: 6px;
+            padding: 0 4px;
+        }
+        .bubble {
+            border-radius: 14px;
+            padding: 16px 18px;
+            line-height: 1.8;
+            border: 1px solid var(--border);
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+        .msg.user .bubble {
+            background: var(--user-bg);
+        }
+        .msg.assistant .bubble {
+            background: var(--assistant-bg);
+        }
+        .route-box,
+        .catalog-list,
+        .retrieval-list {
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .catalog-list,
+        .retrieval-list {
+            overflow-x: hidden;
+        }
+        .route-card,
+        .catalog-card,
+        .retrieval-summary {
+            background: #f8f9fb;
+            border: 1px solid #e6eaf0;
+            border-radius: 8px;
+            padding: 10px 12px;
+            margin-bottom: 12px;
+        }
+        .catalog-section-title {
+            font-weight: 600;
+            margin: 12px 0 8px;
+            color: #333;
+        }
+        .catalog-item {
+            padding: 8px 10px;
+            border: 1px solid #eceff4;
+            border-radius: 8px;
+            margin-bottom: 8px;
+            background: #fff;
+        }
+        .catalog-index {
+            color: #666;
+            margin-right: 4px;
+        }
+        .catalog-type {
+            color: #2457d6;
+            font-weight: 600;
+            margin-right: 6px;
+        }
+        .catalog-name {
+            font-weight: 500;
+        }
+        .catalog-path {
+            margin-top: 4px;
+            color: #666;
+            font-size: 12px;
+            word-break: break-all;
+        }
+        .retrieval-card {
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            background: #fcfcfd;
+            min-width: 0;
+            margin-bottom: 14px;
+        }
+        .retrieval-top {
+            padding: 14px 16px;
+            background: #f9fafb;
+            border-bottom: 1px solid var(--border);
+        }
+        .retrieval-title {
+            font-weight: 700;
+            font-size: 18px;
+            margin-bottom: 8px;
+            color: #111827;
+            word-break: break-word;
+        }
+        .retrieval-meta {
+            font-size: 15px;
+            color: var(--subtext);
+            line-height: 1.75;
+            word-break: break-word;
+        }
+        .retrieval-content {
+            padding: 16px;
+            min-width: 0;
+        }
+        .retrieval-preview,
+        .retrieval-full {
+            white-space: pre-wrap;
+            line-height: 1.9;
+            color: #1f2937;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            font-size: 16px;
+        }
+        .retrieval-full {
+            display: none;
+        }
+        .toggle-link {
+            margin-top: 12px;
+            display: inline-block;
+            color: var(--primary);
+            cursor: pointer;
+            font-size: 15px;
+            user-select: none;
+        }
+        .muted {
+            color: var(--subtext);
+        }
+        .markdown-body {
+            color: var(--text);
+            line-height: 1.85;
+            word-break: break-word;
+            overflow-wrap: anywhere;
+            font-size: 16px;
+        }
+        .markdown-body h1,
+        .markdown-body h2,
+        .markdown-body h3,
+        .markdown-body h4,
+        .markdown-body h5,
+        .markdown-body h6 {
+            margin: 1em 0 .6em;
+            line-height: 1.5;
+        }
+        .markdown-body p {
+            margin: .7em 0;
+        }
+        .markdown-body ul,
+        .markdown-body ol {
+            margin: .7em 0;
+            padding-left: 1.8em;
+        }
+        .markdown-body li {
+            margin: .35em 0;
+        }
+        .markdown-body blockquote {
+            margin: .9em 0;
+            padding: .9em 1em;
+            border-left: 4px solid #93c5fd;
+            background: #eff6ff;
+            color: #374151;
+            border-radius: 8px;
+        }
+        .markdown-body code {
+            background: #f3f4f6;
+            padding: 2px 6px;
+            border-radius: 6px;
+            font-family: Consolas, Monaco, monospace;
+            font-size: .92em;
+        }
+        .markdown-body pre {
+            background: #0f172a;
+            color: #e5e7eb;
+            padding: 16px;
+            border-radius: 10px;
+            overflow-x: auto;
+            white-space: pre;
+            margin: 14px 0;
+        }
+        .markdown-body pre code {
+            background: transparent;
+            padding: 0;
+            color: inherit;
+        }
+        .markdown-body table {
+            display: block;
+            width: 100%;
+            overflow-x: auto;
+            border-collapse: collapse;
+            margin: 14px 0;
+        }
+        .markdown-body th,
+        .markdown-body td {
+            border: 1px solid var(--border);
+            padding: 9px 12px;
+            text-align: left;
+            white-space: nowrap;
+        }
+        .markdown-body th {
+            background: #f9fafb;
+        }
+        .footer-note {
+            margin-top: 18px;
+            text-align: center;
+            color: var(--subtext);
+            font-size: 13px;
+            flex: 0 0 auto;
+        }
+        .cursor-blink {
+            display: inline-block;
+            width: 2px;
+            height: 18px;
+            background-color: var(--primary);
+            vertical-align: middle;
+            margin-left: 4px;
+            animation: blink 1s step-end infinite;
+        }
+        @keyframes blink {
+            50% { opacity: 0; }
+        }
+        /* =============================================
+           响应式：窄屏时退回自然流布局
+           ============================================= */
+        @media (max-width: 1100px) {
+            .layout {
+                grid-template-columns: 1fr;
+                height: auto;
+                min-height: auto;
+            }
+            .left-column {
+                height: auto;
+                overflow: visible;
+            }
+            .card-answer,
+            .card-history {
+                flex: 0 0 auto;
+            }
+            .card-answer .card-body,
+            .card-history .card-body {
+                overflow: visible;
+                flex: unset;
+            }
+            .answer-box {
+                min-height: 260px;
+                max-height: 520px;
+                flex: unset;
+            }
+            .chat-list {
+                min-height: 220px;
+                max-height: 420px;
+                flex: unset;
+            }
+            .right-column {
+                height: auto;
+                overflow: visible;
+                padding-right: 0;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="page">
+    <div class="header">
+        <h1>LAB-403 RAG 知识库内部问答系统</h1>
+        <p>基于 CPU 服务器资源，部署于 GPU 服务器上的检索增强生成系统，用于查询内部文档相关问题。</p>
+    </div>
+    <div class="layout">
+        <!-- 左栏 -->
+        <div class="left-column" id="leftColumn">
+            <!-- 提问面板：固定高度，不伸缩 -->
+            <div class="card card-question">
+                <div class="card-header">提问面板</div>
+                <div class="card-body">
+                    <div class="input-wrap">
+                        <textarea id="question" placeholder="请输入你的问题..."></textarea>
+                        <div class="btn-row">
+                            <button id="submitBtn" class="btn-primary" onclick="askQuestion()">提交问题</button>
+                            <button class="btn-danger" onclick="clearHistory()">清空历史</button>
+                            <button class="btn-secondary" onclick="copyQuestion()">复制问题</button>
+                        </div>
+                        <div id="status" class="status"></div>
+                    </div>
+                </div>
+            </div>
+            <!-- 当前回答：flex 伸展，内部滚动 -->
+            <div class="card card-answer">
+                <div class="card-header">
+                    <span>当前回答</span>
+                    <button class="btn-secondary" onclick="copyLatestAnswer()">复制</button>
+                </div>
+                <div class="card-body">
+                    <div id="answer" class="answer-box markdown-body muted">暂无回答</div>
+                </div>
+            </div>
+            <!-- 历史对话：flex 伸展，内部滚动 -->
+            <div class="card card-history">
+                <div class="card-header">历史对话</div>
+                <div class="card-body">
+                    <div id="history" class="chat-list">
+                        <!-- 历史记录由 JS 渲染 -->
+                    </div>
+                </div>
+            </div>
+        </div>
+        <!-- 右栏：整列滚动 -->
+        <div class="right-column" id="rightColumn">
+            <div class="card">
+                <div class="card-header">查询分析</div>
+                <div class="card-body">
+                    <div id="routeInfo" class="route-box">
+                        <div class="muted">暂无路由信息</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card" id="catalogCard">
+                <div class="card-header">目录 / 文件结果</div>
+                <div class="card-body">
+                    <div id="catalogResult" class="catalog-list">
+                        <div class="muted">暂无目录或文件结果</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card" id="retrievalCard">
+                <div class="card-header">知识库检索结果</div>
+                <div class="card-body">
+                    <div id="retrievals" class="retrieval-list">
+                        <div class="muted">暂无检索结果</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="footer-note">
+        网址：http://172.18.218.245:5000。AI 生成内容，请注意依据来源自行查询辨别！若遇到问题，请联系韦子扬、翁文曦。
+    </div>
+</div>
+<script>
+    let latestAnswerText = "";
+    let currentRoute = "";
+    let latestRouteInfo = null;
+    let latestFileResult = null;
+    let latestRetrievals = [];
+    /* ---------- 右栏高度同步（纯 CSS 控制，JS 仅处理 header 实测高度修正） ---------- */
+    function syncLayoutHeight() {
+        if (window.innerWidth <= 1100) return;
+        const header = document.querySelector(".header");
+        const footer = document.querySelector(".footer-note");
+        const layout = document.querySelector(".layout");
+        if (!header || !footer || !layout) return;
+        // 使用实测高度替代 CSS 变量估算，保证精准
+        const headerH = header.getBoundingClientRect().height;
+        const footerH = footer.getBoundingClientRect().height;
+        const pageMargin = 20;      // margin-top
+        const pagePaddingB = 24;    // padding-bottom
+        const headerMB = 18;        // margin-bottom of header
+        const layoutMT = 0;
+        const footerMT = 18;        // margin-top of footer-note
+        const available = window.innerHeight
+            - pageMargin
+            - pagePaddingB
+            - headerH
+            - headerMB
+            - footerH
+            - footerMT
+            - 4; // 少量余量防出现滚动条
+        const finalH = Math.max(available, 480);
+        layout.style.height = finalH + "px";
+    }
+    window.addEventListener("load", syncLayoutHeight);
+    window.addEventListener("resize", syncLayoutHeight);
+    /* ---------- Markdown ---------- */
+    marked.setOptions({
+        gfm: true,
+        breaks: true
+    });
+    function renderMarkdown(text) {
+        return DOMPurify.sanitize(marked.parse(text || ""));
+    }
+    function escapeHtml(text) {
+        const d = document.createElement("div");
+        d.textContent = text || "";
+        return d.innerHTML;
+    }
+    function setStatus(msg = "", type = "") {
+        const el = document.getElementById("status");
+        el.className = "status";
+        if (type) el.classList.add(type);
+        el.textContent = msg;
+    }
+    async function renderMarkdownToElement(el, text, withCursor = false) {
+        if (!el) return;
+        const html = renderMarkdown(text || "");
+        el.innerHTML = withCursor
+            ? html + "<span class='cursor-blink'></span>"
+            : html;
+        el.querySelectorAll("pre code").forEach(block => {
+            try { hljs.highlightElement(block); } catch (e) {}
+        });
+        if (window.MathJax && window.MathJax.typesetPromise) {
+            try {
+                await MathJax.typesetPromise([el]);
+            } catch (err) {
+                console.error("MathJax render error:", err);
+            }
+        }
+    }
+    async function renderHistory(history) {
+        const box = document.getElementById("history");
+        if (!history || !history.length) {
+            box.innerHTML = '<div class="muted">暂无历史对话</div>';
+            return;
+        }
+        box.innerHTML = history.map(i => `
+            <div class="msg ${i.role === 'user' ? 'user' : 'assistant'}">
+                <div class="msg-label">${i.role === 'user' ? '用户' : '助手'}</div>
+                <div class="bubble">
+                    <div class="history-content markdown-body">${renderMarkdown(i.content || "")}</div>
+                </div>
+            </div>
+        `).join("");
+        box.querySelectorAll("pre code").forEach(block => {
+            try { hljs.highlightElement(block); } catch (e) {}
+        });
+        if (window.MathJax && window.MathJax.typesetPromise) {
+            try {
+                await MathJax.typesetPromise([box]);
+            } catch (err) {
+                console.error("MathJax history render error:", err);
+            }
+        }
+        box.scrollTop = box.scrollHeight;
+    }
+    /* ---------- 路由信息 ---------- */
+    function routeLabel(route) {
+        if (route === "rag_search") return "知识库检索问答";
+        if (route === "file_list") return "目录/文件枚举";
+        if (route === "hybrid") return "混合模式";
+        return route || "未知";
+    }
+    function renderRouteInfo(info) {
+        const box = document.getElementById("routeInfo");
+        latestRouteInfo = info || null;
+        if (!info) {
+            box.innerHTML = '<div class="muted">暂无路由信息</div>';
+            return;
+        }
+        box.innerHTML = `
+            <div class="route-card">
+                <div><strong>当前方案：</strong>${escapeHtml(routeLabel(info.route))}</div>
+                <div><strong>路由标识：</strong>${escapeHtml(info.route || "")}</div>
+                <div><strong>目标对象：</strong>${escapeHtml(info.route_target || "")}</div>
+                <div><strong>原因：</strong>${escapeHtml(info.route_reason || "")}</div>
+            </div>
+        `;
+        togglePanelsByRoute(info.route);
+    }
+    function togglePanelsByRoute(route) {
+        const catalogCard = document.getElementById("catalogCard");
+        const retrievalCard = document.getElementById("retrievalCard");
+        if (route === "rag_search") {
+            catalogCard.style.display = "none";
+            retrievalCard.style.display = "block";
+        } else if (route === "file_list") {
+            catalogCard.style.display = "block";
+            retrievalCard.style.display = "none";
+        } else if (route === "hybrid") {
+            catalogCard.style.display = "block";
+            retrievalCard.style.display = "block";
+        } else {
+            catalogCard.style.display = "block";
+            retrievalCard.style.display = "block";
+        }
+    }
+    /* ---------- 目录/文件结果 ---------- */
+    function renderCatalogResult(fileResult) {
+        const box = document.getElementById("catalogResult");
+        latestFileResult = fileResult || null;
+        if (!fileResult) {
+            box.innerHTML = '<div class="muted">暂无目录或文件结果</div>';
+            return;
+        }
+        const mode = fileResult.mode || "";
+        if (mode === "filesystem_directory") {
+            const matchedDir = fileResult.matched_dir || "";
+            const dirs = fileResult.directories || [];
+            const files = fileResult.files || [];
+            let html = `
+                <div class="catalog-card">
+                    <div><strong>模式：</strong>目录定位</div>
+                    <div><strong>匹配目录：</strong>${escapeHtml(matchedDir)}</div>
+                </div>
+            `;
+            if (dirs.length) {
+                html += `<div class="catalog-section-title">下一级子目录</div>`;
+                html += dirs.map((d, i) => `
+                    <div class="catalog-item">
+                        <span class="catalog-index">${i + 1}.</span>
+                        <span class="catalog-type">[目录]</span>
+                        <span class="catalog-name">${escapeHtml(d.name || "")}</span>
+                        <div class="catalog-path">${escapeHtml(d.rel_path || "")}</div>
+                    </div>
+                `).join("");
+            }
+            if (files.length) {
+                html += `<div class="catalog-section-title">该目录下文件</div>`;
+                html += files.map((f, i) => `
+                    <div class="catalog-item">
+                        <span class="catalog-index">${i + 1}.</span>
+                        <span class="catalog-type">[文件]</span>
+                        <span class="catalog-name">${escapeHtml(f.name || "")}</span>
+                        <div class="catalog-path">${escapeHtml(f.rel_path || "")}</div>
+                    </div>
+                `).join("");
+            }
+            if (!dirs.length && !files.length) {
+                html += `<div class="muted">该目录下未发现子目录或文件。</div>`;
+            }
+            box.innerHTML = html;
+            return;
+        }
+        const entries = fileResult.entries || [];
+        if (!entries.length) {
+            box.innerHTML = '<div class="muted">未找到匹配的目录或文件。</div>';
+            return;
+        }
+        let html = `
+            <div class="catalog-card">
+                <div><strong>模式：</strong>${escapeHtml(mode || "搜索")}</div>
+                <div><strong>结果数：</strong>${entries.length}</div>
+            </div>
+        `;
+        html += entries.slice(0, 100).map((item, i) => {
+            const type = item.type || "file";
+            const title = item.doc_title || item.file_name || item.name || "未知";
+            const extra = item.count != null ? `，chunks: ${item.count}` : "";
+            const score = item.score != null ? `，score: ${item.score}` : "";
+            return `
+                <div class="catalog-item">
+                    <span class="catalog-index">${i + 1}.</span>
+                    <span class="catalog-type">[${escapeHtml(type === "directory" ? "目录" : "文件")}]</span>
+                    <span class="catalog-name">${escapeHtml(title)}</span>
+                    <div class="catalog-path">${escapeHtml(item.rel_path || "")}${escapeHtml(extra)}${escapeHtml(score)}</div>
+                </div>
+            `;
+        }).join("");
+        box.innerHTML = html;
+    }
+    /* ---------- 检索结果 ---------- */
+    function renderRetrievals(list, retrievalMeta = null) {
+        const box = document.getElementById("retrievals");
+        latestRetrievals = list || [];
+        let headerHtml = "";
+        if (retrievalMeta) {
+            headerHtml = `
+                <div class="retrieval-summary">
+                    <div><strong>改写问题：</strong>${escapeHtml(retrievalMeta.rewritten_question || "")}</div>
+                    <div><strong>关键词：</strong>${escapeHtml((retrievalMeta.keywords || []).join("、"))}</div>
+                    <div><strong>检索查询：</strong>${escapeHtml((retrievalMeta.queries || []).join(" | "))}</div>
+                </div>
+            `;
+        }
+        if (!list || !list.length) {
+            box.innerHTML = headerHtml + '<div class="muted">暂无检索结果</div>';
+            return;
+        }
+        box.innerHTML = headerHtml + list.map((item, idx) => {
+            const pid = `preview-${idx}`;
+            const fid = `full-${idx}`;
+            const bid = `btn-${idx}`;
+            const previewText = item.preview ?? "暂无预览";
+            const fullText = item.content ?? item.preview ?? "暂无全文内容";
+            return `
+                <div class="retrieval-card">
+                    <div class="retrieval-top">
+                        <div class="retrieval-title">片段 ${escapeHtml(String(item.index ?? idx + 1))}</div>
+                        <div class="retrieval-meta">
+                            标题：${escapeHtml(String(item.doc_title ?? "未知标题"))}<br>
+                            文件：${escapeHtml(String(item.file_name ?? "未知文件"))}<br>
+                            路径：${escapeHtml(String(item.rel_path ?? "未知路径"))}<br>
+                            页码：${escapeHtml(String(item.page ?? "未知页码"))}<br>
+                            分数：${escapeHtml(String(item.rerank_score ?? "N/A"))}
+                        </div>
+                    </div>
+                    <div class="retrieval-content">
+                        <div id="${pid}" class="retrieval-preview">${escapeHtml(previewText)}</div>
+                        <div id="${fid}" class="retrieval-full" style="display:none;">${escapeHtml(fullText)}</div>
+                        <span id="${bid}" class="toggle-link" onclick="toggleRetrieval('${pid}','${fid}','${bid}')">展开全文</span>
+                    </div>
+                </div>
+            `;
+        }).join("");
+    }
+    function toggleRetrieval(pid, fid, bid) {
+        const preview = document.getElementById(pid);
+        const full = document.getElementById(fid);
+        const btn = document.getElementById(bid);
+        if (!preview || !full || !btn) return;
+        const expanded = full.style.display === "block";
+        if (expanded) {
+            full.style.display = "none";
+            preview.style.display = "block";
+            btn.textContent = "展开全文";
+        } else {
+            full.style.display = "block";
+            preview.style.display = "none";
+            btn.textContent = "收起全文";
+        }
+    }
+    function resetRightPanel() {
+        currentRoute = "";
+        latestRouteInfo = null;
+        latestFileResult = null;
+        latestRetrievals = [];
+        renderRouteInfo(null);
+        renderCatalogResult(null);
+        renderRetrievals([]);
+        document.getElementById("catalogCard").style.display = "block";
+        document.getElementById("retrievalCard").style.display = "block";
+    }
+    /* ---------- 流式请求 ---------- */
+    async function askQuestion() {
+        const qi = document.getElementById("question");
+        const ab = document.getElementById("answer");
+        const submitBtn = document.getElementById("submitBtn");
+        const q = qi.value.trim();
+        if (!q) {
+            setStatus("请输入问题后再提交。", "error");
+            return;
+        }
+        submitBtn.disabled = true;
+        setStatus("正在分析问题...", "loading");
+        ab.classList.remove("muted");
+        latestAnswerText = "";
+        ab.innerHTML = "<span class='cursor-blink'></span>";
+        resetRightPanel();
+        try {
+            const res = await fetch("/ask_stream", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ question: q })
+            });
+            if (!res.ok) {
+                let msg = `HTTP Error: ${res.status}`;
+                try {
+                    const err = await res.json();
+                    if (err && err.error) msg = err.error;
+                } catch (_) {}
+                throw new Error(msg);
+            }
+            const reader = res.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let buffer = "";
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n\n");
+                buffer = lines.pop();
+                for (const line of lines) {
+                    if (!line.startsWith("data: ")) continue;
+                    const jsonStr = line.substring(6);
+                    try {
+                        const data = JSON.parse(jsonStr);
+                        if (data.type === "start") {
+                            setStatus("已提交问题，开始处理...", "loading");
+                        }
+                        else if (data.type === "metadata" && data.stage === "route") {
+                            currentRoute = data.route || "";
+                            renderRouteInfo(data);
+                            if (currentRoute === "rag_search") {
+                                setStatus("已选择：知识库检索问答", "loading");
+                            } else if (currentRoute === "file_list") {
+                                setStatus("已选择：目录/文件枚举", "loading");
+                            } else if (currentRoute === "hybrid") {
+                                setStatus("已选择：混合模式", "loading");
+                            } else {
+                                setStatus("正在处理...", "loading");
+                            }
+                        }
+                        else if (data.type === "tool") {
+                            renderCatalogResult(data.content);
+                            if (currentRoute === "file_list") {
+                                setStatus("目录/文件结果已获取，正在生成回答...", "loading");
+                            } else if (currentRoute === "hybrid") {
+                                setStatus("目录/文件结果已获取，继续检索知识库...", "loading");
+                            }
+                        }
+                        else if (data.type === "metadata" && data.stage === "retrieval") {
+                            renderRetrievals(data.retrievals || [], data);
+                            if (currentRoute === "rag_search") {
+                                setStatus("检索完成，正在生成回答...", "loading");
+                            } else if (currentRoute === "hybrid") {
+                                setStatus("混合检索完成，正在生成回答...", "loading");
+                            }
+                        }
+                        else if (data.type === "chunk") {
+                            latestAnswerText += data.content || "";
+                            await renderMarkdownToElement(ab, latestAnswerText, true);
+                            ab.scrollTop = ab.scrollHeight;
+                        }
+                        else if (data.type === "final") {
+                            if (data.content) {
+                                latestAnswerText = data.content;
+                                await renderMarkdownToElement(ab, latestAnswerText, false);
+                            }
+                            if (data.route && !latestRouteInfo) {
+                                renderRouteInfo({
+                                    route: data.route,
+                                    route_target: "",
+                                    route_reason: ""
+                                });
+                            }
+                            if (data.file_result) {
+                                renderCatalogResult(data.file_result);
+                            }
+                            if (data.retrievals && data.retrievals.length) {
+                                renderRetrievals(data.retrievals, {
+                                    rewritten_question: data.rewritten_question || "",
+                                    keywords: data.keywords || [],
+                                    queries: data.queries || []
+                                });
+                            }
+                            setStatus("回答完成。");
+                        }
+                        else if (data.type === "end") {
+                            setStatus("回答完成。");
+                        }
+                        else if (data.type === "error") {
+                            setStatus(data.content || "生成异常", "error");
+                            await renderMarkdownToElement(
+                                ab,
+                                (latestAnswerText || "") + "\n\n**[生成异常: " + (data.content || "未知错误") + "]**",
+                                false
+                            );
+                        }
+                    } catch (err) {
+                        console.error("JSON parse error:", jsonStr, err);
+                    }
+                }
+            }
+        } catch (e) {
+            setStatus("请求异常：" + e.message, "error");
+            await renderMarkdownToElement(ab, "请求异常：" + (e.message || e), false);
+        } finally {
+            submitBtn.disabled = false;
+        }
+    }
+    /* ---------- 清空 ---------- */
+    async function clearHistory() {
+        const ab = document.getElementById("answer");
+        try {
+            const res = await fetch("/clear", { method: "POST" });
+            const data = await res.json();
+            if (!data.success) {
+                setStatus(data.error || "清空失败", "error");
+                return;
+            }
+            latestAnswerText = "";
+            document.getElementById("question").value = "";
+            ab.classList.add("muted");
+            ab.innerHTML = "暂无回答";
+            await renderHistory([]);
+            resetRightPanel();
+            setStatus("");
+        } catch (e) {
+            setStatus("清空异常：" + e, "error");
+        }
+    }
+    /* ---------- 复制 ---------- */
+    async function copyLatestAnswer() {
+        if (!latestAnswerText) {
+            setStatus("当前没有可复制的回答。", "error");
+            return;
+        }
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(latestAnswerText);
+                setStatus("回答已复制到剪贴板。");
+                return;
+            }
+            const textarea = document.createElement("textarea");
+            textarea.value = latestAnswerText;
+            textarea.style.position = "fixed";
+            textarea.style.left = "-9999px";
+            textarea.style.top = "0";
+            textarea.setAttribute("readonly", "");
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            textarea.setSelectionRange(0, textarea.value.length);
+            const ok = document.execCommand("copy");
+            document.body.removeChild(textarea);
+            if (ok) {
+                setStatus("回答已复制到剪贴板。");
+            } else {
+                setStatus("复制失败：浏览器不支持自动复制，请手动复制。", "error");
+            }
+        } catch (e) {
+            setStatus("复制失败：" + e, "error");
+        }
+    }
+    async function copyQuestion() {
+        const questionText = document.getElementById("question").value.trim();
+        if (!questionText) {
+            setStatus("当前没有可复制的问题。", "error");
+            return;
+        }
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                await navigator.clipboard.writeText(questionText);
+                setStatus("问题已复制到剪贴板。");
+                return;
+            }
+            const textarea = document.createElement("textarea");
+            textarea.value = questionText;
+            textarea.style.position = "fixed";
+            textarea.style.left = "-9999px";
+            textarea.style.top = "0";
+            textarea.setAttribute("readonly", "");
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            textarea.setSelectionRange(0, textarea.value.length);
+            const ok = document.execCommand("copy");
+            document.body.removeChild(textarea);
+            if (ok) {
+                setStatus("问题已复制到剪贴板。");
+            } else {
+                setStatus("复制失败：浏览器不支持自动复制，请手动复制。", "error");
+            }
+        } catch (e) {
+            setStatus("复制失败：" + e, "error");
+        }
+    }
+    window.addEventListener("DOMContentLoaded", async () => {
+        syncLayoutHeight();
+        const initialHistory = {{ history | tojson | safe }};
+        await renderHistory(initialHistory || []);
+        resetRightPanel();
+    });
+</script>
+</body>
+</html>

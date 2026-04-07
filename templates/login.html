@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LAB-403 登录</title>
+    <style>
+        :root {
+            --bg: #f4f7fb;
+            --panel: #ffffff;
+            --border: #e5e7eb;
+            --text: #111827;
+            --subtext: #6b7280;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --danger: #ef4444;
+            --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+            --radius: 16px;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .login-card {
+            width: 100%;
+            max-width: 420px;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            box-shadow: var(--shadow);
+            padding: 28px;
+        }
+        h1 {
+            margin: 0 0 10px;
+            font-size: 28px;
+        }
+        p.desc {
+            margin: 0 0 24px;
+            color: var(--subtext);
+            line-height: 1.7;
+        }
+        .form-group {
+            margin-bottom: 16px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            color: #374151;
+        }
+        input {
+            width: 100%;
+            padding: 12px 14px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            font-size: 15px;
+            outline: none;
+        }
+        input:focus {
+            border-color: #93c5fd;
+            box-shadow: 0 0 0 4px rgba(37,99,235,.12);
+        }
+        button {
+            width: 100%;
+            border: none;
+            border-radius: 12px;
+            padding: 12px 16px;
+            font-size: 15px;
+            background: var(--primary);
+            color: white;
+            cursor: pointer;
+        }
+        button:hover {
+            background: var(--primary-hover);
+        }
+        .status {
+            min-height: 24px;
+            margin-top: 14px;
+            font-size: 14px;
+        }
+        .status.error {
+            color: var(--danger);
+        }
+        .status.success {
+            color: #059669;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-card">
+        <h1>LAB-403 登录</h1>
+        <p class="desc">请输入本系统分配的用户名和密码进行登录。</p>
+
+        <div class="form-group">
+            <label for="username">用户名</label>
+            <input id="username" type="text" placeholder="请输入用户名" />
+        </div>
+
+        <div class="form-group">
+            <label for="password">密码</label>
+            <input id="password" type="password" placeholder="请输入密码" />
+        </div>
+
+        <button onclick="login()">登录</button>
+        <div id="status" class="status"></div>
+    </div>
+
+    <script>
+        function setStatus(msg = "", type = "") {
+            const el = document.getElementById("status");
+            el.className = "status";
+            if (type) el.classList.add(type);
+            el.textContent = msg;
+        }
+
+        async function login() {
+            const username = document.getElementById("username").value.trim();
+            const password = document.getElementById("password").value;
+
+            if (!username || !password) {
+                setStatus("用户名和密码不能为空。", "error");
+                return;
+            }
+
+            try {
+                const res = await fetch("/login", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const data = await res.json();
+
+                if (!data.success) {
+                    setStatus(data.error || "登录失败。", "error");
+                    return;
+                }
+
+                setStatus("登录成功，正在跳转...", "success");
+                setTimeout(() => {
+                    window.location.href = "/";
+                }, 500);
+
+            } catch (e) {
+                setStatus("请求异常：" + e, "error");
+            }
+        }
+
+        document.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") {
+                login();
+            }
+        });
+    </script>
+</body>
+</html>
