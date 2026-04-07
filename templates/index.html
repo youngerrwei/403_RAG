@@ -135,8 +135,8 @@
         }
         /* 历史对话：占用剩余空间，内部滚动 */
         .card-history {
-            flex: 1 1 0;
-            min-height: 80px;
+            flex: 1.6 1 0;
+            min-height: 120px;
             display: flex;
             flex-direction: column;
             overflow: hidden;
@@ -185,7 +185,8 @@
         }
         textarea {
             width: 100%;
-            min-height: 140px;
+            min-height: 90px;
+            height: 90px;
             resize: vertical;
             border: 1px solid var(--border);
             border-radius: 14px;
@@ -481,6 +482,120 @@
             margin-left: 4px;
             animation: blink 1s step-end infinite;
         }
+        /* =============================================
+           全屏预览弹层
+           ============================================= */
+        .fullscreen-overlay {
+            position: fixed;
+            inset: 0;
+            z-index: 9999;
+            background: rgba(15, 23, 42, 0.45);
+            backdrop-filter: blur(6px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+
+        .fullscreen-dialog {
+            width: min(1200px, 96vw);
+            height: min(88vh, 900px);
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(15, 23, 42, 0.22);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .fullscreen-header {
+            flex: 0 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 18px 22px;
+            border-bottom: 1px solid var(--border);
+            background: linear-gradient(135deg, #eef5ff, #ffffff);
+            font-size: 18px;
+            font-weight: 700;
+            color: #0f172a;
+        }
+
+        .fullscreen-body {
+            flex: 1 1 auto;
+            min-height: 0;
+            overflow-y: auto;
+            padding: 22px 24px;
+            background: #ffffff;
+        }
+
+        .fullscreen-body .markdown-body {
+            font-size: 16px;
+            line-height: 1.9;
+            color: var(--text);
+        }
+
+        .fullscreen-body .chat-list {
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+        }
+
+        .fullscreen-body .msg {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .fullscreen-body .msg-label {
+            font-size: 13px;
+            color: var(--subtext);
+            margin-bottom: 6px;
+            padding: 0 4px;
+        }
+
+        .fullscreen-body .bubble {
+            border-radius: 14px;
+            padding: 16px 18px;
+            line-height: 1.8;
+            border: 1px solid var(--border);
+            word-break: break-word;
+            overflow-wrap: anywhere;
+        }
+
+        .fullscreen-body .msg.user .bubble {
+            background: var(--user-bg);
+        }
+
+        .fullscreen-body .msg.assistant .bubble {
+            background: var(--assistant-bg);
+        }
+
+        /* 滚动条美化 */
+        .fullscreen-body::-webkit-scrollbar,
+        .answer-box::-webkit-scrollbar,
+        .chat-list::-webkit-scrollbar,
+        .right-column::-webkit-scrollbar {
+            width: 10px;
+        }
+
+        .fullscreen-body::-webkit-scrollbar-thumb,
+        .answer-box::-webkit-scrollbar-thumb,
+        .chat-list::-webkit-scrollbar-thumb,
+        .right-column::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 999px;
+        }
+
+        .fullscreen-body::-webkit-scrollbar-track,
+        .answer-box::-webkit-scrollbar-track,
+        .chat-list::-webkit-scrollbar-track,
+        .right-column::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
         @keyframes blink {
             50% { opacity: 0; }
         }
@@ -521,6 +636,24 @@
                 overflow: visible;
                 padding-right: 0;
             }
+            .fullscreen-overlay {
+                padding: 0;
+            }
+            .fullscreen-dialog {
+                width: 100vw;
+                height: 100vh;
+                max-width: none;
+                max-height: none;
+                border-radius: 0;
+                border: none;
+            }
+            .fullscreen-header {
+                padding: 16px 18px;
+                font-size: 17px;
+            }
+            .fullscreen-body {
+                padding: 18px 16px;
+            }
         }
     </style>
 </head>
@@ -552,7 +685,10 @@
             <div class="card card-answer">
                 <div class="card-header">
                     <span>当前回答</span>
-                    <button class="btn-secondary" onclick="copyLatestAnswer()">复制</button>
+                    <div class="card-actions">
+                        <button class="btn-secondary" onclick="copyLatestAnswer()">复制</button>
+                        <button class="btn-secondary" onclick="openFullscreenPanel('answer')">全屏</button>
+                    </div>
                 </div>
                 <div class="card-body">
                     <div id="answer" class="answer-box markdown-body muted">暂无回答</div>
@@ -560,11 +696,29 @@
             </div>
             <!-- 历史对话：flex 伸展，内部滚动 -->
             <div class="card card-history">
-                <div class="card-header">历史对话</div>
+                <div class="card-header">
+                    <span>历史对话</span>
+                    <div class="card-actions">
+                        <button class="btn-secondary" onclick="openFullscreenPanel('history')">全屏</button>
+                    </div>
+                </div>
                 <div class="card-body">
                     <div id="history" class="chat-list">
                         <!-- 历史记录由 JS 渲染 -->
                     </div>
+                </div>
+            </div>
+        </div>
+        <div id="fullscreenOverlay" class="fullscreen-overlay" style="display:none;" onclick="handleOverlayClick(event)">
+            <div class="fullscreen-dialog">
+                <div class="fullscreen-header">
+                    <span id="fullscreenTitle">全屏预览</span>
+                    <div class="card-actions">
+                        <button class="btn-secondary" onclick="closeFullscreenPanel()">关闭</button>
+                    </div>
+                </div>
+                <div class="fullscreen-body">
+                    <div id="fullscreenContent" class="markdown-body"></div>
                 </div>
             </div>
         </div>
@@ -883,6 +1037,48 @@
         document.getElementById("catalogCard").style.display = "block";
         document.getElementById("retrievalCard").style.display = "block";
     }
+    async function openFullscreenPanel(type) {
+        const overlay = document.getElementById("fullscreenOverlay");
+        const title = document.getElementById("fullscreenTitle");
+        const content = document.getElementById("fullscreenContent");
+
+        if (type === "answer") {
+            title.textContent = "当前回答（全屏预览）";
+            content.innerHTML = `<div class="markdown-body">${renderMarkdown(latestAnswerText || "暂无回答")}</div>`;
+        } else {
+            title.textContent = "历史对话（全屏预览）";
+            const historyEl = document.getElementById("history");
+            content.innerHTML = historyEl
+                ? `<div class="chat-list">${historyEl.innerHTML}</div>`
+                : '<div class="muted">暂无历史对话</div>';
+        }
+
+        overlay.style.display = "flex";
+        document.body.style.overflow = "hidden";
+
+        content.querySelectorAll("pre code").forEach(block => {
+            try { hljs.highlightElement(block); } catch (e) {}
+        });
+
+        if (window.MathJax && window.MathJax.typesetPromise) {
+            try { await MathJax.typesetPromise([content]); } catch (err) {}
+        }
+    }
+    function closeFullscreenPanel() {
+        document.getElementById("fullscreenOverlay").style.display = "none";
+        document.getElementById("fullscreenContent").innerHTML = "";
+        document.body.style.overflow = "";
+    }
+    function handleOverlayClick(event) {
+        const dialog = document.querySelector(".fullscreen-dialog");
+        if (!dialog) return;
+        if (!dialog.contains(event.target)) {
+            closeFullscreenPanel();
+        }
+    }
+    document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape") closeFullscreenPanel();
+    });
     /* ---------- 流式请求 ---------- */
     async function askQuestion() {
         const qi = document.getElementById("question");
