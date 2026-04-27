@@ -1,14 +1,16 @@
 import os
 import re
-import uuid
 from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
 
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# 【修改 1】移除 RecursiveCharacterTextSplitter，引入 SemanticChunker
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_huggingface import HuggingFaceEmbeddings
+import torch
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
@@ -33,7 +35,7 @@ def load_config():
 
     说明：
     - DOCS_PATH：知识库原始文件目录（仅限 Markdown）
-    - CHUNK_SIZE / CHUNK_OVERLAP：文本切块参数
+    - SEMANTIC_THRESHOLD_TYPE / SEMANTIC_THRESHOLD：语义分割的阈值类型和数值
     - EMBEDDING_MODEL_NAME：向量模型名称
     - EMBEDDING_DEVICE：embedding 所使用的设备，如 cuda / cpu
     - QDRANT_HOST / QDRANT_PORT：远程 Qdrant 地址
@@ -44,10 +46,13 @@ def load_config():
 
     cfg = {
         "DOCS_PATH": os.getenv("DOCS_PATH", "./data"),
-        "PARENT_CHUNK_SIZE": int(os.getenv("PARENT_CHUNK_SIZE", "1500")),
-        "PARENT_CHUNK_OVERLAP": int(os.getenv("PARENT_CHUNK_OVERLAP", "200")),
-        "CHILD_CHUNK_SIZE": int(os.getenv("CHILD_CHUNK_SIZE", "300")),
-        "CHILD_CHUNK_OVERLAP": int(os.getenv("CHILD_CHUNK_OVERLAP", "50")),
+
+        # 【修改 2】替换原有的 CHUNK_SIZE/OVERLAP，改为语义分割专属配置
+        # 可选类型: percentile (百分位数), standard_deviation (标准差), interquartile (四分位距)
+        "SEMANTIC_THRESHOLD_TYPE": os.getenv("SEMANTIC_THRESHOLD_TYPE", "percentile"),
+        # 例如 80 表示：句子间距离大于 80% 的其他句子间距离时，进行切块断点
+        "SEMANTIC_THRESHOLD": float(os.getenv("SEMANTIC_THRESHOLD", "85.0")),
+
         "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3"),
         "EMBEDDING_DEVICE": os.getenv("EMBEDDING_DEVICE", "cuda"),
 
@@ -74,13 +79,9 @@ def clean_text_light(text: str) -> str:
         return ""
 
     try:
-        # 处理英文单词跨行断开
         text = re.sub(r"([A-Za-z])-\s*\n\s*([A-Za-z])", r"\1\2", text)
-        # 单换行变空格
         text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-        # 压缩空白
         text = re.sub(r"\s+", " ", text)
-
         return text.strip()
     except Exception as e:
         log(f"文本清洗异常: {e}")
@@ -90,19 +91,12 @@ def clean_text_light(text: str) -> str:
 # ================= MARKDOWN LOADER =================
 
 def load_md(file_path: Path) -> List[Document]:
-    """
-    加载 Markdown 文件。
-    """
+    """加载 Markdown 文件。"""
     log(f"开始加载 Markdown: {file_path.name}")
     results = []
-
     try:
-        # 读取文件内容
         content = file_path.read_text(encoding="utf-8")
-
-        # 清洗文本
         text = clean_text_light(content)
-
         if text:
             results.append(Document(
                 page_content=text,
@@ -110,13 +104,12 @@ def load_md(file_path: Path) -> List[Document]:
                     "source": str(file_path),
                     "file_name": file_path.name,
                     "doc_title": file_path.stem,
+                    "page": None,
                     "type": "md",
                 }
             ))
-
         log(f"Markdown加载完成: {file_path.name}, doc数={len(results)}")
         return results
-
     except Exception as e:
         log(f"加载 Markdown 失败: {file_path}, 错误: {e}")
         return results
@@ -125,33 +118,19 @@ def load_md(file_path: Path) -> List[Document]:
 # ================= LOAD =================
 
 def load_documents(path: str) -> List[Document]:
-    """
-    遍历目录，仅加载 .md 文件，并为每个文档补充相对路径 metadata。
-    """
+    """遍历目录，加载 .md 文件"""
     root = Path(path).resolve()
     docs: List[Document] = []
-
     if not root.exists():
         log(f"文档目录不存在: {root}")
         return docs
 
-    # 递归遍历所有文件
     for f in root.rglob("*"):
         try:
-            if not f.is_file():
+            if not f.is_file() or f.suffix.lower() != ".md":
                 continue
-
-            # 仅处理 .md 文件
-            if f.suffix.lower() != ".md":
-                continue
-
-            # 计算相对路径
             rel_path = f.relative_to(root).as_posix()
-
-            # 加载 markdown
             file_docs = load_md(f)
-
-            # 补充 metadata
             for d in file_docs:
                 md = dict(d.metadata) if d.metadata else {}
                 md.setdefault("source", str(f))
@@ -160,10 +139,8 @@ def load_documents(path: str) -> List[Document]:
                 md["rel_path"] = rel_path
                 d.metadata = md
                 docs.append(d)
-
         except Exception as e:
             log(f"加载文件失败: {f}, 错误: {e}")
-
     log(f"总文档数: {len(docs)}")
     return docs
 
@@ -171,13 +148,10 @@ def load_documents(path: str) -> List[Document]:
 # ================= CHUNK ENRICH =================
 
 def enrich_chunk_with_titles(doc: Document) -> Document:
-    """
-    将文档标题、相对路径等结构信息注入 chunk 前缀。
-    """
+    """将文档标题、相对路径等结构信息注入 chunk 前缀。"""
     try:
         doc_title = doc.metadata.get("doc_title")
         rel_path = doc.metadata.get("rel_path")
-
         prefix_parts = []
         if doc_title:
             prefix_parts.append(f"[文档标题] {doc_title}")
@@ -190,91 +164,78 @@ def enrich_chunk_with_titles(doc: Document) -> Document:
         if prefix:
             content = prefix + "\n\n" + content
 
-        return Document(
-            page_content=content,
-            metadata=doc.metadata
-        )
+        return Document(page_content=content, metadata=doc.metadata)
     except Exception as e:
         log(f"chunk 标题增强失败: {e}")
         return doc
 
 
-# ================= CHUNK =================
+# ================= CHUNK (SEMANTIC) =================
 
-def split_documents(docs: List[Document], cfg: dict):
+# 【修改 3】修改切块函数，接收 embeddings 模型，使用 SemanticChunker
+def split_documents(docs: List[Document], embeddings, cfg):
     """
-    小检索大召回（父子块）切分逻辑：
-    1. 先切出较大的父块。
-    2. 为每个父块分配 UUID，并将其完整文本保存备用。
-    3. 将父块继续切分为小的子块。
-    4. 将父块的 UUID 和完整文本写入子块的 metadata。
+    使用双重切分：先进行超大块粗切（防止单文件过大导致 OOM），再进行语义分割。
+    逐个处理并及时清理显存。
     """
-    log("开始执行 父-子 (Small-to-Big) 两级文本切块")
+    log("开始语义文本切块 (Semantic Chunking)...")
+    final_chunks = []
 
     try:
-        parent_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=cfg["PARENT_CHUNK_SIZE"],
-            chunk_overlap=cfg["PARENT_CHUNK_OVERLAP"],
-            separators=["\n\n", "\n", "。", ". ", " "]
+        # 1. 预先粗切分：防止单个 Markdown 文件高达几万字，直接撑爆 SemanticChunker
+        rough_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=5000,
+            chunk_overlap=0,
+            separators=["\n\n", "\n"]
+        )
+        rough_docs = rough_splitter.split_documents(docs)
+        log(f"预处理：将原始文档粗切分为 {len(rough_docs)} 个片段以控制显存...")
+
+        # 2. 初始化语义切分器
+        semantic_splitter = SemanticChunker(
+            embeddings,
+            breakpoint_threshold_type=cfg["SEMANTIC_THRESHOLD_TYPE"],
+            breakpoint_threshold_amount=cfg["SEMANTIC_THRESHOLD"]
         )
 
-        child_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=cfg["CHILD_CHUNK_SIZE"],
-            chunk_overlap=cfg["CHILD_CHUNK_OVERLAP"],
-            separators=["\n\n", "\n", "。", "！", "？", "，", ", ", " "]
-        )
+        # 3. 逐个片段进行语义切分
+        for i, rough_doc in enumerate(rough_docs):
+            try:
+                # 对单个片段进行语义切片
+                sub_chunks = semantic_splitter.split_documents([rough_doc])
 
-        final_child_chunks = []
+                # 标题增强并加入最终结果
+                enriched_chunks = [enrich_chunk_with_titles(c) for c in sub_chunks]
+                final_chunks.extend(enriched_chunks)
 
-        # 第一层：切分父文档
-        parent_chunks = parent_splitter.split_documents(docs)
-        # 为父文档注入标题增强
-        parent_chunks = [enrich_chunk_with_titles(p) for p in parent_chunks]
+            except Exception as sub_e:
+                log(f"切分第 {i + 1} 个片段时出错 (可能仍是OOM或文本异常): {sub_e}")
 
-        # 第二层：切分子文档
-        for p_chunk in parent_chunks:
-            parent_id = str(uuid.uuid4())
-            parent_text = p_chunk.page_content
+            finally:
+                # 【关键】每处理完一个片段，强制清理无用的 GPU 显存缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-            # 切分子块
-            child_chunks = child_splitter.split_documents([p_chunk])
-
-            for c_chunk in child_chunks:
-                # 继承父块的所有 metadata，并追加父块相关信息
-                c_metadata = c_chunk.metadata.copy()
-                c_metadata["parent_id"] = parent_id
-                c_metadata["parent_content"] = parent_text
-                c_metadata["size"] = "small"  # 标记这是一个小块
-
-                final_child_chunks.append(Document(
-                    page_content=c_chunk.page_content,
-                    metadata=c_metadata
-                ))
-
-        log(f"切块完成: 生成了 {len(parent_chunks)} 个父块，衍生出 {len(final_child_chunks)} 个子块")
-        return final_child_chunks
+        log(f"语义切块完成: 最终切割出 {len(final_chunks)} 个块")
+        return final_chunks
 
     except Exception as e:
-        log(f"文本切块失败: {e}")
+        log(f"语义文本切块整体失败: {e}")
         return []
 
 
 # ================= FILTER =================
 
 def analyze_bad_chunk_reason(text: str) -> str:
-    """
-    分析 chunk 被过滤的原因。
-    """
     if not text or not text.strip():
         return "empty"
-
     text = text.strip()
-    if len(text) < 80:
+    if len(text) < 40:  # 稍微放宽对短句的限制，因为语义切块可能会产生较短的一句话
         return "too_short"
 
     valid_chars = re.findall(r"[A-Za-z\u4e00-\u9fff]", text)
     valid_count = len(valid_chars)
-    if valid_count < 30:
+    if valid_count < 15:  # 稍微放宽
         return "too_few_valid_chars"
 
     digits = len(re.findall(r"\d", text))
@@ -290,25 +251,18 @@ def analyze_bad_chunk_reason(text: str) -> str:
 
 
 def filter_chunks(docs: List[Document]):
-    """
-    过滤低质量 chunk。
-    """
     log("开始过滤低质量chunk")
-
     results = []
     reason_stats = {}
-
     try:
         for d in docs:
             reason = analyze_bad_chunk_reason(d.page_content)
             reason_stats[reason] = reason_stats.get(reason, 0) + 1
             if reason == "good":
                 results.append(d)
-
         log(f"过滤前: {len(docs)}, 过滤后: {len(results)}")
         log(f"过滤统计: {reason_stats}")
         return results
-
     except Exception as e:
         log(f"过滤 chunk 失败: {e}")
         return docs
@@ -317,16 +271,15 @@ def filter_chunks(docs: List[Document]):
 # ================= EMBEDDING =================
 
 def build_embeddings(cfg):
-    """
-    初始化 embedding 模型。
-    """
     log("初始化 Embedding 模型")
-
     try:
         embeddings = HuggingFaceEmbeddings(
             model_name=cfg["EMBEDDING_MODEL_NAME"],
             model_kwargs={"device": cfg["EMBEDDING_DEVICE"]},
-            encode_kwargs={"normalize_embeddings": True},
+            encode_kwargs={
+                "normalize_embeddings": True,
+                "batch_size": 4  # 【新增】强行降低批量大小，防止 OOM。如果显存还是不够，改成 2 甚至 1
+            },
         )
         return embeddings
     except Exception as e:
@@ -337,11 +290,8 @@ def build_embeddings(cfg):
 # ================= QDRANT =================
 
 def get_embedding_dimension(embeddings) -> int:
-    """
-    动态获取向量维度。
-    """
     try:
-        test_vec = embeddings.embed_query("测试文本")
+        test_vec = embeddings.embed_query("测试")
         dim = len(test_vec)
         log(f"检测到向量维度: {dim}")
         return dim
@@ -351,16 +301,9 @@ def get_embedding_dimension(embeddings) -> int:
 
 
 def create_qdrant_client(cfg):
-    """
-    创建 Qdrant 客户端。
-    """
     try:
-        client = QdrantClient(
-            host=cfg["QDRANT_HOST"],
-            port=cfg["QDRANT_PORT"],
-            timeout=30
-        )
-        log(f"Qdrant 客户端创建成功: {cfg['QDRANT_HOST']}:{cfg['QDRANT_PORT']}")
+        client = QdrantClient(host=cfg["QDRANT_HOST"], port=cfg["QDRANT_PORT"], timeout=30)
+        log(f"Qdrant 客户端创建成功")
         return client
     except Exception as e:
         log(f"创建 Qdrant 客户端失败: {e}")
@@ -368,61 +311,39 @@ def create_qdrant_client(cfg):
 
 
 def prepare_collection(client: QdrantClient, cfg, vector_size: int):
-    """
-    准备 Qdrant collection。
-    """
     collection_name = cfg["QDRANT_COLLECTION_NAME"]
-
     try:
-        existing_collections = [c.name for c in client.get_collections().collections]
-
-        if cfg["QDRANT_RECREATE_COLLECTION"] and collection_name in existing_collections:
+        existing = [c.name for c in client.get_collections().collections]
+        if cfg["QDRANT_RECREATE_COLLECTION"] and collection_name in existing:
             log(f"删除旧集合: {collection_name}")
             client.delete_collection(collection_name=collection_name)
-            existing_collections.remove(collection_name)
+            existing.remove(collection_name)
 
-        if collection_name not in existing_collections:
+        if collection_name not in existing:
             log(f"创建新集合: {collection_name}")
             client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=vector_size,
-                    distance=Distance.COSINE
-                )
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
             )
-            log(f"集合创建完成: {collection_name}")
         else:
-            log(f"集合已存在，直接复用: {collection_name}")
-
+            log(f"集合已存在，复用: {collection_name}")
     except Exception as e:
         log(f"准备 Qdrant collection 失败: {e}")
         raise
 
 
 def save_to_qdrant(docs: List[Document], embeddings, cfg):
-    """
-    将文档写入 Qdrant。
-    """
     log("开始写入 Qdrant")
-
-    if not docs:
-        log("没有可写入的文档 chunk，跳过入库")
-        return
-
+    if not docs: return
     try:
         client = create_qdrant_client(cfg)
         vector_size = get_embedding_dimension(embeddings)
         prepare_collection(client, cfg, vector_size)
-
         vector_store = QdrantVectorStore(
-            client=client,
-            collection_name=cfg["QDRANT_COLLECTION_NAME"],
-            embedding=embeddings,
+            client=client, collection_name=cfg["QDRANT_COLLECTION_NAME"], embedding=embeddings,
         )
-
         vector_store.add_documents(documents=docs)
-        log(f"Qdrant 写入完成，集合名: {cfg['QDRANT_COLLECTION_NAME']}")
-
+        log(f"Qdrant 写入完成")
     except Exception as e:
         log(f"写入 Qdrant 失败: {e}")
         raise
@@ -431,20 +352,20 @@ def save_to_qdrant(docs: List[Document], embeddings, cfg):
 # ================= MAIN =================
 
 def main():
-    """
-    主流程
-    """
-    log("===== 开始执行 ingest (Markdown Only) =====")
-
+    log("===== 开始执行 ingest (Semantic Splitting) =====")
     try:
         cfg = load_config()
 
         docs = load_documents(cfg["DOCS_PATH"])
         if not docs:
-            log("未加载到任何 .md 文档，请检查 DOCS_PATH 或文件后缀")
+            log("未加载到任何文档")
             return
 
-        chunks = split_documents(docs, cfg)
+        # 【修改 4】语义分割依赖 Embedding 模型，所以需要提前初始化 Embedding 模型
+        embeddings = build_embeddings(cfg)
+
+        # 传入 embeddings 和配置进行语义切块
+        chunks = split_documents(docs, embeddings, cfg)
         if not chunks:
             log("切块结果为空，任务结束")
             return
@@ -454,9 +375,7 @@ def main():
             log("过滤后没有可用 chunk，任务结束")
             return
 
-        embeddings = build_embeddings(cfg)
         save_to_qdrant(chunks, embeddings, cfg)
-
         log("===== ingest 完成 =====")
 
     except Exception as e:

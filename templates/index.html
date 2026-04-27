@@ -8,652 +8,136 @@
     <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
     <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-    <!-- MathJax：用于渲染 LaTeX 数学公式 -->
     <script>
         window.MathJax = {
-            tex: {
-                inlineMath: [['$', '$'], ['\\(', '\\)']],
-                displayMath: [['$$', '$$'], ['\\[', '\\]']]
-            },
-            svg: {
-                fontCache: 'global'
-            },
-            options: {
-                skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code']
-            }
+            tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+            svg: { fontCache: 'global' },
+            options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
         };
     </script>
     <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
     <style>
         :root {
-            --bg: #f4f7fb;
-            --panel: #ffffff;
-            --border: #e5e7eb;
-            --text: #111827;
-            --subtext: #6b7280;
-            --primary: #2563eb;
-            --primary-hover: #1d4ed8;
-            --danger: #ef4444;
-            --danger-hover: #dc2626;
-            --assistant-bg: #f8fafc;
-            --user-bg: #eaf2ff;
-            --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
-            --radius: 16px;
-            /* 页面各部分高度常量 */
-            --page-v-padding: 44px;       /* margin-top(20) + padding-bottom(24) */
-            --header-height: 120px;        /* header 估算高度（含 margin-bottom:18px） */
-            --footer-height: 36px;         /* footer-note 估算高度（含 margin-top:18px） */
-            /* 左右两栏可用高度 */
+            --bg: #f4f7fb; --panel: #ffffff; --border: #e5e7eb; --text: #111827; --subtext: #6b7280;
+            --primary: #2563eb; --primary-hover: #1d4ed8; --danger: #ef4444; --danger-hover: #dc2626;
+            --success: #10b981; --success-hover: #059669;
+            --assistant-bg: #f8fafc; --user-bg: #eaf2ff; --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+            --radius: 16px; --page-v-padding: 44px; --header-height: 120px; --footer-height: 36px;
             --columns-height: calc(100vh - var(--page-v-padding) - var(--header-height) - var(--footer-height));
         }
-        * {
-            box-sizing: border-box;
-        }
-        html, body {
-            height: 100%;
-            margin: 0;
-        }
-        body {
-            font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
-            color: var(--text);
-            background: var(--bg);
-        }
-        .page {
-            max-width: 1680px;
-            margin: 20px auto;
-            padding: 0 20px 24px;
-            display: flex;
-            flex-direction: column;
-            min-height: calc(100vh - 40px);
-        }
-        .header {
-            background: linear-gradient(135deg, #eef5ff, #ffffff);
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            padding: 24px 28px;
-            box-shadow: var(--shadow);
-            margin-bottom: 18px;
-            flex: 0 0 auto;
-        }
-        .header h1 {
-            margin: 0 0 10px;
-            font-size: 30px;
-            color: #0f172a;
-        }
-        .header p {
-            margin: 0;
-            color: var(--subtext);
-            line-height: 1.7;
-            font-size: 15px;
-        }
-        /* =============================================
-           核心布局：两列等高，高度由 CSS 变量控制
-           ============================================= */
-        .layout {
-            display: grid;
-            grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
-            gap: 18px;
-            /* 两栏高度固定为可用高度，不随内容撑开 */
-            height: var(--columns-height);
-            min-height: 480px;
-            flex: 1 1 auto;
-        }
-        /* ---------- 左栏：flex 列，高度固定，子卡片分配空间 ---------- */
-        .left-column {
-            min-width: 0;
-            display: flex;
-            flex-direction: column;
-            gap: 18px;
-            height: 100%;   /* 等于 layout 的 height */
-            overflow: hidden; /* 不让左栏整体溢出 */
-        }
-        /* ---------- 右栏：整列滚动，高度固定 ---------- */
-        .right-column {
-            min-width: 0;
-            height: 100%;
-            overflow-y: auto;
-            overflow-x: hidden;
-            padding-right: 4px;
-            display: flex;
-            flex-direction: column;
-            gap: 18px;
-        }
-        /* =============================================
-           左栏内三张卡片的伸缩策略
-           ============================================= */
-        /* 提问面板：固定收缩，不伸展 */
-        .card-question {
-            flex: 0 0 auto;
-        }
-        /* 当前回答：优先占用较多空间，内部滚动 */
-        .card-answer {
-            flex: 2 1 0;
-            min-height: 120px;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-        /* 历史对话：占用剩余空间，内部滚动 */
-        .card-history {
-            flex: 1.6 1 0;
-            min-height: 120px;
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
-        /* card-answer 和 card-history 的 card-body 需要撑满并滚动 */
-        .card-answer .card-body,
-        .card-history .card-body {
-            flex: 1 1 0;
-            min-height: 0;
-            overflow: hidden;
-            display: flex;
-            flex-direction: column;
-        }
-        /* =============================================
-           通用卡片样式
-           ============================================= */
-        .card {
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: var(--radius);
-            box-shadow: var(--shadow);
-            min-width: 0;
-        }
-        /* 右栏卡片不参与 flex 伸缩，随内容自然高度 */
-        .right-column .card {
-            flex: 0 0 auto;
-        }
-        .card-header {
-            padding: 18px 20px;
-            border-bottom: 1px solid var(--border);
-            font-weight: 700;
-            font-size: 17px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            flex: 0 0 auto;
-        }
-        .card-body {
-            padding: 18px 20px;
-            min-width: 0;
-        }
-        .input-wrap {
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-        }
-        textarea {
-            width: 100%;
-            min-height: 90px;
-            height: 90px;
-            resize: vertical;
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 16px;
-            font-size: 16px;
-            line-height: 1.75;
-            outline: none;
-            transition: border-color .2s, box-shadow .2s;
-        }
-        textarea:focus {
-            border-color: #93c5fd;
-            box-shadow: 0 0 0 4px rgba(37,99,235,.12);
-        }
-        .btn-row {
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-        }
-        button {
-            appearance: none;
-            border: none;
-            border-radius: 12px;
-            padding: 11px 18px;
-            font-size: 15px;
-            cursor: pointer;
-            transition: all .2s;
-        }
-        .btn-primary {
-            background: var(--primary);
-            color: #fff;
-        }
-        .btn-primary:hover {
-            background: var(--primary-hover);
-        }
-        .btn-primary:disabled {
-            background: #9ca3af;
-            cursor: not-allowed;
-        }
-        .btn-secondary {
-            background: #eef2ff;
-            color: #374151;
-        }
-        .btn-secondary:hover {
-            background: #e0e7ff;
-        }
-        .btn-danger {
-            background: var(--danger);
-            color: #fff;
-        }
-        .btn-danger:hover {
-            background: var(--danger-hover);
-        }
-        .status {
-            min-height: 24px;
-            margin-top: 4px;
-            font-size: 14px;
-        }
+        * { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; color: var(--text); background: var(--bg); }
+        .page { max-width: 1680px; margin: 20px auto; padding: 0 20px 24px; display: flex; flex-direction: column; min-height: calc(100vh - 40px); }
+        .header { background: linear-gradient(135deg, #eef5ff, #ffffff); border: 1px solid var(--border); border-radius: 20px; padding: 24px 28px; box-shadow: var(--shadow); margin-bottom: 18px; flex: 0 0 auto; }
+        .header h1 { margin: 0 0 10px; font-size: 30px; color: #0f172a; }
+        .header p { margin: 0; color: var(--subtext); line-height: 1.7; font-size: 15px; }
+
+        .layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 18px; height: var(--columns-height); min-height: 480px; flex: 1 1 auto; }
+        .left-column { min-width: 0; display: flex; flex-direction: column; gap: 18px; height: 100%; overflow: hidden; }
+        .right-column { min-width: 0; height: 100%; overflow-y: auto; overflow-x: hidden; padding-right: 4px; display: flex; flex-direction: column; gap: 18px; }
+
+        .card-question { flex: 0 0 auto; }
+        .card-answer { flex: 2 1 0; min-height: 120px; display: flex; flex-direction: column; overflow: hidden; }
+        .card-history { flex: 1.6 1 0; min-height: 120px; display: flex; flex-direction: column; overflow: hidden; }
+        .card-answer .card-body, .card-history .card-body { flex: 1 1 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); min-width: 0; }
+        .right-column .card { flex: 0 0 auto; }
+        .card-header { padding: 18px 20px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 17px; display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; }
+        .card-body { padding: 18px 20px; min-width: 0; }
+        .input-wrap { display: flex; flex-direction: column; gap: 14px; }
+        textarea { width: 100%; min-height: 90px; height: 90px; resize: vertical; border: 1px solid var(--border); border-radius: 14px; padding: 16px; font-size: 16px; line-height: 1.75; outline: none; transition: border-color .2s, box-shadow .2s; }
+        textarea:focus { border-color: #93c5fd; box-shadow: 0 0 0 4px rgba(37,99,235,.12); }
+
+        .btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
+        button { appearance: none; border: none; border-radius: 12px; padding: 11px 18px; font-size: 15px; cursor: pointer; transition: all .2s; }
+        .btn-primary { background: var(--primary); color: #fff; }
+        .btn-primary:hover { background: var(--primary-hover); }
+        .btn-primary:disabled { background: #9ca3af; cursor: not-allowed; }
+        .btn-secondary { background: #eef2ff; color: #374151; }
+        .btn-secondary:hover { background: #e0e7ff; }
+        .btn-danger { background: var(--danger); color: #fff; }
+        .btn-danger:hover { background: var(--danger-hover); }
+        .btn-success { background: var(--success); color: #fff; }
+        .btn-success:hover { background: var(--success-hover); }
+
+        .status { min-height: 24px; margin-top: 4px; font-size: 14px; }
         .status.loading { color: #b45309; }
         .status.error { color: var(--danger); }
-        /* 当前回答：充满父级 card-body 并滚动 */
-        .answer-box {
-            flex: 1 1 0;
-            min-height: 0;
-            overflow-y: auto;
-            padding-right: 6px;
-            word-break: break-word;
-            overflow-wrap: anywhere;
-            font-size: 16px;
-            line-height: 1.85;
-        }
-        /* 历史对话：充满父级 card-body 并滚动 */
-        .chat-list {
-            flex: 1 1 0;
-            min-height: 0;
-            overflow-y: auto;
-            padding-right: 6px;
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-        }
-        .msg {
-            display: flex;
-            flex-direction: column;
-            min-width: 0;
-        }
-        .msg-label {
-            font-size: 13px;
-            color: var(--subtext);
-            margin-bottom: 6px;
-            padding: 0 4px;
-        }
-        .bubble {
-            border-radius: 14px;
-            padding: 16px 18px;
-            line-height: 1.8;
-            border: 1px solid var(--border);
-            word-break: break-word;
-            overflow-wrap: anywhere;
-        }
-        .msg.user .bubble {
-            background: var(--user-bg);
-        }
-        .msg.assistant .bubble {
-            background: var(--assistant-bg);
-        }
-        .route-box,
-        .catalog-list,
-        .retrieval-list {
-            font-size: 14px;
-            line-height: 1.6;
-        }
-        .catalog-list,
-        .retrieval-list {
-            overflow-x: hidden;
-        }
-        .route-card,
-        .catalog-card,
-        .retrieval-summary {
-            background: #f8f9fb;
-            border: 1px solid #e6eaf0;
-            border-radius: 8px;
-            padding: 10px 12px;
-            margin-bottom: 12px;
-        }
-        .catalog-section-title {
-            font-weight: 600;
-            margin: 12px 0 8px;
-            color: #333;
-        }
-        .catalog-item {
-            padding: 8px 10px;
-            border: 1px solid #eceff4;
-            border-radius: 8px;
-            margin-bottom: 8px;
-            background: #fff;
-        }
-        .catalog-index {
-            color: #666;
-            margin-right: 4px;
-        }
-        .catalog-type {
-            color: #2457d6;
-            font-weight: 600;
-            margin-right: 6px;
-        }
-        .catalog-name {
-            font-weight: 500;
-        }
-        .catalog-path {
-            margin-top: 4px;
-            color: #666;
-            font-size: 12px;
-            word-break: break-all;
-        }
-        .retrieval-card {
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            background: #fcfcfd;
-            min-width: 0;
-            margin-bottom: 14px;
-        }
-        .retrieval-top {
-            padding: 14px 16px;
-            background: #f9fafb;
-            border-bottom: 1px solid var(--border);
-        }
-        .retrieval-title {
-            font-weight: 700;
-            font-size: 18px;
-            margin-bottom: 8px;
-            color: #111827;
-            word-break: break-word;
-        }
-        .retrieval-meta {
-            font-size: 15px;
-            color: var(--subtext);
-            line-height: 1.75;
-            word-break: break-word;
-        }
-        .retrieval-content {
-            padding: 16px;
-            min-width: 0;
-        }
-        .retrieval-preview,
-        .retrieval-full {
-            white-space: pre-wrap;
-            line-height: 1.9;
-            color: #1f2937;
-            word-break: break-word;
-            overflow-wrap: anywhere;
-            font-size: 16px;
-        }
-        .retrieval-full {
-            display: none;
-        }
-        .toggle-link {
-            margin-top: 12px;
-            display: inline-block;
-            color: var(--primary);
-            cursor: pointer;
-            font-size: 15px;
-            user-select: none;
-        }
-        .muted {
-            color: var(--subtext);
-        }
-        .markdown-body {
-            color: var(--text);
-            line-height: 1.85;
-            word-break: break-word;
-            overflow-wrap: anywhere;
-            font-size: 16px;
-        }
-        .markdown-body h1,
-        .markdown-body h2,
-        .markdown-body h3,
-        .markdown-body h4,
-        .markdown-body h5,
-        .markdown-body h6 {
-            margin: 1em 0 .6em;
-            line-height: 1.5;
-        }
-        .markdown-body p {
-            margin: .7em 0;
-        }
-        .markdown-body ul,
-        .markdown-body ol {
-            margin: .7em 0;
-            padding-left: 1.8em;
-        }
-        .markdown-body li {
-            margin: .35em 0;
-        }
-        .markdown-body blockquote {
-            margin: .9em 0;
-            padding: .9em 1em;
-            border-left: 4px solid #93c5fd;
-            background: #eff6ff;
-            color: #374151;
-            border-radius: 8px;
-        }
-        .markdown-body code {
-            background: #f3f4f6;
-            padding: 2px 6px;
-            border-radius: 6px;
-            font-family: Consolas, Monaco, monospace;
-            font-size: .92em;
-        }
-        .markdown-body pre {
-            background: #0f172a;
-            color: #e5e7eb;
-            padding: 16px;
-            border-radius: 10px;
-            overflow-x: auto;
-            white-space: pre;
-            margin: 14px 0;
-        }
-        .markdown-body pre code {
-            background: transparent;
-            padding: 0;
-            color: inherit;
-        }
-        .markdown-body table {
-            display: block;
-            width: 100%;
-            overflow-x: auto;
-            border-collapse: collapse;
-            margin: 14px 0;
-        }
-        .markdown-body th,
-        .markdown-body td {
-            border: 1px solid var(--border);
-            padding: 9px 12px;
-            text-align: left;
-            white-space: nowrap;
-        }
-        .markdown-body th {
-            background: #f9fafb;
-        }
-        .footer-note {
-            margin-top: 18px;
-            text-align: center;
-            color: var(--subtext);
-            font-size: 13px;
-            flex: 0 0 auto;
-        }
-        .cursor-blink {
-            display: inline-block;
-            width: 2px;
-            height: 18px;
-            background-color: var(--primary);
-            vertical-align: middle;
-            margin-left: 4px;
-            animation: blink 1s step-end infinite;
-        }
-        /* =============================================
-           全屏预览弹层
-           ============================================= */
-        .fullscreen-overlay {
-            position: fixed;
-            inset: 0;
-            z-index: 9999;
-            background: rgba(15, 23, 42, 0.45);
-            backdrop-filter: blur(6px);
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 24px;
-        }
+        .status.success { color: var(--success); }
 
-        .fullscreen-dialog {
-            width: min(1200px, 96vw);
-            height: min(88vh, 900px);
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(15, 23, 42, 0.22);
-            display: flex;
-            flex-direction: column;
-            overflow: hidden;
-        }
+        .answer-box, .chat-list { flex: 1 1 0; min-height: 0; overflow-y: auto; padding-right: 6px; word-break: break-word; overflow-wrap: anywhere; font-size: 16px; line-height: 1.85; }
+        .chat-list { display: flex; flex-direction: column; }
 
-        .fullscreen-header {
-            flex: 0 0 auto;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            padding: 18px 22px;
-            border-bottom: 1px solid var(--border);
-            background: linear-gradient(135deg, #eef5ff, #ffffff);
-            font-size: 18px;
-            font-weight: 700;
-            color: #0f172a;
-        }
+        /* 历史轮次分组样式 */
+        .history-pair { position: relative; padding-top: 34px; margin-bottom: 16px; border-top: 1px dashed #cbd5e1; display: flex; flex-direction: column; gap: 14px; }
+        .history-pair:first-child { border-top: none; } /* 删除了 padding-top: 0，让第一轮也保留顶部的按钮空间 */
+        .btn-delete-pair { position: absolute; top: 6px; right: 0; padding: 4px 10px; font-size: 12px; background: #fef2f2; color: #ef4444; border: 1px solid #f87171; border-radius: 6px; cursor: pointer; transition: 0.2s; z-index: 10; }
+        .btn-delete-pair:hover { background: #ef4444; color: #fff; }
 
-        .fullscreen-body {
-            flex: 1 1 auto;
-            min-height: 0;
-            overflow-y: auto;
-            padding: 22px 24px;
-            background: #ffffff;
-        }
+        .msg { display: flex; flex-direction: column; min-width: 0; }
+        .msg-label { font-size: 13px; color: var(--subtext); margin-bottom: 6px; padding: 0 4px; }
+        .bubble { border-radius: 14px; padding: 16px 18px; line-height: 1.8; border: 1px solid var(--border); word-break: break-word; overflow-wrap: anywhere; }
+        .msg.user .bubble { background: var(--user-bg); }
+        .msg.assistant .bubble { background: var(--assistant-bg); }
 
-        .fullscreen-body .markdown-body {
-            font-size: 16px;
-            line-height: 1.9;
-            color: var(--text);
-        }
+        .route-box, .catalog-list, .retrieval-list { font-size: 14px; line-height: 1.6; }
+        .catalog-list, .retrieval-list { overflow-x: hidden; }
+        .route-card, .catalog-card, .retrieval-summary { background: #f8f9fb; border: 1px solid #e6eaf0; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
+        .catalog-section-title { font-weight: 600; margin: 12px 0 8px; color: #333; }
+        .catalog-item { padding: 8px 10px; border: 1px solid #eceff4; border-radius: 8px; margin-bottom: 8px; background: #fff; }
+        .catalog-index { color: #666; margin-right: 4px; }
+        .catalog-type { color: #2457d6; font-weight: 600; margin-right: 6px; }
+        .catalog-name { font-weight: 500; }
+        .catalog-path { margin-top: 4px; color: #666; font-size: 12px; word-break: break-all; }
 
-        .fullscreen-body .chat-list {
-            display: flex;
-            flex-direction: column;
-            gap: 14px;
-        }
+        .retrieval-card { border: 1px solid var(--border); border-radius: 14px; background: #fcfcfd; min-width: 0; margin-bottom: 14px; }
+        .retrieval-top { padding: 14px 16px; background: #f9fafb; border-bottom: 1px solid var(--border); }
+        .retrieval-title { font-weight: 700; font-size: 18px; margin-bottom: 8px; color: #111827; word-break: break-word; }
+        .retrieval-meta { font-size: 15px; color: var(--subtext); line-height: 1.75; word-break: break-word; }
+        .retrieval-content { padding: 16px; min-width: 0; }
+        .retrieval-preview, .retrieval-full { white-space: pre-wrap; line-height: 1.9; color: #1f2937; word-break: break-word; overflow-wrap: anywhere; font-size: 16px; }
+        .retrieval-full { display: none; }
+        .toggle-link { margin-top: 12px; display: inline-block; color: var(--primary); cursor: pointer; font-size: 15px; user-select: none; }
+        .muted { color: var(--subtext); }
 
-        .fullscreen-body .msg {
-            display: flex;
-            flex-direction: column;
-            min-width: 0;
-        }
+        .markdown-body { color: var(--text); line-height: 1.85; word-break: break-word; overflow-wrap: anywhere; font-size: 16px; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { margin: 1em 0 .6em; line-height: 1.5; }
+        .markdown-body p { margin: .7em 0; }
+        .markdown-body ul, .markdown-body ol { margin: .7em 0; padding-left: 1.8em; }
+        .markdown-body li { margin: .35em 0; }
+        .markdown-body blockquote { margin: .9em 0; padding: .9em 1em; border-left: 4px solid #93c5fd; background: #eff6ff; color: #374151; border-radius: 8px; }
+        .markdown-body code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; font-family: Consolas, Monaco, monospace; font-size: .92em; }
+        .markdown-body pre { background: #0f172a; color: #e5e7eb; padding: 16px; border-radius: 10px; overflow-x: auto; white-space: pre; margin: 14px 0; }
+        .markdown-body pre code { background: transparent; padding: 0; color: inherit; }
+        .markdown-body table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; margin: 14px 0; }
+        .markdown-body th, .markdown-body td { border: 1px solid var(--border); padding: 9px 12px; text-align: left; white-space: nowrap; }
+        .markdown-body th { background: #f9fafb; }
+        .footer-note { margin-top: 18px; text-align: center; color: var(--subtext); font-size: 13px; flex: 0 0 auto; }
+        .cursor-blink { display: inline-block; width: 2px; height: 18px; background-color: var(--primary); vertical-align: middle; margin-left: 4px; animation: blink 1s step-end infinite; }
 
-        .fullscreen-body .msg-label {
-            font-size: 13px;
-            color: var(--subtext);
-            margin-bottom: 6px;
-            padding: 0 4px;
-        }
+        .fullscreen-overlay { position: fixed; inset: 0; z-index: 9999; background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 24px; }
+        .fullscreen-dialog { width: min(1200px, 96vw); height: min(88vh, 900px); background: var(--panel); border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 20px 60px rgba(15, 23, 42, 0.22); display: flex; flex-direction: column; overflow: hidden; }
+        .fullscreen-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 22px; border-bottom: 1px solid var(--border); background: linear-gradient(135deg, #eef5ff, #ffffff); font-size: 18px; font-weight: 700; color: #0f172a; }
+        .fullscreen-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 22px 24px; background: #ffffff; }
+        .fullscreen-body .markdown-body { font-size: 16px; line-height: 1.9; color: var(--text); }
+        .fullscreen-body .chat-list { display: flex; flex-direction: column; gap: 0; }
 
-        .fullscreen-body .bubble {
-            border-radius: 14px;
-            padding: 16px 18px;
-            line-height: 1.8;
-            border: 1px solid var(--border);
-            word-break: break-word;
-            overflow-wrap: anywhere;
-        }
+        .fullscreen-body::-webkit-scrollbar, .answer-box::-webkit-scrollbar, .chat-list::-webkit-scrollbar, .right-column::-webkit-scrollbar { width: 10px; }
+        .fullscreen-body::-webkit-scrollbar-thumb, .answer-box::-webkit-scrollbar-thumb, .chat-list::-webkit-scrollbar-thumb, .right-column::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+        .fullscreen-body::-webkit-scrollbar-track, .answer-box::-webkit-scrollbar-track, .chat-list::-webkit-scrollbar-track, .right-column::-webkit-scrollbar-track { background: transparent; }
+        @keyframes blink { 50% { opacity: 0; } }
 
-        .fullscreen-body .msg.user .bubble {
-            background: var(--user-bg);
-        }
-
-        .fullscreen-body .msg.assistant .bubble {
-            background: var(--assistant-bg);
-        }
-
-        /* 滚动条美化 */
-        .fullscreen-body::-webkit-scrollbar,
-        .answer-box::-webkit-scrollbar,
-        .chat-list::-webkit-scrollbar,
-        .right-column::-webkit-scrollbar {
-            width: 10px;
-        }
-
-        .fullscreen-body::-webkit-scrollbar-thumb,
-        .answer-box::-webkit-scrollbar-thumb,
-        .chat-list::-webkit-scrollbar-thumb,
-        .right-column::-webkit-scrollbar-thumb {
-            background: #cbd5e1;
-            border-radius: 999px;
-        }
-
-        .fullscreen-body::-webkit-scrollbar-track,
-        .answer-box::-webkit-scrollbar-track,
-        .chat-list::-webkit-scrollbar-track,
-        .right-column::-webkit-scrollbar-track {
-            background: transparent;
-        }
-
-        @keyframes blink {
-            50% { opacity: 0; }
-        }
-        /* =============================================
-           响应式：窄屏时退回自然流布局
-           ============================================= */
         @media (max-width: 1100px) {
-            .layout {
-                grid-template-columns: 1fr;
-                height: auto;
-                min-height: auto;
-            }
-            .left-column {
-                height: auto;
-                overflow: visible;
-            }
-            .card-answer,
-            .card-history {
-                flex: 0 0 auto;
-            }
-            .card-answer .card-body,
-            .card-history .card-body {
-                overflow: visible;
-                flex: unset;
-            }
-            .answer-box {
-                min-height: 260px;
-                max-height: 520px;
-                flex: unset;
-            }
-            .chat-list {
-                min-height: 220px;
-                max-height: 420px;
-                flex: unset;
-            }
-            .right-column {
-                height: auto;
-                overflow: visible;
-                padding-right: 0;
-            }
-            .fullscreen-overlay {
-                padding: 0;
-            }
-            .fullscreen-dialog {
-                width: 100vw;
-                height: 100vh;
-                max-width: none;
-                max-height: none;
-                border-radius: 0;
-                border: none;
-            }
-            .fullscreen-header {
-                padding: 16px 18px;
-                font-size: 17px;
-            }
-            .fullscreen-body {
-                padding: 18px 16px;
-            }
+            .layout { grid-template-columns: 1fr; height: auto; min-height: auto; }
+            .left-column { height: auto; overflow: visible; }
+            .card-answer, .card-history { flex: 0 0 auto; }
+            .card-answer .card-body, .card-history .card-body { overflow: visible; flex: unset; }
+            .answer-box { min-height: 260px; max-height: 520px; flex: unset; }
+            .chat-list { min-height: 220px; max-height: 420px; flex: unset; }
+            .right-column { height: auto; overflow: visible; padding-right: 0; }
+            .fullscreen-overlay { padding: 0; }
+            .fullscreen-dialog { width: 100vw; height: 100vh; max-width: none; max-height: none; border-radius: 0; border: none; }
         }
     </style>
 </head>
@@ -664,9 +148,8 @@
         <p>基于 CPU 服务器资源，部署于 GPU 服务器上的检索增强生成系统，用于查询内部文档相关问题。</p>
     </div>
     <div class="layout">
-        <!-- 左栏 -->
         <div class="left-column" id="leftColumn">
-            <!-- 提问面板：固定高度，不伸缩 -->
+            <!-- 提问面板 -->
             <div class="card card-question">
                 <div class="card-header">提问面板</div>
                 <div class="card-body">
@@ -674,14 +157,16 @@
                         <textarea id="question" placeholder="请输入你的问题..."></textarea>
                         <div class="btn-row">
                             <button id="submitBtn" class="btn-primary" onclick="askQuestion()">提交问题</button>
-                            <button class="btn-danger" onclick="clearHistory()">清空历史</button>
+                            <!-- 【新增】保存历史按钮 -->
+                            <button id="saveBtn" class="btn-success" onclick="saveHistory()">保存历史</button>
+                            <button class="btn-danger" onclick="clearHistoryUI()">清空面板</button>
                             <button class="btn-secondary" onclick="copyQuestion()">复制问题</button>
                         </div>
                         <div id="status" class="status"></div>
                     </div>
                 </div>
             </div>
-            <!-- 当前回答：flex 伸展，内部滚动 -->
+            <!-- 当前回答 -->
             <div class="card card-answer">
                 <div class="card-header">
                     <span>当前回答</span>
@@ -694,10 +179,10 @@
                     <div id="answer" class="answer-box markdown-body muted">暂无回答</div>
                 </div>
             </div>
-            <!-- 历史对话：flex 伸展，内部滚动 -->
+            <!-- 历史对话 -->
             <div class="card card-history">
                 <div class="card-header">
-                    <span>历史对话</span>
+                    <span>历史对话 (未保存)</span>
                     <div class="card-actions">
                         <button class="btn-secondary" onclick="openFullscreenPanel('history')">全屏</button>
                     </div>
@@ -709,6 +194,8 @@
                 </div>
             </div>
         </div>
+
+        <!-- 全屏面板 -->
         <div id="fullscreenOverlay" class="fullscreen-overlay" style="display:none;" onclick="handleOverlayClick(event)">
             <div class="fullscreen-dialog">
                 <div class="fullscreen-header">
@@ -722,31 +209,20 @@
                 </div>
             </div>
         </div>
-        <!-- 右栏：整列滚动 -->
+
         <div class="right-column" id="rightColumn">
+            <!-- 状态面板略 -->
             <div class="card">
                 <div class="card-header">查询分析</div>
-                <div class="card-body">
-                    <div id="routeInfo" class="route-box">
-                        <div class="muted">暂无路由信息</div>
-                    </div>
-                </div>
+                <div class="card-body"><div id="routeInfo" class="route-box"><div class="muted">暂无路由信息</div></div></div>
             </div>
             <div class="card" id="catalogCard">
                 <div class="card-header">目录 / 文件结果</div>
-                <div class="card-body">
-                    <div id="catalogResult" class="catalog-list">
-                        <div class="muted">暂无目录或文件结果</div>
-                    </div>
-                </div>
+                <div class="card-body"><div id="catalogResult" class="catalog-list"><div class="muted">暂无目录或文件结果</div></div></div>
             </div>
             <div class="card" id="retrievalCard">
                 <div class="card-header">知识库检索结果</div>
-                <div class="card-body">
-                    <div id="retrievals" class="retrieval-list">
-                        <div class="muted">暂无检索结果</div>
-                    </div>
-                </div>
+                <div class="card-body"><div id="retrievals" class="retrieval-list"><div class="muted">暂无检索结果</div></div></div>
             </div>
         </div>
     </div>
@@ -754,359 +230,300 @@
         网址：http://172.18.218.245:5000。AI 生成内容，请注意依据来源自行查询辨别！若遇到问题，请联系韦子扬、翁文曦。
     </div>
 </div>
+
 <script>
     let latestAnswerText = "";
     let currentRoute = "";
     let latestRouteInfo = null;
     let latestFileResult = null;
     let latestRetrievals = [];
-    /* ---------- 右栏高度同步（纯 CSS 控制，JS 仅处理 header 实测高度修正） ---------- */
+
+    // 全局对话历史数组
+    let currentHistory = [];
+
     function syncLayoutHeight() {
         if (window.innerWidth <= 1100) return;
-        const header = document.querySelector(".header");
-        const footer = document.querySelector(".footer-note");
         const layout = document.querySelector(".layout");
-        if (!header || !footer || !layout) return;
-        // 使用实测高度替代 CSS 变量估算，保证精准
-        const headerH = header.getBoundingClientRect().height;
-        const footerH = footer.getBoundingClientRect().height;
-        const pageMargin = 20;      // margin-top
-        const pagePaddingB = 24;    // padding-bottom
-        const headerMB = 18;        // margin-bottom of header
-        const layoutMT = 0;
-        const footerMT = 18;        // margin-top of footer-note
-        const available = window.innerHeight
-            - pageMargin
-            - pagePaddingB
-            - headerH
-            - headerMB
-            - footerH
-            - footerMT
-            - 4; // 少量余量防出现滚动条
-        const finalH = Math.max(available, 480);
-        layout.style.height = finalH + "px";
+        if (!layout) return;
+        const available = window.innerHeight - 44 - 120 - 36 - 4;
+        layout.style.height = Math.max(available, 480) + "px";
     }
     window.addEventListener("load", syncLayoutHeight);
     window.addEventListener("resize", syncLayoutHeight);
-    /* ---------- Markdown ---------- */
-    marked.setOptions({
-        gfm: true,
-        breaks: true
-    });
-    function renderMarkdown(text) {
-        return DOMPurify.sanitize(marked.parse(text || ""));
-    }
-    function escapeHtml(text) {
-        const d = document.createElement("div");
-        d.textContent = text || "";
-        return d.innerHTML;
-    }
+
+    marked.setOptions({ gfm: true, breaks: true });
+    function renderMarkdown(text) { return DOMPurify.sanitize(marked.parse(text || "")); }
+    function escapeHtml(text) { const d = document.createElement("div"); d.textContent = text || ""; return d.innerHTML; }
+
     function setStatus(msg = "", type = "") {
         const el = document.getElementById("status");
         el.className = "status";
         if (type) el.classList.add(type);
         el.textContent = msg;
     }
+
     async function renderMarkdownToElement(el, text, withCursor = false) {
         if (!el) return;
         const html = renderMarkdown(text || "");
-        el.innerHTML = withCursor
-            ? html + "<span class='cursor-blink'></span>"
-            : html;
-        el.querySelectorAll("pre code").forEach(block => {
-            try { hljs.highlightElement(block); } catch (e) {}
-        });
-        if (window.MathJax && window.MathJax.typesetPromise) {
-            try {
-                await MathJax.typesetPromise([el]);
-            } catch (err) {
-                console.error("MathJax render error:", err);
-            }
-        }
+        el.innerHTML = withCursor ? html + "<span class='cursor-blink'></span>" : html;
+        el.querySelectorAll("pre code").forEach(block => { try { hljs.highlightElement(block); } catch (e) {} });
+        if (window.MathJax && window.MathJax.typesetPromise) { try { await MathJax.typesetPromise([el]); } catch (err) {} }
     }
+
+    /* ---------- 修改：历史渲染与成对分组 ---------- */
+    function createMsgHtml(item) {
+        return `
+            <div class="msg ${item.role === 'user' ? 'user' : 'assistant'}">
+                <div class="msg-label">${item.role === 'user' ? '用户' : '助手'}</div>
+                <div class="bubble">
+                    <div class="history-content markdown-body">${renderMarkdown(item.content || "")}</div>
+                </div>
+            </div>
+        `;
+    }
+
     async function renderHistory(history) {
         const box = document.getElementById("history");
         if (!history || !history.length) {
             box.innerHTML = '<div class="muted">暂无历史对话</div>';
+            updateFullscreenHistoryIfOpen();
             return;
         }
-        box.innerHTML = history.map(i => `
-            <div class="msg ${i.role === 'user' ? 'user' : 'assistant'}">
-                <div class="msg-label">${i.role === 'user' ? '用户' : '助手'}</div>
-                <div class="bubble">
-                    <div class="history-content markdown-body">${renderMarkdown(i.content || "")}</div>
-                </div>
-            </div>
-        `).join("");
-        box.querySelectorAll("pre code").forEach(block => {
-            try { hljs.highlightElement(block); } catch (e) {}
-        });
-        if (window.MathJax && window.MathJax.typesetPromise) {
-            try {
-                await MathJax.typesetPromise([box]);
-            } catch (err) {
-                console.error("MathJax history render error:", err);
+
+        let html = "";
+        let i = 0;
+        // 遍历数组，尝试把 User 和随后挨着的 Assistant 打包成一轮
+        while (i < history.length) {
+            const isUser = history[i].role === 'user';
+
+            // 包裹一轮对话的容器
+            html += `<div class="history-pair">`;
+            // 添加右上角的删除按钮，传入当前这条在数组中的索引起点
+            html += `<button class="btn-delete-pair" onclick="deleteHistoryPair(${i})" title="删除此轮对话">删除这轮</button>`;
+
+            if (isUser) {
+                html += createMsgHtml(history[i]);
+                i++;
+                // 如果下一条是 AI 回答，打包在一起
+                if (i < history.length && history[i].role === 'assistant') {
+                    html += createMsgHtml(history[i]);
+                    i++;
+                }
+            } else {
+                // 如果出现错乱，单独渲染 AI（也带删除按钮）
+                html += createMsgHtml(history[i]);
+                i++;
+            }
+            html += `</div>`;
+        }
+
+        box.innerHTML = html;
+
+        box.querySelectorAll("pre code").forEach(block => { try { hljs.highlightElement(block); } catch (e) {} });
+        if (window.MathJax && window.MathJax.typesetPromise) { try { await MathJax.typesetPromise([box]); } catch (err) {} }
+
+        box.scrollTop = box.scrollHeight;
+        updateFullscreenHistoryIfOpen();
+    }
+
+    // 【新增功能】删除一轮历史对话
+    async function deleteHistoryPair(startIndex) {
+        if (!confirm("确定要删除这一轮对话吗？(注意: 未保存前不影响云端数据)")) return;
+
+        let deleteCount = 1;
+        // 判断下一条是否是 AI，如果是，一并删掉
+        if (startIndex + 1 < currentHistory.length && currentHistory[startIndex + 1].role === 'assistant') {
+            deleteCount = 2;
+        }
+        currentHistory.splice(startIndex, deleteCount);
+        setStatus("一轮对话已在面板移除，需点击[保存历史]才能同步到服务器。", "loading");
+
+        document.querySelector('.card-history .card-header span').textContent = "历史对话 (未保存)";
+        await renderHistory(currentHistory);
+    }
+
+    // 如果全屏面板正开着，立刻同步把新内容塞进去
+    function updateFullscreenHistoryIfOpen() {
+        const overlay = document.getElementById("fullscreenOverlay");
+        if (overlay.style.display === "flex") {
+            const title = document.getElementById("fullscreenTitle");
+            if (title.textContent.includes("历史对话")) {
+                const content = document.getElementById("fullscreenContent");
+                const historyEl = document.getElementById("history");
+                content.innerHTML = historyEl ? `<div class="chat-list">${historyEl.innerHTML}</div>` : '<div class="muted">暂无历史对话</div>';
             }
         }
-        box.scrollTop = box.scrollHeight;
     }
-    /* ---------- 路由信息 ---------- */
-    function routeLabel(route) {
-        if (route === "rag_search") return "知识库检索问答";
-        if (route === "file_list") return "目录/文件枚举";
-        if (route === "hybrid") return "混合模式";
-        return route || "未知";
+
+    /* ---------- 【新增】手动保存历史到后端 ---------- */
+    async function saveHistory() {
+        const btn = document.getElementById("saveBtn");
+        const oldText = btn.textContent;
+        btn.textContent = "保存中...";
+        btn.disabled = true;
+
+        try {
+            const res = await fetch("/save_history", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ history: currentHistory })
+            });
+            const data = await res.json();
+            if (data.success) {
+                setStatus("历史记录已保存到服务器。", "success");
+                document.querySelector('.card-history .card-header span').textContent = "历史对话 (已保存)";
+            } else {
+                setStatus("保存失败：" + data.error, "error");
+            }
+        } catch (e) {
+            setStatus("保存异常：" + e, "error");
+        } finally {
+            btn.textContent = oldText;
+            btn.disabled = false;
+        }
     }
+
+    // 【修改】只清空前端界面，不请求后端（符合只在点击保存时生效的逻辑）
+    async function clearHistoryUI() {
+        if (!confirm("确定清空当前面板的所有历史对话吗？\n\n如果想要在云端也删除历史，清空后面板请点击 [保存历史]。")) return;
+
+        const ab = document.getElementById("answer");
+        latestAnswerText = "";
+        document.getElementById("question").value = "";
+        ab.classList.add("muted");
+        ab.innerHTML = "暂无回答";
+
+        currentHistory = [];
+        await renderHistory(currentHistory);
+        resetRightPanel();
+
+        document.querySelector('.card-history .card-header span').textContent = "历史对话 (未保存)";
+        setStatus("面板历史已清空，如需清空云端存档，请点击 [保存历史]。", "loading");
+    }
+
+    // 路由及检索渲染保持原样
+    function routeLabel(route) { if (route === "rag_search") return "知识库检索问答"; if (route === "file_list") return "目录/文件枚举"; if (route === "hybrid") return "混合模式"; return route || "未知"; }
     function renderRouteInfo(info) {
         const box = document.getElementById("routeInfo");
         latestRouteInfo = info || null;
-        if (!info) {
-            box.innerHTML = '<div class="muted">暂无路由信息</div>';
-            return;
-        }
-        box.innerHTML = `
-            <div class="route-card">
-                <div><strong>当前方案：</strong>${escapeHtml(routeLabel(info.route))}</div>
-                <div><strong>路由标识：</strong>${escapeHtml(info.route || "")}</div>
-                <div><strong>目标对象：</strong>${escapeHtml(info.route_target || "")}</div>
-                <div><strong>原因：</strong>${escapeHtml(info.route_reason || "")}</div>
-            </div>
-        `;
+        if (!info) { box.innerHTML = '<div class="muted">暂无路由信息</div>'; return; }
+        box.innerHTML = `<div class="route-card"><div><strong>当前方案：</strong>${escapeHtml(routeLabel(info.route))}</div><div><strong>路由标识：</strong>${escapeHtml(info.route || "")}</div><div><strong>目标对象：</strong>${escapeHtml(info.route_target || "")}</div><div><strong>原因：</strong>${escapeHtml(info.route_reason || "")}</div></div>`;
         togglePanelsByRoute(info.route);
     }
     function togglePanelsByRoute(route) {
         const catalogCard = document.getElementById("catalogCard");
         const retrievalCard = document.getElementById("retrievalCard");
-        if (route === "rag_search") {
-            catalogCard.style.display = "none";
-            retrievalCard.style.display = "block";
-        } else if (route === "file_list") {
-            catalogCard.style.display = "block";
-            retrievalCard.style.display = "none";
-        } else if (route === "hybrid") {
-            catalogCard.style.display = "block";
-            retrievalCard.style.display = "block";
-        } else {
-            catalogCard.style.display = "block";
-            retrievalCard.style.display = "block";
-        }
+        if (route === "rag_search") { catalogCard.style.display = "none"; retrievalCard.style.display = "block"; }
+        else if (route === "file_list") { catalogCard.style.display = "block"; retrievalCard.style.display = "none"; }
+        else { catalogCard.style.display = "block"; retrievalCard.style.display = "block"; }
     }
-    /* ---------- 目录/文件结果 ---------- */
     function renderCatalogResult(fileResult) {
         const box = document.getElementById("catalogResult");
         latestFileResult = fileResult || null;
-        if (!fileResult) {
-            box.innerHTML = '<div class="muted">暂无目录或文件结果</div>';
-            return;
-        }
+        if (!fileResult) { box.innerHTML = '<div class="muted">暂无目录或文件结果</div>'; return; }
+        // 省略中间一大段不需修改的渲染逻辑...
         const mode = fileResult.mode || "";
         if (mode === "filesystem_directory") {
             const matchedDir = fileResult.matched_dir || "";
             const dirs = fileResult.directories || [];
             const files = fileResult.files || [];
-            let html = `
-                <div class="catalog-card">
-                    <div><strong>模式：</strong>目录定位</div>
-                    <div><strong>匹配目录：</strong>${escapeHtml(matchedDir)}</div>
-                </div>
-            `;
+            let html = `<div class="catalog-card"><div><strong>模式：</strong>目录定位</div><div><strong>匹配目录：</strong>${escapeHtml(matchedDir)}</div></div>`;
             if (dirs.length) {
                 html += `<div class="catalog-section-title">下一级子目录</div>`;
-                html += dirs.map((d, i) => `
-                    <div class="catalog-item">
-                        <span class="catalog-index">${i + 1}.</span>
-                        <span class="catalog-type">[目录]</span>
-                        <span class="catalog-name">${escapeHtml(d.name || "")}</span>
-                        <div class="catalog-path">${escapeHtml(d.rel_path || "")}</div>
-                    </div>
-                `).join("");
+                html += dirs.map((d, i) => `<div class="catalog-item"><span class="catalog-index">${i + 1}.</span><span class="catalog-type">[目录]</span><span class="catalog-name">${escapeHtml(d.name || "")}</span><div class="catalog-path">${escapeHtml(d.rel_path || "")}</div></div>`).join("");
             }
             if (files.length) {
                 html += `<div class="catalog-section-title">该目录下文件</div>`;
-                html += files.map((f, i) => `
-                    <div class="catalog-item">
-                        <span class="catalog-index">${i + 1}.</span>
-                        <span class="catalog-type">[文件]</span>
-                        <span class="catalog-name">${escapeHtml(f.name || "")}</span>
-                        <div class="catalog-path">${escapeHtml(f.rel_path || "")}</div>
-                    </div>
-                `).join("");
+                html += files.map((f, i) => `<div class="catalog-item"><span class="catalog-index">${i + 1}.</span><span class="catalog-type">[文件]</span><span class="catalog-name">${escapeHtml(f.name || "")}</span><div class="catalog-path">${escapeHtml(f.rel_path || "")}</div></div>`).join("");
             }
-            if (!dirs.length && !files.length) {
-                html += `<div class="muted">该目录下未发现子目录或文件。</div>`;
-            }
-            box.innerHTML = html;
-            return;
+            if (!dirs.length && !files.length) html += `<div class="muted">该目录下未发现子目录或文件。</div>`;
+            box.innerHTML = html; return;
         }
         const entries = fileResult.entries || [];
-        if (!entries.length) {
-            box.innerHTML = '<div class="muted">未找到匹配的目录或文件。</div>';
-            return;
-        }
-        let html = `
-            <div class="catalog-card">
-                <div><strong>模式：</strong>${escapeHtml(mode || "搜索")}</div>
-                <div><strong>结果数：</strong>${entries.length}</div>
-            </div>
-        `;
+        if (!entries.length) { box.innerHTML = '<div class="muted">未找到匹配的目录或文件。</div>'; return; }
+        let html = `<div class="catalog-card"><div><strong>模式：</strong>${escapeHtml(mode || "搜索")}</div><div><strong>结果数：</strong>${entries.length}</div></div>`;
         html += entries.slice(0, 100).map((item, i) => {
             const type = item.type || "file";
             const title = item.doc_title || item.file_name || item.name || "未知";
             const extra = item.count != null ? `，chunks: ${item.count}` : "";
             const score = item.score != null ? `，score: ${item.score}` : "";
-            return `
-                <div class="catalog-item">
-                    <span class="catalog-index">${i + 1}.</span>
-                    <span class="catalog-type">[${escapeHtml(type === "directory" ? "目录" : "文件")}]</span>
-                    <span class="catalog-name">${escapeHtml(title)}</span>
-                    <div class="catalog-path">${escapeHtml(item.rel_path || "")}${escapeHtml(extra)}${escapeHtml(score)}</div>
-                </div>
-            `;
+            return `<div class="catalog-item"><span class="catalog-index">${i + 1}.</span><span class="catalog-type">[${escapeHtml(type === "directory" ? "目录" : "文件")}]</span><span class="catalog-name">${escapeHtml(title)}</span><div class="catalog-path">${escapeHtml(item.rel_path || "")}${escapeHtml(extra)}${escapeHtml(score)}</div></div>`;
         }).join("");
         box.innerHTML = html;
     }
-    /* ---------- 检索结果 ---------- */
     function renderRetrievals(list, retrievalMeta = null) {
         const box = document.getElementById("retrievals");
         latestRetrievals = list || [];
         let headerHtml = "";
         if (retrievalMeta) {
-            headerHtml = `
-                <div class="retrieval-summary">
-                    <div><strong>改写问题：</strong>${escapeHtml(retrievalMeta.rewritten_question || "")}</div>
-                    <div><strong>关键词：</strong>${escapeHtml((retrievalMeta.keywords || []).join("、"))}</div>
-                    <div><strong>检索查询：</strong>${escapeHtml((retrievalMeta.queries || []).join(" | "))}</div>
-                </div>
-            `;
+            headerHtml = `<div class="retrieval-summary"><div><strong>改写问题：</strong>${escapeHtml(retrievalMeta.rewritten_question || "")}</div><div><strong>关键词：</strong>${escapeHtml((retrievalMeta.keywords || []).join("、"))}</div><div><strong>检索查询：</strong>${escapeHtml((retrievalMeta.queries || []).join(" | "))}</div></div>`;
         }
-        if (!list || !list.length) {
-            box.innerHTML = headerHtml + '<div class="muted">暂无检索结果</div>';
-            return;
-        }
+        if (!list || !list.length) { box.innerHTML = headerHtml + '<div class="muted">暂无检索结果</div>'; return; }
         box.innerHTML = headerHtml + list.map((item, idx) => {
-            const pid = `preview-${idx}`;
-            const fid = `full-${idx}`;
-            const bid = `btn-${idx}`;
-            const previewText = item.preview ?? "暂无预览";
-            const fullText = item.content ?? item.preview ?? "暂无全文内容";
-            return `
-                <div class="retrieval-card">
-                    <div class="retrieval-top">
-                        <div class="retrieval-title">片段 ${escapeHtml(String(item.index ?? idx + 1))}</div>
-                        <div class="retrieval-meta">
-                            标题：${escapeHtml(String(item.doc_title ?? "未知标题"))}<br>
-                            文件：${escapeHtml(String(item.file_name ?? "未知文件"))}<br>
-                            路径：${escapeHtml(String(item.rel_path ?? "未知路径"))}<br>
-                            页码：${escapeHtml(String(item.page ?? "未知页码"))}<br>
-                            分数：${escapeHtml(String(item.rerank_score ?? "N/A"))}
-                        </div>
-                    </div>
-                    <div class="retrieval-content">
-                        <div id="${pid}" class="retrieval-preview">${escapeHtml(previewText)}</div>
-                        <div id="${fid}" class="retrieval-full" style="display:none;">${escapeHtml(fullText)}</div>
-                        <span id="${bid}" class="toggle-link" onclick="toggleRetrieval('${pid}','${fid}','${bid}')">展开全文</span>
-                    </div>
-                </div>
-            `;
+            const pid = `preview-${idx}`; const fid = `full-${idx}`; const bid = `btn-${idx}`;
+            const previewText = item.preview ?? "暂无预览"; const fullText = item.content ?? item.preview ?? "暂无全文内容";
+            return `<div class="retrieval-card"><div class="retrieval-top"><div class="retrieval-title">片段 ${escapeHtml(String(item.index ?? idx + 1))}</div><div class="retrieval-meta">标题：${escapeHtml(String(item.doc_title ?? "未知标题"))}<br>文件：${escapeHtml(String(item.file_name ?? "未知文件"))}<br>路径：${escapeHtml(String(item.rel_path ?? "未知路径"))}<br>分数：${escapeHtml(String(item.rerank_score ?? "N/A"))}</div></div><div class="retrieval-content"><div id="${pid}" class="retrieval-preview">${escapeHtml(previewText)}</div><div id="${fid}" class="retrieval-full" style="display:none;">${escapeHtml(fullText)}</div><span id="${bid}" class="toggle-link" onclick="toggleRetrieval('${pid}','${fid}','${bid}')">展开全文</span></div></div>`;
         }).join("");
     }
     function toggleRetrieval(pid, fid, bid) {
-        const preview = document.getElementById(pid);
-        const full = document.getElementById(fid);
-        const btn = document.getElementById(bid);
+        const preview = document.getElementById(pid); const full = document.getElementById(fid); const btn = document.getElementById(bid);
         if (!preview || !full || !btn) return;
         const expanded = full.style.display === "block";
-        if (expanded) {
-            full.style.display = "none";
-            preview.style.display = "block";
-            btn.textContent = "展开全文";
-        } else {
-            full.style.display = "block";
-            preview.style.display = "none";
-            btn.textContent = "收起全文";
-        }
+        if (expanded) { full.style.display = "none"; preview.style.display = "block"; btn.textContent = "展开全文"; }
+        else { full.style.display = "block"; preview.style.display = "none"; btn.textContent = "收起全文"; }
     }
     function resetRightPanel() {
-        currentRoute = "";
-        latestRouteInfo = null;
-        latestFileResult = null;
-        latestRetrievals = [];
-        renderRouteInfo(null);
-        renderCatalogResult(null);
-        renderRetrievals([]);
-        document.getElementById("catalogCard").style.display = "block";
-        document.getElementById("retrievalCard").style.display = "block";
+        currentRoute = ""; latestRouteInfo = null; latestFileResult = null; latestRetrievals = [];
+        renderRouteInfo(null); renderCatalogResult(null); renderRetrievals([]);
+        document.getElementById("catalogCard").style.display = "block"; document.getElementById("retrievalCard").style.display = "block";
     }
+
     async function openFullscreenPanel(type) {
         const overlay = document.getElementById("fullscreenOverlay");
         const title = document.getElementById("fullscreenTitle");
         const content = document.getElementById("fullscreenContent");
-
         if (type === "answer") {
             title.textContent = "当前回答（全屏预览）";
             content.innerHTML = `<div class="markdown-body">${renderMarkdown(latestAnswerText || "暂无回答")}</div>`;
         } else {
             title.textContent = "历史对话（全屏预览）";
             const historyEl = document.getElementById("history");
-            content.innerHTML = historyEl
-                ? `<div class="chat-list">${historyEl.innerHTML}</div>`
-                : '<div class="muted">暂无历史对话</div>';
+            content.innerHTML = historyEl ? `<div class="chat-list">${historyEl.innerHTML}</div>` : '<div class="muted">暂无历史对话</div>';
         }
-
         overlay.style.display = "flex";
         document.body.style.overflow = "hidden";
+        content.querySelectorAll("pre code").forEach(block => { try { hljs.highlightElement(block); } catch (e) {} });
+        if (window.MathJax && window.MathJax.typesetPromise) { try { await MathJax.typesetPromise([content]); } catch (err) {} }
+    }
+    function closeFullscreenPanel() { document.getElementById("fullscreenOverlay").style.display = "none"; document.getElementById("fullscreenContent").innerHTML = ""; document.body.style.overflow = ""; }
+    function handleOverlayClick(event) { const dialog = document.querySelector(".fullscreen-dialog"); if (!dialog) return; if (!dialog.contains(event.target)) closeFullscreenPanel(); }
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeFullscreenPanel(); });
 
-        content.querySelectorAll("pre code").forEach(block => {
-            try { hljs.highlightElement(block); } catch (e) {}
-        });
-
-        if (window.MathJax && window.MathJax.typesetPromise) {
-            try { await MathJax.typesetPromise([content]); } catch (err) {}
-        }
-    }
-    function closeFullscreenPanel() {
-        document.getElementById("fullscreenOverlay").style.display = "none";
-        document.getElementById("fullscreenContent").innerHTML = "";
-        document.body.style.overflow = "";
-    }
-    function handleOverlayClick(event) {
-        const dialog = document.querySelector(".fullscreen-dialog");
-        if (!dialog) return;
-        if (!dialog.contains(event.target)) {
-            closeFullscreenPanel();
-        }
-    }
-    document.addEventListener("keydown", function (e) {
-        if (e.key === "Escape") closeFullscreenPanel();
-    });
-    /* ---------- 流式请求 ---------- */
     async function askQuestion() {
         const qi = document.getElementById("question");
         const ab = document.getElementById("answer");
         const submitBtn = document.getElementById("submitBtn");
         const q = qi.value.trim();
-        if (!q) {
-            setStatus("请输入问题后再提交。", "error");
-            return;
-        }
+        if (!q) { setStatus("请输入问题后再提交。", "error"); return; }
+
+        currentHistory.push({ role: "user", content: q });
+        await renderHistory(currentHistory);
+        document.querySelector('.card-history .card-header span').textContent = "历史对话 (未保存)";
+
         submitBtn.disabled = true;
         setStatus("正在分析问题...", "loading");
         ab.classList.remove("muted");
         latestAnswerText = "";
         ab.innerHTML = "<span class='cursor-blink'></span>";
         resetRightPanel();
+
         try {
             const res = await fetch("/ask_stream", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ question: q })
+                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: q })
             });
             if (!res.ok) {
                 let msg = `HTTP Error: ${res.status}`;
-                try {
-                    const err = await res.json();
-                    if (err && err.error) msg = err.error;
-                } catch (_) {}
+                try { const err = await res.json(); if (err && err.error) msg = err.error; } catch (_) {}
                 throw new Error(msg);
             }
             const reader = res.body.getReader();
@@ -1123,37 +540,24 @@
                     const jsonStr = line.substring(6);
                     try {
                         const data = JSON.parse(jsonStr);
-                        if (data.type === "start") {
-                            setStatus("已提交问题，开始处理...", "loading");
-                        }
+                        if (data.type === "start") setStatus("已提交问题，开始处理...", "loading");
                         else if (data.type === "metadata" && data.stage === "route") {
                             currentRoute = data.route || "";
                             renderRouteInfo(data);
-                            if (currentRoute === "rag_search") {
-                                setStatus("已选择：知识库检索问答", "loading");
-                            } else if (currentRoute === "file_list") {
-                                setStatus("已选择：目录/文件枚举", "loading");
-                            } else if (currentRoute === "hybrid") {
-                                setStatus("已选择：混合模式", "loading");
-                            } else {
-                                setStatus("正在处理...", "loading");
-                            }
+                            if (currentRoute === "rag_search") setStatus("已选择：知识库检索问答", "loading");
+                            else if (currentRoute === "file_list") setStatus("已选择：目录/文件枚举", "loading");
+                            else if (currentRoute === "hybrid") setStatus("已选择：混合模式", "loading");
+                            else setStatus("正在处理...", "loading");
                         }
                         else if (data.type === "tool") {
                             renderCatalogResult(data.content);
-                            if (currentRoute === "file_list") {
-                                setStatus("目录/文件结果已获取，正在生成回答...", "loading");
-                            } else if (currentRoute === "hybrid") {
-                                setStatus("目录/文件结果已获取，继续检索知识库...", "loading");
-                            }
+                            if (currentRoute === "file_list") setStatus("目录/文件结果已获取，正在生成回答...", "loading");
+                            else if (currentRoute === "hybrid") setStatus("目录/文件结果已获取，继续检索知识库...", "loading");
                         }
                         else if (data.type === "metadata" && data.stage === "retrieval") {
                             renderRetrievals(data.retrievals || [], data);
-                            if (currentRoute === "rag_search") {
-                                setStatus("检索完成，正在生成回答...", "loading");
-                            } else if (currentRoute === "hybrid") {
-                                setStatus("混合检索完成，正在生成回答...", "loading");
-                            }
+                            if (currentRoute === "rag_search") setStatus("检索完成，正在生成回答...", "loading");
+                            else if (currentRoute === "hybrid") setStatus("混合检索完成，正在生成回答...", "loading");
                         }
                         else if (data.type === "chunk") {
                             latestAnswerText += data.content || "";
@@ -1161,143 +565,69 @@
                             ab.scrollTop = ab.scrollHeight;
                         }
                         else if (data.type === "final") {
-                            if (data.content) {
-                                latestAnswerText = data.content;
-                                await renderMarkdownToElement(ab, latestAnswerText, false);
-                            }
-                            if (data.route && !latestRouteInfo) {
-                                renderRouteInfo({
-                                    route: data.route,
-                                    route_target: "",
-                                    route_reason: ""
-                                });
-                            }
-                            if (data.file_result) {
-                                renderCatalogResult(data.file_result);
-                            }
-                            if (data.retrievals && data.retrievals.length) {
-                                renderRetrievals(data.retrievals, {
-                                    rewritten_question: data.rewritten_question || "",
-                                    keywords: data.keywords || [],
-                                    queries: data.queries || []
-                                });
-                            }
-                            setStatus("回答完成。");
-                        }
-                        else if (data.type === "end") {
-                            setStatus("回答完成。");
+                            if (data.content) { latestAnswerText = data.content; await renderMarkdownToElement(ab, latestAnswerText, false); }
+                            if (data.route && !latestRouteInfo) renderRouteInfo({ route: data.route, route_target: "", route_reason: "" });
+                            if (data.file_result) renderCatalogResult(data.file_result);
+                            if (data.retrievals && data.retrievals.length) renderRetrievals(data.retrievals, { rewritten_question: data.rewritten_question || "", keywords: data.keywords || [], queries: data.queries || [] });
+
+                            setStatus("回答完成。(记得点击保存以防丢失)", "success");
+                            currentHistory.push({ role: "assistant", content: latestAnswerText });
+                            await renderHistory(currentHistory);
                         }
                         else if (data.type === "error") {
-                            setStatus(data.content || "生成异常", "error");
-                            await renderMarkdownToElement(
-                                ab,
-                                (latestAnswerText || "") + "\n\n**[生成异常: " + (data.content || "未知错误") + "]**",
-                                false
-                            );
+                            const errorMsg = "生成异常: " + (data.content || "未知错误");
+                            setStatus(errorMsg, "error");
+                            latestAnswerText = (latestAnswerText || "") + "\n\n**[" + errorMsg + "]**";
+                            await renderMarkdownToElement(ab, latestAnswerText, false);
+                            currentHistory.push({ role: "assistant", content: latestAnswerText });
+                            await renderHistory(currentHistory);
                         }
-                    } catch (err) {
-                        console.error("JSON parse error:", jsonStr, err);
-                    }
+                    } catch (err) { console.error("JSON parse error:", jsonStr, err); }
                 }
             }
         } catch (e) {
             setStatus("请求异常：" + e.message, "error");
-            await renderMarkdownToElement(ab, "请求异常：" + (e.message || e), false);
+            latestAnswerText = "请求异常：" + (e.message || e);
+            await renderMarkdownToElement(ab, latestAnswerText, false);
+            currentHistory.push({ role: "assistant", content: latestAnswerText });
+            await renderHistory(currentHistory);
         } finally {
             submitBtn.disabled = false;
         }
     }
-    /* ---------- 清空 ---------- */
-    async function clearHistory() {
-        const ab = document.getElementById("answer");
-        try {
-            const res = await fetch("/clear", { method: "POST" });
-            const data = await res.json();
-            if (!data.success) {
-                setStatus(data.error || "清空失败", "error");
-                return;
-            }
-            latestAnswerText = "";
-            document.getElementById("question").value = "";
-            ab.classList.add("muted");
-            ab.innerHTML = "暂无回答";
-            await renderHistory([]);
-            resetRightPanel();
-            setStatus("");
-        } catch (e) {
-            setStatus("清空异常：" + e, "error");
-        }
-    }
-    /* ---------- 复制 ---------- */
+
     async function copyLatestAnswer() {
-        if (!latestAnswerText) {
-            setStatus("当前没有可复制的回答。", "error");
-            return;
-        }
+        if (!latestAnswerText) { setStatus("当前没有可复制的回答。", "error"); return; }
         try {
             if (navigator.clipboard && window.isSecureContext) {
                 await navigator.clipboard.writeText(latestAnswerText);
-                setStatus("回答已复制到剪贴板。");
-                return;
+                setStatus("回答已复制到剪贴板。"); return;
             }
-            const textarea = document.createElement("textarea");
-            textarea.value = latestAnswerText;
-            textarea.style.position = "fixed";
-            textarea.style.left = "-9999px";
-            textarea.style.top = "0";
-            textarea.setAttribute("readonly", "");
-            document.body.appendChild(textarea);
-            textarea.focus();
-            textarea.select();
-            textarea.setSelectionRange(0, textarea.value.length);
-            const ok = document.execCommand("copy");
-            document.body.removeChild(textarea);
-            if (ok) {
-                setStatus("回答已复制到剪贴板。");
-            } else {
-                setStatus("复制失败：浏览器不支持自动复制，请手动复制。", "error");
-            }
-        } catch (e) {
-            setStatus("复制失败：" + e, "error");
-        }
+            const textarea = document.createElement("textarea"); textarea.value = latestAnswerText; textarea.style.position = "fixed"; textarea.style.left = "-9999px"; textarea.style.top = "0"; textarea.setAttribute("readonly", ""); document.body.appendChild(textarea); textarea.focus(); textarea.select(); textarea.setSelectionRange(0, textarea.value.length);
+            const ok = document.execCommand("copy"); document.body.removeChild(textarea);
+            if (ok) setStatus("回答已复制到剪贴板。"); else setStatus("复制失败：浏览器不支持自动复制，请手动复制。", "error");
+        } catch (e) { setStatus("复制失败：" + e, "error"); }
     }
+
     async function copyQuestion() {
         const questionText = document.getElementById("question").value.trim();
-        if (!questionText) {
-            setStatus("当前没有可复制的问题。", "error");
-            return;
-        }
+        if (!questionText) { setStatus("当前没有可复制的问题。", "error"); return; }
         try {
             if (navigator.clipboard && window.isSecureContext) {
                 await navigator.clipboard.writeText(questionText);
-                setStatus("问题已复制到剪贴板。");
-                return;
+                setStatus("问题已复制到剪贴板。"); return;
             }
-            const textarea = document.createElement("textarea");
-            textarea.value = questionText;
-            textarea.style.position = "fixed";
-            textarea.style.left = "-9999px";
-            textarea.style.top = "0";
-            textarea.setAttribute("readonly", "");
-            document.body.appendChild(textarea);
-            textarea.focus();
-            textarea.select();
-            textarea.setSelectionRange(0, textarea.value.length);
-            const ok = document.execCommand("copy");
-            document.body.removeChild(textarea);
-            if (ok) {
-                setStatus("问题已复制到剪贴板。");
-            } else {
-                setStatus("复制失败：浏览器不支持自动复制，请手动复制。", "error");
-            }
-        } catch (e) {
-            setStatus("复制失败：" + e, "error");
-        }
+            const textarea = document.createElement("textarea"); textarea.value = questionText; textarea.style.position = "fixed"; textarea.style.left = "-9999px"; textarea.style.top = "0"; textarea.setAttribute("readonly", ""); document.body.appendChild(textarea); textarea.focus(); textarea.select(); textarea.setSelectionRange(0, textarea.value.length);
+            const ok = document.execCommand("copy"); document.body.removeChild(textarea);
+            if (ok) setStatus("问题已复制到剪贴板。"); else setStatus("复制失败：浏览器不支持自动复制，请手动复制。", "error");
+        } catch (e) { setStatus("复制失败：" + e, "error"); }
     }
+
     window.addEventListener("DOMContentLoaded", async () => {
         syncLayoutHeight();
-        const initialHistory = {{ history | tojson | safe }};
-        await renderHistory(initialHistory || []);
+        currentHistory = {{ history | tojson | safe }} || [];
+        await renderHistory(currentHistory);
+        document.querySelector('.card-history .card-header span').textContent = "历史对话 (已读取云端存档)";
         resetRightPanel();
     });
 </script>

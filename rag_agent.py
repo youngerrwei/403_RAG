@@ -11,6 +11,7 @@ from difflib import SequenceMatcher
 from langchain_openai import ChatOpenAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
@@ -23,8 +24,58 @@ load_dotenv()
 # =========================
 # 全局状态
 # =========================
-chat_history: List[Dict[str, str]] = []
 _runtime: Optional[dict] = None
+
+
+# =========================
+# 历史记录本地文件管理
+# =========================
+HISTORY_DIR = os.path.join(os.getcwd(), "data", "chat_histories")
+os.makedirs(HISTORY_DIR, exist_ok=True)
+
+def get_history_path(username: str) -> str:
+    """获取指定用户的历史记录文件路径，过滤特殊字符防止路径穿越漏洞"""
+    if not username:
+        username = "anonymous"
+    # 只允许字母、数字、点、下划线、减号
+    safe_name = "".join(c for c in str(username) if c.isalnum() or c in "._-")
+    return os.path.join(HISTORY_DIR, f"{safe_name}.json")
+
+def load_history(username: str) -> List[Dict[str, str]]:
+    """读取指定用户的对话历史"""
+    path = get_history_path(username)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            debug_log(f"读取用户 {username} 历史失败:", repr(e))
+            return []
+    return []
+
+def save_history(username: str, history: List[Dict[str, str]]):
+    """保存指定用户的对话历史到本地"""
+    path = get_history_path(username)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        debug_log(f"保存用户 {username} 历史失败:", repr(e))
+
+def append_to_user_history(username: str, role: str, content: str):
+    """向指定用户追加一条对话记录，并限制最大保存条数防止文件过大"""
+    history = load_history(username)
+    history.append({"role": role, "content": content})
+    # 防止文件无限增大，限制保留最近的 500 条（250轮对话）
+    if len(history) > 500:
+        history = history[-500:]
+    save_history(username, history)
+
+def clear_user_history(username: str):
+    """清空指定用户的历史记录"""
+    path = get_history_path(username)
+    if os.path.exists(path):
+        os.remove(path)
 
 
 # =========================
@@ -32,6 +83,48 @@ _runtime: Optional[dict] = None
 # =========================
 def _env_bool(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "y", "on"}
+
+
+def expand_to_parent_docs(child_docs: List[Document], top_k: int) -> List[Document]:
+    """
+    将检索并重排后的子块，转换为其对应的父块。
+    按子块的最高得分顺序，依次提取父块，直到凑齐 top_k 个独立父块。
+    """
+    parent_docs = []
+    seen_parent_ids = set()
+
+    for child in child_docs:
+        md = child.metadata or {}
+        parent_id = md.get("parent_id")
+        parent_content = md.get("parent_content")
+
+        if parent_id and parent_content:
+            if parent_id not in seen_parent_ids:
+                seen_parent_ids.add(parent_id)
+                # 创建新的父 Document
+                parent_doc = Document(
+                    page_content=parent_content,
+                    metadata=md.copy()
+                )
+                # 标记该块被还原为大块
+                parent_doc.metadata["size"] = "large"
+                # 清理掉 payload 中巨大的父文本，避免打印日志过长
+                parent_doc.metadata.pop("parent_content", None)
+
+                parent_docs.append(parent_doc)
+        else:
+            # 兼容老数据（如果没有经过子父切分，直接使用当前块）
+            fallback_id = md.get("rel_path", "") + str(hash(child.page_content))
+            if fallback_id not in seen_parent_ids:
+                seen_parent_ids.add(fallback_id)
+                parent_docs.append(child)
+
+        # 只要收集到足够的父块就停止
+        if len(parent_docs) >= top_k:
+            break
+
+    debug_log(f"expand_to_parent_docs: 展开获得 {len(parent_docs)} 个独立父块")
+    return parent_docs
 
 
 DEBUG_MODE = _env_bool("DEBUG_MODE", "true")
@@ -404,17 +497,27 @@ def rewrite_question(llm, question: str) -> dict:
 # 检索与重排
 # =========================
 def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int):
+    """
+    🔥 升级版：
+    - 不再均分K
+    - 每个query都拿大K（大召回）
+    - 后面再统一裁剪
+    """
     all_docs = []
+
+    per_query_k = max(top_k_each // max(1, len(queries)), 20)
+
     for q in queries:
         t0 = time.perf_counter()
         try:
-            docs = vectorstore.similarity_search(q, k=top_k_each)
+            docs = vectorstore.similarity_search(q, k=per_query_k)
             elapsed = time.perf_counter() - t0
-            debug_log(f"similarity_search query={repr(q)} k={top_k_each} docs={len(docs)} elapsed={elapsed:.3f}s")
+            debug_log(f"[RECALL] q={repr(q)} k={per_query_k} docs={len(docs)} time={elapsed:.3f}s")
             all_docs.extend(docs)
         except Exception as e:
-            elapsed = time.perf_counter() - t0
-            debug_log(f"similarity_search error query={repr(q)} elapsed={elapsed:.3f}s err={repr(e)}")
+            debug_log(f"[RECALL ERROR] q={repr(q)} err={repr(e)}")
+
+    debug_log(f"[RECALL TOTAL] before merge = {len(all_docs)}")
     return all_docs
 
 
@@ -429,10 +532,9 @@ def dedup_docs(docs):
 
         for doc in docs:
             file_name = doc.metadata.get("file_name", "")
-            page = doc.metadata.get("page", "")
             content = clean_retrieval_display_text(doc.page_content)
 
-            exact_key = (file_name, page, content[:1000])
+            exact_key = (file_name, content[:1000])
             if exact_key in seen:
                 continue
 
@@ -446,36 +548,77 @@ def dedup_docs(docs):
 def rerank_docs(reranker, query: str, docs, top_k: int):
     if not docs:
         return []
+
     try:
-        with Timer(f"rerank_docs input={len(docs)} top_k={top_k}"):
+        with Timer(f"rerank_docs_v2 input={len(docs)} top_k={top_k}"):
+
             pairs = [(query, clean_retrieval_display_text(d.page_content)) for d in docs]
             scores = reranker.predict(pairs)
-            scored = list(zip(docs, scores))
-            scored.sort(key=lambda x: float(x[1]), reverse=True)
 
-            final_docs = []
-            for doc, score in scored[:top_k]:
-                doc.metadata["rerank_score"] = float(score)
-                final_docs.append(doc)
+            boosted = []
 
-            debug_log(f"rerank_docs output={len(final_docs)}")
+            for doc, score in zip(docs, scores):
+                score = float(score)
+
+                text = doc.page_content or ""
+                meta = doc.metadata or {}
+
+                # 🔥 1. chunk size bias（关键）
+                size = meta.get("size", "")
+                if size == "large":
+                    score += 0.15
+                elif size == "medium":
+                    score += 0.08
+
+                # 🔥 2. keyword boost
+                if query.lower() in text.lower():
+                    score += 0.1
+
+                # 🔥 3. 标题 boost
+                title = meta.get("doc_title", "")
+                if query.lower() in str(title).lower():
+                    score += 0.12
+
+                doc.metadata["rerank_score"] = score
+                boosted.append((doc, score))
+
+            boosted.sort(key=lambda x: x[1], reverse=True)
+
+            final_docs = [d for d, _ in boosted[:top_k]]
+
+            debug_log(f"rerank_docs_v2 output={len(final_docs)}")
             return final_docs
+
     except Exception as e:
-        debug_log("rerank_docs error:", repr(e))
+        debug_log("rerank_docs_v2 error:", repr(e))
         return docs[:top_k]
 
 
-def build_context(docs) -> str:
+def build_context(docs, max_chars: int = 6000) -> str:
+    """
+    🔥 升级版：加入长度熔断机制，防止大召回导致 LLM 上下文爆炸。
+    """
     parts = []
-    for i, doc in enumerate(docs, start=1):
-        parts.append(
-            f"[片段{i}]\n"
+    current_length = 0
+
+    for doc in docs:
+        content = (
             f"[文档标题] {doc.metadata.get('doc_title', '未知标题')}\n"
             f"[路径] {doc.metadata.get('rel_path', '未知路径')}\n"
-            f"[页码] {doc.metadata.get('page', '未知页码')}\n"
             f"{clean_retrieval_display_text(doc.page_content)}"
         )
-    return "\n\n".join(parts)
+
+        doc_len = len(content)
+
+        # 【新增】长度校验：如果加入当前块会严重超标，则丢弃排名靠后的父块
+        if current_length + doc_len > max_chars and current_length > 0:
+            debug_log(f"上下文已达 {current_length} 字符，截断后续 {len(docs) - len(parts)} 个排名较低的文档以防爆炸。")
+            break
+
+        parts.append(content)
+        current_length += doc_len
+
+    return "\n\n====================\n\n".join(parts)
 
 
 # =========================
@@ -821,15 +964,13 @@ def answer_stream(llm, question: str, context: str, route: str, route_reason: st
     你是实验室内部知识库问答助手。
 
     请严格遵守以下规则：
-    1. 必须优先依据“上下文结果”回答问题。
+    1. 必须且只能依据“上下文结果”回答问题。
     2. 如果用户问“有哪些设备/有哪些文件/目录下有什么/某组有什么设备”，优先根据目录/文件枚举结果作答，完整列出。
     3. 如果用户问的是说明、原理、参数、步骤、操作方法、用途等内容，优先根据文档检索片段回答。
     4. 如果上下文没有足够信息，请明确说明：“知识库中未找到足够相关内容”。
-    5. 可以基于你的通用知识补充，但必须明确标注：“以下补充非知识库内容”。
-    6. 回答要准确、专业、清晰，注意滤除你认为是文档解析错误带来的结果。
-    7. 如果能够识别来源路径或文档标题，回答结尾列出“主要来源”。
-    8. 如果是目录枚举类问题，优先用条目列表回答。
-    9. 涉及数学符号或公式时，必须使用标准 LaTeX 格式：$公式$。
+    5. 回答要准确、专业、清晰，注意滤除你认为是文档解析错误带来的结果。
+    6. 如果依据知识库内容进行回答，结尾必须列出“主要来源”。
+    7. 涉及数学符号或公式时，必须使用标准 LaTeX 格式：$公式$。
 
     上下文结果：
     {context}
@@ -850,9 +991,7 @@ def answer_stream(llm, question: str, context: str, route: str, route_reason: st
 # =========================
 # 主入口：流式
 # =========================
-def ask_stream(question: str) -> Generator[dict, None, None]:
-    global chat_history
-
+def ask_stream(question: str, username: str = "anonymous") -> Generator[dict, None, None]:
     total_start = time.perf_counter()
 
     try:
@@ -924,28 +1063,31 @@ def ask_stream(question: str) -> Generator[dict, None, None]:
                 debug_log(f"recalled_docs_after_dedup={len(recalled_docs)}")
 
             with Timer("stage_rerank"):
-                final_docs = rerank_docs(reranker, rewritten_question, recalled_docs, config["FINAL_TOP_K"])
+                child_top_k = config["FINAL_TOP_K"] * 3
+                reranked_child_docs = rerank_docs(reranker, rewritten_question, recalled_docs, child_top_k)
 
-            debug_log(f"final_docs={len(final_docs)}")
+                # 【新增】将重排后的子块展开为大召回的父块
+                final_docs = expand_to_parent_docs(reranked_child_docs, config["FINAL_TOP_K"])
+
+            debug_log(f"final_docs_after_parent_expansion={len(final_docs)}")
 
             for i, doc in enumerate(final_docs, start=1):
                 raw_content = (doc.page_content or "").strip()
                 display_content = clean_retrieval_display_text(raw_content)
-                preview = display_content[:220]
+                # 因为变成了父块，内容变长，截取预览长度可以稍微放宽
+                preview = display_content[:300]
 
                 rag_retrievals.append({
                     "index": i,
                     "doc_title": doc.metadata.get("doc_title", "未知标题"),
                     "file_name": doc.metadata.get("file_name", "未知文件"),
                     "rel_path": doc.metadata.get("rel_path", "未知路径"),
-                    "page": doc.metadata.get("page", "未知页码"),
                     "rerank_score": doc.metadata.get("rerank_score"),
                     "preview": preview,
-                    "content": display_content,
+                    "content": display_content,  # 这里前端展示和传入LLM的已经是完整的父块
                 })
 
-                debug_log("raw_content=", repr(raw_content[:200]))
-                debug_log("display_content=", repr(display_content[:200]))
+                debug_log(f"[DOC {i}] title={doc.metadata.get('doc_title')}")
 
             yield {
                 "type": "metadata",
@@ -979,8 +1121,8 @@ def ask_stream(question: str) -> Generator[dict, None, None]:
                         "content": content,
                     }
 
-        chat_history.append({"role": "user", "content": question})
-        chat_history.append({"role": "assistant", "content": full_answer})
+        # append_to_user_history(username, "user", question)
+        # append_to_user_history(username, "assistant", full_answer)
 
         total_elapsed = time.perf_counter() - total_start
         debug_log(f"ask_stream done total_elapsed={total_elapsed:.3f}s answer_len={len(full_answer)}")
