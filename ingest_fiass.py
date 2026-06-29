@@ -34,7 +34,7 @@ def load_config():
         "CHUNK_SIZE": int(os.getenv("CHUNK_SIZE", "900")),
         "CHUNK_OVERLAP": int(os.getenv("CHUNK_OVERLAP", "200")),
         "VECTOR_STORE_PATH": os.getenv("VECTOR_STORE_PATH", "./vector_store/faiss_index"),
-        "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3"),
+        "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "./models/bge-m3"),
         "EMBEDDING_DEVICE": os.getenv("EMBEDDING_DEVICE", "cuda"),
     }
     log(f"配置加载完成: {cfg}")

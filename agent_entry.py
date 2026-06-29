@@ -24,15 +24,16 @@ def debug_log(*args):
 
 def build_qwen_llm() -> ChatOpenAI:
     base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
-    api_key = os.getenv("VLLM_API_KEY", "EMPTY")
-    model_name = os.getenv("VLLM_MODEL_NAME", "qwen-7b-chat")
+    api_key = os.getenv("VLLM_API_KEY", "lab-secret-key")
+    model_name = os.getenv("VLLM_MODEL_NAME", "./models/Qwen3-8B-Instruct")
 
     llm = ChatOpenAI(
         model=model_name,
         openai_api_base=base_url,
         openai_api_key=api_key,
         temperature=0.1,
-        max_tokens=1024,
+        max_tokens=2048,
+        top_p=0.9,
         timeout=120,
     )
     return llm

@@ -105,8 +105,8 @@ def load_config() -> dict:
         "VLLM_API_KEY": os.getenv("VLLM_API_KEY", ""),
         "VLLM_MODEL_NAME": os.getenv("VLLM_MODEL_NAME", ""),
 
-        "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3"),
-        "EMBEDDING_DEVICE": os.getenv("EMBEDDING_DEVICE", "cpu"),
+        "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "./models/bge-m3"),
+        "EMBEDDING_DEVICE": os.getenv("EMBEDDING_DEVICE", "cuda:2"),
 
         # Qdrant 远程配置，替代 FAISS 本地路径
         "QDRANT_HOST": os.getenv("QDRANT_HOST", "172.18.216.71"),
@@ -121,8 +121,8 @@ def load_config() -> dict:
         "MAX_LEN": int(os.getenv("MAX_LEN", "2048")),
 
         # reranker
-        "RERANKER_MODEL_NAME": os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3"),
-        "RERANKER_DEVICE": os.getenv("RERANKER_DEVICE", "cpu"),
+        "RERANKER_MODEL_NAME": os.getenv("RERANKER_MODEL_NAME", "./models/bge-reranker-v2-m3"),
+        "RERANKER_DEVICE": os.getenv("RERANKER_DEVICE", "cuda:2"),
     }
 
     return config

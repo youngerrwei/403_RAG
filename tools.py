@@ -30,8 +30,8 @@ def _load_vectorstore_for_tool() -> QdrantVectorStore:
     qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
     collection_name = os.getenv("QDRANT_COLLECTION_NAME", "lab_knowledge_base")
 
-    embedding_model = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3")
-    embedding_device = os.getenv("EMBEDDING_DEVICE", "cpu")
+    embedding_model = os.getenv("EMBEDDING_MODEL_NAME", "./models/bge-m3")
+    embedding_device = os.getenv("EMBEDDING_DEVICE", "cuda:2")
 
     embeddings = HuggingFaceEmbeddings(
         model_name=embedding_model,

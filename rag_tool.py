@@ -102,11 +102,11 @@ def load_config() -> dict:
 
     config = {
         "VLLM_BASE_URL": os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
-        "VLLM_API_KEY": os.getenv("VLLM_API_KEY", ""),
-        "VLLM_MODEL_NAME": os.getenv("VLLM_MODEL_NAME", ""),
+        "VLLM_API_KEY": os.getenv("VLLM_API_KEY", "lab-secret-key"),
+        "VLLM_MODEL_NAME": os.getenv("VLLM_MODEL_NAME", "./models/Qwen3-8B-Instruct"),
 
-        "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3"),
-        "EMBEDDING_DEVICE": os.getenv("EMBEDDING_DEVICE", "cpu"),
+        "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "./models/bge-m3"),
+        "EMBEDDING_DEVICE": os.getenv("EMBEDDING_DEVICE", "cuda:2"),
 
         # Qdrant 远程配置，替代 FAISS 本地路径
         "QDRANT_HOST": os.getenv("QDRANT_HOST", "172.18.216.71"),
@@ -114,15 +114,15 @@ def load_config() -> dict:
         "QDRANT_COLLECTION_NAME": os.getenv("QDRANT_COLLECTION_NAME", "lab_knowledge_base"),
 
         # 初始召回数（先尽量多取一些，后面再重排）
-        "INITIAL_RETRIEVAL_K": int(os.getenv("INITIAL_RETRIEVAL_K", "20")),
+        "INITIAL_RETRIEVAL_K": int(os.getenv("INITIAL_RETRIEVAL_K", "64")),
         # 最终送给 LLM 的 topK
-        "FINAL_TOP_K": int(os.getenv("FINAL_TOP_K", "5")),
+        "FINAL_TOP_K": int(os.getenv("FINAL_TOP_K", "16")),
 
         "MAX_LEN": int(os.getenv("MAX_LEN", "2048")),
 
         # reranker
-        "RERANKER_MODEL_NAME": os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-v2-m3"),
-        "RERANKER_DEVICE": os.getenv("RERANKER_DEVICE", "cpu"),
+        "RERANKER_MODEL_NAME": os.getenv("RERANKER_MODEL_NAME", "./models/bge-reranker-v2-m3"),
+        "RERANKER_DEVICE": os.getenv("RERANKER_DEVICE", "cuda:2"),
     }
 
     return config
@@ -186,7 +186,7 @@ def build_llm(base_url: str, api_key: str, model_name: str):
             openai_api_key=api_key,
             openai_api_base=base_url,
             temperature=0.1,
-            max_tokens=1024,
+            max_tokens=int(os.getenv("RESPONSE_MAX_TOKENS", "2048")),
             streaming=True,
             timeout=120,
         )
