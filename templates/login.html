@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>LAB-403 登录</title>
-    <style>
+    <style nonce="{{ nonce }}">
         :root {
             --bg: #f4f7fb;
             --panel: #ffffff;
@@ -21,7 +21,7 @@
         body {
             margin: 0;
             font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
-            background: var(--bg);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: var(--text);
             display: flex;
             align-items: center;
@@ -29,61 +29,142 @@
             min-height: 100vh;
         }
         .login-card {
-            width: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.15);
+            padding: 48px 40px;
             max-width: 420px;
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 20px;
-            box-shadow: var(--shadow);
-            padding: 28px;
+            width: 100%;
         }
         h1 {
-            margin: 0 0 10px;
+            margin: 0 0 8px;
+            background: linear-gradient(135deg, #2563eb, #7c3aed);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
             font-size: 28px;
+            font-weight: 700;
+        }
+        .subtitle {
+            margin: 0 0 6px;
+            font-size: 13px;
+            color: #9ca3af;
+            font-weight: 500;
+            letter-spacing: 2px;
+            text-transform: uppercase;
         }
         p.desc {
-            margin: 0 0 24px;
+            margin: 0 0 28px;
             color: var(--subtext);
             line-height: 1.7;
+            font-size: 14px;
         }
         .form-group {
-            margin-bottom: 16px;
+            position: relative;
+            margin-bottom: 24px;
         }
-        label {
-            display: block;
-            margin-bottom: 8px;
-            font-size: 14px;
-            color: #374151;
-        }
-        input {
+        .form-group input {
             width: 100%;
-            padding: 12px 14px;
-            border: 1px solid var(--border);
-            border-radius: 12px;
+            padding: 16px 14px 8px;
+            border: 2px solid #e5e7eb;
+            border-radius: 10px;
             font-size: 15px;
+            background: #f9fafb;
+            transition: all 0.3s ease;
             outline: none;
         }
-        input:focus {
-            border-color: #93c5fd;
-            box-shadow: 0 0 0 4px rgba(37,99,235,.12);
+        .form-group input:focus {
+            border-color: #2563eb;
+            background: white;
+            box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.1);
+        }
+        .form-group label {
+            position: absolute;
+            left: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #6b7280;
+            font-size: 15px;
+            transition: all 0.2s ease;
+            pointer-events: none;
+            background: transparent;
+            padding: 0 4px;
+        }
+        .form-group input:focus + label,
+        .form-group input:not(:placeholder-shown) + label {
+            top: 6px;
+            transform: translateY(0);
+            font-size: 11px;
+            color: #2563eb;
+            background: white;
         }
         button {
-            width: 100%;
+            background: linear-gradient(135deg, #2563eb, #7c3aed);
             border: none;
-            border-radius: 12px;
-            padding: 12px 16px;
-            font-size: 15px;
-            background: var(--primary);
+            border-radius: 10px;
             color: white;
+            padding: 14px;
+            font-size: 16px;
+            font-weight: 600;
             cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            box-shadow: 0 4px 15px rgba(37, 99, 235, 0.3);
+            width: 100%;
         }
         button:hover {
-            background: var(--primary-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(37, 99, 235, 0.4);
+        }
+        button:active {
+            transform: translateY(0);
+        }
+        button.loading {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        button.loading::after {
+            content: '';
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-left: 8px;
+            vertical-align: middle;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .pwd-toggle {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            padding: 4px;
+            opacity: 0.5;
+            transition: opacity 0.2s;
+            box-shadow: none;
+            width: auto;
+        }
+        .pwd-toggle:hover {
+            opacity: 1;
+            transform: translateY(-50%);
+            box-shadow: none;
         }
         .status {
             min-height: 24px;
             margin-top: 14px;
             font-size: 14px;
+            text-align: center;
         }
         .status.error {
             color: var(--danger);
@@ -91,28 +172,62 @@
         .status.success {
             color: #059669;
         }
+
+        /* 暗色模式 */
+        @media (prefers-color-scheme: dark) {
+            body {
+                background: linear-gradient(135deg, #1e1b4b 0%, #312e81 100%);
+            }
+            .login-card {
+                background: rgba(30, 41, 59, 0.95);
+                border-color: rgba(100, 116, 139, 0.3);
+            }
+            .login-card h1 { color: #f1f5f9; -webkit-text-fill-color: unset; background: none; }
+            .login-card .subtitle { color: #64748b; }
+            .login-card .desc { color: #94a3b8; }
+            .form-group input {
+                background: #1e293b;
+                border-color: #334155;
+                color: #f1f5f9;
+            }
+            .form-group input:focus {
+                border-color: #3b82f6;
+                background: #0f172a;
+                box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.15);
+            }
+            .form-group label { color: #94a3b8; }
+            .form-group input:focus + label,
+            .form-group input:not(:placeholder-shown) + label {
+                color: #60a5fa;
+                background: #1e293b;
+            }
+            .status.error { color: #f87171; }
+            .status.success { color: #34d399; }
+        }
     </style>
 </head>
 <body>
     <div class="login-card">
+        <p class="subtitle">Intelligence Assistant</p>
         <h1>LAB-403 登录</h1>
         <p class="desc">请输入本系统分配的用户名和密码进行登录。</p>
 
         <div class="form-group">
+            <input id="username" type="text" placeholder=" " />
             <label for="username">用户名</label>
-            <input id="username" type="text" placeholder="请输入用户名" />
         </div>
 
         <div class="form-group">
+            <input id="password" type="password" placeholder=" " />
             <label for="password">密码</label>
-            <input id="password" type="password" placeholder="请输入密码" />
+            <button type="button" class="pwd-toggle" onclick="togglePassword()">👁</button>
         </div>
 
-        <button onclick="login()">登录</button>
+        <button id="loginBtn" onclick="login()">登录</button>
         <div id="status" class="status"></div>
     </div>
 
-    <script>
+    <script nonce="{{ nonce }}">
         function setStatus(msg = "", type = "") {
             const el = document.getElementById("status");
             el.className = "status";
@@ -120,14 +235,30 @@
             el.textContent = msg;
         }
 
+        function togglePassword() {
+            const pwd = document.getElementById('password');
+            const btn = document.querySelector('.pwd-toggle');
+            if (pwd.type === 'password') {
+                pwd.type = 'text';
+                btn.textContent = '🙈';
+            } else {
+                pwd.type = 'password';
+                btn.textContent = '👁';
+            }
+        }
+
         async function login() {
             const username = document.getElementById("username").value.trim();
             const password = document.getElementById("password").value;
+            const btn = document.getElementById("loginBtn");
 
             if (!username || !password) {
                 setStatus("用户名和密码不能为空。", "error");
                 return;
             }
+
+            btn.classList.add("loading");
+            setStatus("");
 
             try {
                 const res = await fetch("/login", {
@@ -142,6 +273,7 @@
 
                 if (!data.success) {
                     setStatus(data.error || "登录失败。", "error");
+                    btn.classList.remove("loading");
                     return;
                 }
 
@@ -152,6 +284,7 @@
 
             } catch (e) {
                 setStatus("请求异常：" + e, "error");
+                btn.classList.remove("loading");
             }
         }
 

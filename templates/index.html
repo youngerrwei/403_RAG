@@ -4,137 +4,470 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>LAB-403 RAG 知识库内部问答系统</title>
-    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
+    <script nonce="{{ nonce }}" src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script nonce="{{ nonce }}" src="https://cdn.jsdelivr.net/npm/dompurify@3.0.8/dist/purify.min.js"></script>
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
-    <script>
+    <script nonce="{{ nonce }}" src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+    <script nonce="{{ nonce }}">
         window.MathJax = {
             tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
             svg: { fontCache: 'global' },
             options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
         };
     </script>
-    <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
-    <style>
+    <script nonce="{{ nonce }}" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+    <style nonce="{{ nonce }}">
         :root {
-            --bg: #f4f7fb; --panel: #ffffff; --border: #e5e7eb; --text: #111827; --subtext: #6b7280;
-            --primary: #2563eb; --primary-hover: #1d4ed8; --danger: #ef4444; --danger-hover: #dc2626;
+            --bg: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%); --bg-flat: #f8fafc; --bg-color: #f8fafc;
+            --panel: #ffffff; --border: #e2e8f0; --text: #374151; --subtext: #475569;
+            --primary: #2563eb; --primary-hover: #1d4ed8; --danger: #f43f5e; --danger-hover: #e11d48;
             --success: #10b981; --success-hover: #059669;
-            --assistant-bg: #f8fafc; --user-bg: #eaf2ff; --shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
-            --radius: 16px; --page-v-padding: 44px; --header-height: 120px; --footer-height: 36px;
-            --columns-height: calc(100vh - var(--page-v-padding) - var(--header-height) - var(--footer-height));
+            --assistant-bg: #f8fafc; --user-bg: #dbeafe;
+            --shadow: 0 1px 3px rgba(0,0,0,0.04), 0 4px 12px rgba(0,0,0,0.06);
+            --shadow-hover: 0 2px 6px rgba(0,0,0,0.06), 0 8px 24px rgba(0,0,0,0.08);
+            --radius: 8px; --page-v-padding: 44px; --header-height: 56px; --footer-height: 32px;
         }
         * { box-sizing: border-box; }
-        html, body { height: 100%; margin: 0; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; color: var(--text); background: var(--bg); }
-        .page { max-width: 1680px; margin: 20px auto; padding: 0 20px 24px; display: flex; flex-direction: column; min-height: calc(100vh - 40px); }
-        .header { background: linear-gradient(135deg, #eef5ff, #ffffff); border: 1px solid var(--border); border-radius: 20px; padding: 24px 28px; box-shadow: var(--shadow); margin-bottom: 18px; flex: 0 0 auto; }
-        .header h1 { margin: 0 0 10px; font-size: 30px; color: #0f172a; }
-        .header p { margin: 0; color: var(--subtext); line-height: 1.7; font-size: 15px; }
+        html, body { height: 100vh; margin: 0; overflow: hidden; font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif; color: var(--text); background: var(--bg); background-color: var(--bg-color); font-size: 14px; }
+        .page { max-width: 1680px; margin: 0 auto; padding: 12px 16px 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        .header { background: #f8fafc; border: 1px solid var(--border); border-radius: 8px; padding: 10px 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); margin-bottom: 10px; flex: 0 0 auto; border-bottom: 2px solid #e0e7ff; }
+        .header h1 { margin: 0 0 4px; font-size: 20px; color: var(--text); }
+        .header p { margin: 0; color: var(--subtext); line-height: 1.5; font-size: 12px; }
 
-        .layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 18px; height: var(--columns-height); min-height: 480px; flex: 1 1 auto; }
-        .left-column { min-width: 0; display: flex; flex-direction: column; gap: 18px; height: 100%; overflow: hidden; }
-        .right-column { min-width: 0; height: 100%; overflow-y: auto; overflow-x: hidden; padding-right: 4px; display: flex; flex-direction: column; gap: 18px; }
+        .layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; flex: 1 1 0; min-height: 0; overflow: hidden; }
+        .left-column { min-width: 0; display: flex; flex-direction: column; gap: 10px; height: 100%; overflow: hidden; }
+        .right-column { min-width: 0; height: 100%; overflow-y: auto; overflow-x: hidden; padding-right: 4px; display: flex; flex-direction: column; gap: 10px; }
 
-        .card-question { flex: 0 0 auto; }
-        .card-answer { flex: 2 1 0; min-height: 120px; display: flex; flex-direction: column; overflow: hidden; }
-        .card-history { flex: 1.6 1 0; min-height: 120px; display: flex; flex-direction: column; overflow: hidden; }
-        .card-answer .card-body, .card-history .card-body { flex: 1 1 0; min-height: 0; overflow: hidden; display: flex; flex-direction: column; }
+        .card-question { flex: 0 0 auto; overflow: hidden; }
+        .card-answer { flex: 3; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+        .card-history { flex: 2; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+        .card-answer .card-body { flex: 1 1 0; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+        .card-history .card-body { flex: 1 1 0; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
 
-        .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); min-width: 0; }
+        .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); min-width: 0; transition: box-shadow 0.2s ease; }
+        .card:hover { box-shadow: var(--shadow-hover); }
         .right-column .card { flex: 0 0 auto; }
-        .card-header { padding: 18px 20px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 17px; display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; }
-        .card-body { padding: 18px 20px; min-width: 0; }
-        .input-wrap { display: flex; flex-direction: column; gap: 14px; }
-        textarea { width: 100%; min-height: 90px; height: 90px; resize: vertical; border: 1px solid var(--border); border-radius: 14px; padding: 16px; font-size: 16px; line-height: 1.75; outline: none; transition: border-color .2s, box-shadow .2s; }
-        textarea:focus { border-color: #93c5fd; box-shadow: 0 0 0 4px rgba(37,99,235,.12); }
+        .card-header { padding: 10px 14px; border-bottom: 1px solid var(--border); font-weight: 700; font-size: 15px; display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; color: var(--text); }
+        .card-body { padding: 12px 14px; min-width: 0; }
+        .input-wrap { display: flex; flex-direction: column; gap: 8px; }
+        textarea { width: 100%; min-height: 60px; height: 60px; resize: vertical; border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-size: 14px; line-height: 1.6; outline: none; transition: border-color .2s, box-shadow .2s; }
+        textarea:focus { border-color: #93c5fd; box-shadow: 0 0 0 3px rgba(59,130,246,0.1); }
 
-        .btn-row { display: flex; gap: 12px; flex-wrap: wrap; }
-        button { appearance: none; border: none; border-radius: 12px; padding: 11px 18px; font-size: 15px; cursor: pointer; transition: all .2s; }
+        .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+        button { appearance: none; border: none; border-radius: 6px; padding: 6px 14px; font-size: 13px; cursor: pointer; transition: all .2s; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
         .btn-primary { background: var(--primary); color: #fff; }
         .btn-primary:hover { background: var(--primary-hover); }
-        .btn-primary:disabled { background: #9ca3af; cursor: not-allowed; }
-        .btn-secondary { background: #eef2ff; color: #374151; }
-        .btn-secondary:hover { background: #e0e7ff; }
+        .btn-primary:disabled { background: #9ca3af; cursor: not-allowed; box-shadow: none; }
+        .btn-secondary { background: #f1f5f9; color: #475569; }
+        .btn-secondary:hover { background: #e2e8f0; }
         .btn-danger { background: var(--danger); color: #fff; }
         .btn-danger:hover { background: var(--danger-hover); }
         .btn-success { background: var(--success); color: #fff; }
         .btn-success:hover { background: var(--success-hover); }
 
-        .status { min-height: 24px; margin-top: 4px; font-size: 14px; }
+        .status { min-height: 20px; margin-top: 2px; font-size: 12px; }
         .status.loading { color: #b45309; }
         .status.error { color: var(--danger); }
-        .status.success { color: var(--success); }
+        .status.success { color: #059669; }
 
-        .answer-box, .chat-list { flex: 1 1 0; min-height: 0; overflow-y: auto; padding-right: 6px; word-break: break-word; overflow-wrap: anywhere; font-size: 16px; line-height: 1.85; }
-        .chat-list { display: flex; flex-direction: column; }
+        .answer-box, .chat-list { flex: 1 1 0; min-height: 0; padding-right: 6px; word-break: break-word; overflow-wrap: anywhere; font-size: 14px; line-height: 1.75; }
+        .answer-box { overflow-y: auto; }
+        .chat-list { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; overflow-y: auto; }
 
         /* 历史轮次分组样式 */
-        .history-pair { position: relative; padding-top: 34px; margin-bottom: 16px; border-top: 1px dashed #cbd5e1; display: flex; flex-direction: column; gap: 14px; }
-        .history-pair:first-child { border-top: none; } /* 删除了 padding-top: 0，让第一轮也保留顶部的按钮空间 */
-        .btn-delete-pair { position: absolute; top: 6px; right: 0; padding: 4px 10px; font-size: 12px; background: #fef2f2; color: #ef4444; border: 1px solid #f87171; border-radius: 6px; cursor: pointer; transition: 0.2s; z-index: 10; }
+        .history-pair { position: relative; padding-top: 26px; margin-bottom: 10px; border-top: 1px dashed #cbd5e1; display: flex; flex-direction: column; gap: 8px; }
+        .history-pair:first-child { border-top: none; }
+        .btn-delete-pair { position: absolute; top: 4px; right: 0; padding: 3px 8px; font-size: 11px; background: #fef2f2; color: #ef4444; border: 1px solid #f87171; border-radius: 4px; cursor: pointer; transition: 0.2s; z-index: 10; }
         .btn-delete-pair:hover { background: #ef4444; color: #fff; }
 
         .msg { display: flex; flex-direction: column; min-width: 0; }
-        .msg-label { font-size: 13px; color: var(--subtext); margin-bottom: 6px; padding: 0 4px; }
-        .bubble { border-radius: 14px; padding: 16px 18px; line-height: 1.8; border: 1px solid var(--border); word-break: break-word; overflow-wrap: anywhere; }
+        .msg-label { font-size: 12px; color: var(--subtext); margin-bottom: 4px; padding: 0 4px; }
+        .bubble { border-radius: 8px; padding: 10px 14px; line-height: 1.7; border: 1px solid var(--border); word-break: break-word; overflow-wrap: anywhere; font-size: 13px; }
         .msg.user .bubble { background: var(--user-bg); }
-        .msg.assistant .bubble { background: var(--assistant-bg); }
+        .msg.assistant .bubble { background: var(--assistant-bg); border-left: 3px solid #2563eb; }
 
-        .route-box, .catalog-list, .retrieval-list { font-size: 14px; line-height: 1.6; }
+        /* 卡片顶部边框色调区分 */
+        .card-retrieval { border-top: 3px solid #3b82f6; }
+        .card-catalog { border-top: 3px solid #10b981; }
+        .card-route { border-top: 3px solid #8b5cf6; }
+        .card-question { border-top: 3px solid #f59e0b; }
+        .card-answer { border-top: 3px solid #2563eb; }
+        .card-history { border-top: 3px solid #6366f1; }
+        .card-reasoning { border-top: 3px solid #ec4899; }
+
+        .route-box, .catalog-list, .retrieval-list { font-size: 13px; line-height: 1.5; }
         .catalog-list, .retrieval-list { overflow-x: hidden; }
-        .route-card, .catalog-card, .retrieval-summary { background: #f8f9fb; border: 1px solid #e6eaf0; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; }
-        .catalog-section-title { font-weight: 600; margin: 12px 0 8px; color: #333; }
-        .catalog-item { padding: 8px 10px; border: 1px solid #eceff4; border-radius: 8px; margin-bottom: 8px; background: #fff; }
-        .catalog-index { color: #666; margin-right: 4px; }
-        .catalog-type { color: #2457d6; font-weight: 600; margin-right: 6px; }
+        .route-card, .catalog-card, .retrieval-summary { background: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
+        .catalog-section-title { font-weight: 600; margin: 8px 0 6px; color: var(--text); font-size: 13px; }
+        .catalog-item { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px; background: #fff; font-size: 13px; }
+        .catalog-index { color: #64748b; margin-right: 4px; }
+        .catalog-type { color: #3b82f6; font-weight: 600; margin-right: 6px; }
         .catalog-name { font-weight: 500; }
-        .catalog-path { margin-top: 4px; color: #666; font-size: 12px; word-break: break-all; }
+        .catalog-path { margin-top: 3px; color: #64748b; font-size: 11px; word-break: break-all; }
 
-        .retrieval-card { border: 1px solid var(--border); border-radius: 14px; background: #fcfcfd; min-width: 0; margin-bottom: 14px; }
-        .retrieval-top { padding: 14px 16px; background: #f9fafb; border-bottom: 1px solid var(--border); }
-        .retrieval-title { font-weight: 700; font-size: 18px; margin-bottom: 8px; color: #111827; word-break: break-word; }
-        .retrieval-meta { font-size: 15px; color: var(--subtext); line-height: 1.75; word-break: break-word; }
-        .retrieval-content { padding: 16px; min-width: 0; }
-        .retrieval-preview, .retrieval-full { white-space: pre-wrap; line-height: 1.9; color: #1f2937; word-break: break-word; overflow-wrap: anywhere; font-size: 16px; }
+        .retrieval-card { border: 1px solid var(--border); border-radius: 8px; background: #fcfcfd; min-width: 0; margin-bottom: 10px; }
+        .retrieval-top { padding: 10px 12px; background: #f9fafb; border-bottom: 1px solid var(--border); }
+        .retrieval-title { font-weight: 700; font-size: 15px; margin-bottom: 4px; color: var(--text); word-break: break-word; }
+        .retrieval-meta { font-size: 13px; color: var(--subtext); line-height: 1.6; word-break: break-word; }
+        .retrieval-content { padding: 10px 12px; min-width: 0; }
+        .retrieval-preview, .retrieval-full { white-space: pre-wrap; line-height: 1.7; color: var(--text); word-break: break-word; overflow-wrap: anywhere; font-size: 13px; }
         .retrieval-full { display: none; }
-        .toggle-link { margin-top: 12px; display: inline-block; color: var(--primary); cursor: pointer; font-size: 15px; user-select: none; }
+        .toggle-link { margin-top: 8px; display: inline-block; color: var(--primary); cursor: pointer; font-size: 13px; user-select: none; }
         .muted { color: var(--subtext); }
 
-        .markdown-body { color: var(--text); line-height: 1.85; word-break: break-word; overflow-wrap: anywhere; font-size: 16px; }
-        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { margin: 1em 0 .6em; line-height: 1.5; }
-        .markdown-body p { margin: .7em 0; }
-        .markdown-body ul, .markdown-body ol { margin: .7em 0; padding-left: 1.8em; }
-        .markdown-body li { margin: .35em 0; }
-        .markdown-body blockquote { margin: .9em 0; padding: .9em 1em; border-left: 4px solid #93c5fd; background: #eff6ff; color: #374151; border-radius: 8px; }
-        .markdown-body code { background: #f3f4f6; padding: 2px 6px; border-radius: 6px; font-family: Consolas, Monaco, monospace; font-size: .92em; }
-        .markdown-body pre { background: #0f172a; color: #e5e7eb; padding: 16px; border-radius: 10px; overflow-x: auto; white-space: pre; margin: 14px 0; }
+        .markdown-body { color: var(--text); line-height: 1.75; word-break: break-word; overflow-wrap: anywhere; font-size: 14px; }
+        .markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { margin: .8em 0 .5em; line-height: 1.4; }
+        .markdown-body p { margin: .5em 0; }
+        .markdown-body ul, .markdown-body ol { margin: .5em 0; padding-left: 1.6em; }
+        .markdown-body li { margin: .25em 0; }
+        .markdown-body blockquote { margin: .7em 0; padding: .7em 1em; border-left: 3px solid #93c5fd; background: #eff6ff; color: #374151; border-radius: 6px; }
+        .markdown-body code { background: #f3f4f6; padding: 2px 5px; border-radius: 4px; font-family: Consolas, Monaco, monospace; font-size: .9em; }
+        .markdown-body pre { background: #0f172a; color: #e5e7eb; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre; margin: 10px 0; }
         .markdown-body pre code { background: transparent; padding: 0; color: inherit; }
-        .markdown-body table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; margin: 14px 0; }
-        .markdown-body th, .markdown-body td { border: 1px solid var(--border); padding: 9px 12px; text-align: left; white-space: nowrap; }
+        .markdown-body table { display: block; width: 100%; overflow-x: auto; border-collapse: collapse; margin: 10px 0; }
+        .markdown-body th, .markdown-body td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; white-space: nowrap; font-size: 13px; }
         .markdown-body th { background: #f9fafb; }
-        .footer-note { margin-top: 18px; text-align: center; color: var(--subtext); font-size: 13px; flex: 0 0 auto; }
-        .cursor-blink { display: inline-block; width: 2px; height: 18px; background-color: var(--primary); vertical-align: middle; margin-left: 4px; animation: blink 1s step-end infinite; }
+        .footer-note { padding: 6px 0; text-align: center; color: var(--subtext); font-size: 11px; flex: 0 0 auto; }
+        .cursor-blink { display: inline-block; width: 2px; height: 16px; background-color: var(--primary); vertical-align: middle; margin-left: 4px; animation: blink 1s step-end infinite; }
 
-        .fullscreen-overlay { position: fixed; inset: 0; z-index: 9999; background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(6px); display: flex; align-items: center; justify-content: center; padding: 24px; }
-        .fullscreen-dialog { width: min(1200px, 96vw); height: min(88vh, 900px); background: var(--panel); border: 1px solid var(--border); border-radius: 20px; box-shadow: 0 20px 60px rgba(15, 23, 42, 0.22); display: flex; flex-direction: column; overflow: hidden; }
-        .fullscreen-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 22px; border-bottom: 1px solid var(--border); background: linear-gradient(135deg, #eef5ff, #ffffff); font-size: 18px; font-weight: 700; color: #0f172a; }
-        .fullscreen-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 22px 24px; background: #ffffff; }
-        .fullscreen-body .markdown-body { font-size: 16px; line-height: 1.9; color: var(--text); }
+        .fullscreen-overlay { position: fixed; inset: 0; z-index: 9999; background: rgba(15, 23, 42, 0.45); backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; padding: 24px; }
+        .fullscreen-dialog { width: min(1200px, 96vw); height: min(88vh, 900px); background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 60px rgba(15, 23, 42, 0.22); display: flex; flex-direction: column; overflow: hidden; }
+        .fullscreen-header { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--border); background: #f8fafc; font-size: 16px; font-weight: 700; color: var(--text); }
+        .fullscreen-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 18px 20px; background: #ffffff; }
+        .fullscreen-body .markdown-body { font-size: 14px; line-height: 1.75; color: var(--text); }
         .fullscreen-body .chat-list { display: flex; flex-direction: column; gap: 0; }
 
-        .fullscreen-body::-webkit-scrollbar, .answer-box::-webkit-scrollbar, .chat-list::-webkit-scrollbar, .right-column::-webkit-scrollbar { width: 10px; }
-        .fullscreen-body::-webkit-scrollbar-thumb, .answer-box::-webkit-scrollbar-thumb, .chat-list::-webkit-scrollbar-thumb, .right-column::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
-        .fullscreen-body::-webkit-scrollbar-track, .answer-box::-webkit-scrollbar-track, .chat-list::-webkit-scrollbar-track, .right-column::-webkit-scrollbar-track { background: transparent; }
+        .fullscreen-body::-webkit-scrollbar, .card-answer .card-body::-webkit-scrollbar, .answer-box::-webkit-scrollbar, .right-column::-webkit-scrollbar { width: 6px; }
+        .fullscreen-body::-webkit-scrollbar-thumb, .card-answer .card-body::-webkit-scrollbar-thumb, .answer-box::-webkit-scrollbar-thumb, .right-column::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+        .fullscreen-body::-webkit-scrollbar-thumb:hover, .card-answer .card-body::-webkit-scrollbar-thumb:hover, .answer-box::-webkit-scrollbar-thumb:hover, .right-column::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .fullscreen-body::-webkit-scrollbar-track, .card-answer .card-body::-webkit-scrollbar-track, .answer-box::-webkit-scrollbar-track, .right-column::-webkit-scrollbar-track { background: transparent; }
+        /* 覆盖度提示条 */
+        .coverage-hint {
+            margin-top: 8px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+        .coverage-hint.medium { background: #e8f4fd; color: #1976d2; border-left: 3px solid #1976d2; }
+        .coverage-hint.low { background: #fff8e1; color: #f57c00; border-left: 3px solid #f57c00; }
+        .coverage-hint.very_low, .coverage-hint.none { background: #fce4ec; color: #c62828; border-left: 3px solid #c62828; }
+
+        /* 引用来源列表 */
+        .citations-container { margin-top: 8px; font-size: 13px; }
+        .citations-toggle { cursor: pointer; color: #666; padding: 4px 0; user-select: none; }
+        .citations-toggle:hover { color: #333; }
+        .citations-list { padding: 8px 12px; background: #f8f9fa; border-radius: 6px; margin-top: 4px; overflow: hidden; transition: max-height 0.3s ease, opacity 0.3s ease; max-height: 0; opacity: 0; }
+        .citation-item { display: flex; align-items: center; gap: 8px; padding: 4px 0; border-bottom: 1px solid #eee; }
+        .citation-item:last-child { border-bottom: none; }
+        .citation-source { font-weight: 500; color: #333; }
+        .citation-section { color: #666; flex: 1; }
+        .citation-score { background: #e8f5e9; color: #2e7d32; padding: 2px 6px; border-radius: 4px; font-size: 12px; }
+
         @keyframes blink { 50% { opacity: 0; } }
 
+        /* 三阶段流式反馈状态指示器 */
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            color: var(--subtext);
+            font-size: 14px;
+        }
+        .status-dots {
+            display: inline-flex;
+            gap: 4px;
+        }
+        .status-dots span {
+            animation: dot-bounce 1.4s infinite ease-in-out both;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background-color: #666;
+            display: inline-block;
+        }
+        .status-dots span:nth-child(1) { animation-delay: -0.32s; }
+        .status-dots span:nth-child(2) { animation-delay: -0.16s; }
+        .status-dots span:nth-child(3) { animation-delay: 0s; }
+        @keyframes dot-bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1.0); }
+        }
+
+        /* 暗色模式 - 跟随系统 */
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: linear-gradient(135deg, #0f172a 0%, #1a1a2e 50%, #16213e 100%);
+                --bg-flat: #0f172a;
+                --panel: #1e293b;
+                --border: #334155;
+                --text: #f1f5f9;
+                --subtext: #94a3b8;
+                --primary: #3b82f6;
+                --primary-hover: #60a5fa;
+                --danger: #f87171;
+                --success: #34d399;
+                --user-bubble: #1e3a5f;
+                --bot-bubble: #1e293b;
+                --shadow: 0 2px 8px rgba(0,0,0,0.3);
+                --shadow-lg: 0 8px 24px rgba(0,0,0,0.4);
+                --user-bg: #1e3a5f;
+                --assistant-bg: #1e293b;
+                --bg-color: #0f172a;
+                --shadow-hover: 0 4px 16px rgba(0,0,0,0.4);
+            }
+            .card-header { color: var(--text); }
+            .card-title,
+            h1, h2, h3,
+            .msg,
+            .header,
+            textarea,
+            input { color: var(--text); }
+            .desc,
+            .subtext,
+            p { color: var(--subtext); }
+            .bubble { color: var(--text); }
+            .header h1 { color: var(--text); }
+            .header { background: #1e293b; border-color: #334155; border-bottom-color: #334155; }
+            .retrieval-title { color: #f1f5f9; }
+            .retrieval-preview, .retrieval-full { color: #e2e8f0; }
+            .catalog-section-title { color: var(--text); }
+            .status-indicator { color: var(--subtext); }
+            .route-card, .catalog-card, .retrieval-summary { background: #0f172a; border-color: #334155; }
+            .catalog-item { background: #0f172a; border-color: #334155; }
+            .retrieval-card { background: #0f172a; border-color: #334155; }
+            .retrieval-top { background: #1e293b; border-color: #334155; }
+            .markdown-body code { background: #334155; color: #e2e8f0; }
+            .markdown-body blockquote { background: #1e293b; border-left-color: #3b82f6; color: #e2e8f0; }
+            .markdown-body th { background: #1e293b; }
+            .markdown-body th, .markdown-body td { border-color: #334155; color: #e2e8f0; }
+            .btn-secondary { background: #334155; color: #e2e8f0; }
+            .btn-secondary:hover { background: #475569; }
+            textarea { background: #0f172a; color: #f1f5f9; border-color: #334155; }
+            .fullscreen-header { background: #1e293b; color: #f1f5f9; border-color: #334155; }
+            .fullscreen-body { background: #0f172a; }
+            /* Agent 推理卡片暗色适配 */
+            #agent-reasoning-body { color: #f1f5f9; }
+            .agent-step details, #agent-reasoning-body .agent-step details {
+                background: #0f172a !important;
+                border-color: #334155 !important;
+            }
+            .agent-step summary, #agent-reasoning-body .agent-step summary {
+                color: #94a3b8 !important;
+            }
+            .agent-step pre, #agent-reasoning-body .agent-step pre {
+                color: #e2e8f0 !important;
+            }
+            .agent-tool-step details, #agent-reasoning-body .agent-tool-step details {
+                background: #0a1f1a !important;
+                border-color: #334155 !important;
+            }
+            .agent-tool-step summary, #agent-reasoning-body .agent-tool-step summary {
+                color: #34d399 !important;
+            }
+            .agent-tool-step pre, #agent-reasoning-body .agent-tool-step pre {
+                color: #e2e8f0 !important;
+            }
+            .agent-chunk-area, .agent-final-answer {
+                border-top-color: #334155 !important;
+                color: #f1f5f9;
+            }
+        }
+
+        /* 暗色模式 - 手动切换 */
+        [data-theme="dark"] {
+            --bg: linear-gradient(135deg, #0f172a 0%, #1a1a2e 50%, #16213e 100%);
+            --bg-flat: #0f172a;
+            --panel: #1e293b;
+            --border: #334155;
+            --text: #f1f5f9;
+            --subtext: #94a3b8;
+            --primary: #3b82f6;
+            --primary-hover: #60a5fa;
+            --danger: #f87171;
+            --success: #34d399;
+            --user-bubble: #1e3a5f;
+            --bot-bubble: #1e293b;
+            --shadow: 0 2px 8px rgba(0,0,0,0.3);
+            --shadow-lg: 0 8px 24px rgba(0,0,0,0.4);
+            --user-bg: #1e3a5f;
+            --assistant-bg: #1e293b;
+            --bg-color: #0f172a;
+            --shadow-hover: 0 4px 16px rgba(0,0,0,0.4);
+        }
+        [data-theme="dark"] .header { background: #1e293b; border-color: #334155; border-bottom-color: #334155; }
+        [data-theme="dark"] .header h1 { color: #f1f5f9; }
+        [data-theme="dark"] .route-card, [data-theme="dark"] .catalog-card, [data-theme="dark"] .retrieval-summary { background: #0f172a; border-color: #334155; }
+        [data-theme="dark"] .catalog-item { background: #0f172a; border-color: #334155; }
+        [data-theme="dark"] .retrieval-card { background: #0f172a; border-color: #334155; }
+        [data-theme="dark"] .retrieval-top { background: #1e293b; border-color: #334155; }
+        [data-theme="dark"] .retrieval-title { color: #f1f5f9; }
+        [data-theme="dark"] .retrieval-preview, [data-theme="dark"] .retrieval-full { color: #e2e8f0; }
+        [data-theme="dark"] .markdown-body code { background: #334155; color: #e2e8f0; }
+        [data-theme="dark"] .markdown-body blockquote { background: #1e293b; border-left-color: #3b82f6; color: #e2e8f0; }
+        [data-theme="dark"] .markdown-body th { background: #1e293b; }
+        [data-theme="dark"] .markdown-body th, [data-theme="dark"] .markdown-body td { border-color: #334155; color: #e2e8f0; }
+        [data-theme="dark"] .fullscreen-header { background: #1e293b; color: #f1f5f9; border-color: #334155; }
+        [data-theme="dark"] .fullscreen-body { background: #0f172a; }
+        [data-theme="dark"] .coverage-hint.medium { background: #1e3a5f; color: #93c5fd; border-left-color: #3b82f6; }
+        [data-theme="dark"] .coverage-hint.low { background: #422006; color: #fbbf24; border-left-color: #f59e0b; }
+        [data-theme="dark"] .coverage-hint.very_low, [data-theme="dark"] .coverage-hint.none { background: #450a0a; color: #fca5a5; border-left-color: #ef4444; }
+        [data-theme="dark"] .citations-list { background: #0f172a; }
+        [data-theme="dark"] .citation-item { border-bottom-color: #334155; }
+        [data-theme="dark"] .citation-source { color: #f1f5f9; }
+        [data-theme="dark"] .citation-section { color: #94a3b8; }
+        [data-theme="dark"] .citation-score { background: #064e3b; color: #34d399; }
+        [data-theme="dark"] .btn-secondary { background: #334155; color: #e2e8f0; }
+        [data-theme="dark"] .btn-secondary:hover { background: #475569; }
+        [data-theme="dark"] textarea { background: #0f172a; color: #f1f5f9; border-color: #334155; }
+        [data-theme="dark"] .msg.assistant .bubble { border-left-color: #3b82f6; }
+        [data-theme="dark"] .card-header { color: var(--text); }
+        [data-theme="dark"] .card-title,
+        [data-theme="dark"] h1, [data-theme="dark"] h2, [data-theme="dark"] h3,
+        [data-theme="dark"] .msg,
+        [data-theme="dark"] .header,
+        [data-theme="dark"] textarea,
+        [data-theme="dark"] input { color: var(--text); }
+        [data-theme="dark"] .desc,
+        [data-theme="dark"] .subtext,
+        [data-theme="dark"] p { color: var(--subtext); }
+        [data-theme="dark"] .bubble { color: var(--text); }
+        [data-theme="dark"] .catalog-section-title { color: var(--text); }
+        [data-theme="dark"] .status-indicator { color: var(--subtext); }
+        /* Agent 推理卡片暗色适配 */
+        [data-theme="dark"] #agent-reasoning-body { color: #f1f5f9; }
+        [data-theme="dark"] .agent-step details,
+        [data-theme="dark"] #agent-reasoning-body .agent-step details {
+            background: #0f172a !important;
+            border-color: #334155 !important;
+        }
+        [data-theme="dark"] .agent-step summary,
+        [data-theme="dark"] #agent-reasoning-body .agent-step summary {
+            color: #94a3b8 !important;
+        }
+        [data-theme="dark"] .agent-step pre,
+        [data-theme="dark"] #agent-reasoning-body .agent-step pre {
+            color: #e2e8f0 !important;
+        }
+        [data-theme="dark"] .agent-tool-step details,
+        [data-theme="dark"] #agent-reasoning-body .agent-tool-step details {
+            background: #0a1f1a !important;
+            border-color: #334155 !important;
+        }
+        [data-theme="dark"] .agent-tool-step summary,
+        [data-theme="dark"] #agent-reasoning-body .agent-tool-step summary {
+            color: #34d399 !important;
+        }
+        [data-theme="dark"] .agent-tool-step pre,
+        [data-theme="dark"] #agent-reasoning-body .agent-tool-step pre {
+            color: #e2e8f0 !important;
+        }
+        [data-theme="dark"] .agent-chunk-area,
+        [data-theme="dark"] .agent-final-answer {
+            border-top-color: #334155 !important;
+            color: #f1f5f9;
+        }
+
+        /* 消息气泡淡入滑入 */
+        @keyframes msg-slide-in {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .msg { animation: msg-slide-in 0.3s ease-out; }
+
+        /* 卡片 hover 微交互 */
+        .card-retrieval, .card-catalog, .card-route, .card-reasoning {
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        .card-retrieval:hover, .card-catalog:hover, .card-route:hover, .card-reasoning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+        }
+
+        /* 发送按钮 loading 状态 */
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        .btn-send.loading {
+            pointer-events: none;
+            opacity: 0.7;
+        }
+        .btn-send.loading::after {
+            content: '';
+            display: inline-block;
+            width: 14px; height: 14px;
+            border: 2px solid #fff;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-left: 6px;
+            vertical-align: middle;
+        }
+
+        /* 覆盖度提示淡入 */
+        .coverage-hint {
+            animation: msg-slide-in 0.4s ease-out;
+        }
+
+        /* 引用列表平滑展开 */
+        .citations-list {
+            overflow: hidden;
+            transition: max-height 0.3s ease, opacity 0.3s ease;
+            max-height: 0;
+            opacity: 0;
+        }
+        .citations-list.show {
+            max-height: 500px;
+            opacity: 1;
+        }
+
+        /* 主题切换按钮 */
+        #theme-toggle {
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.2s;
+        }
+        #theme-toggle:hover {
+            background: var(--border);
+        }
+
+        /* 侧边栏切换按钮（移动端） */
+        .mobile-only { display: none; }
+        #sidebar-toggle {
+            background: none;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 4px 10px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.2s;
+        }
+        #sidebar-toggle:hover { background: var(--border); }
+
+        /* 平板响应式 */
+        @media (max-width: 768px) {
+            .header { padding: 10px 16px; }
+            .layout { gap: 8px; padding: 8px; }
+            .right-column { display: none; }
+            .right-column.visible { display: flex; }
+            .left-column { width: 100%; }
+            .mobile-only { display: inline-flex; }
+        }
+
         @media (max-width: 1100px) {
-            .layout { grid-template-columns: 1fr; height: auto; min-height: auto; }
+            html, body { height: auto; overflow: auto; }
+            .page { height: auto; overflow: visible; }
+            .layout { grid-template-columns: 1fr; flex: unset; min-height: auto; overflow: visible; }
             .left-column { height: auto; overflow: visible; }
-            .card-answer, .card-history { flex: 0 0 auto; }
+            .card-answer, .card-history { flex: 0 0 auto; overflow: visible; }
             .card-answer .card-body, .card-history .card-body { overflow: visible; flex: unset; }
-            .answer-box { min-height: 260px; max-height: 520px; flex: unset; }
-            .chat-list { min-height: 220px; max-height: 420px; flex: unset; }
+            .answer-box { min-height: 260px; max-height: 520px; flex: unset; overflow-y: auto; }
+            .chat-list { min-height: 220px; max-height: 420px; flex: unset; overflow-y: auto; }
             .right-column { height: auto; overflow: visible; padding-right: 0; }
             .fullscreen-overlay { padding: 0; }
             .fullscreen-dialog { width: 100vw; height: 100vh; max-width: none; max-height: none; border-radius: 0; border: none; }
@@ -143,9 +476,15 @@
 </head>
 <body>
 <div class="page">
-    <div class="header">
-        <h1>LAB-403 RAG 知识库内部问答系统</h1>
-        <p>基于 CPU 服务器资源，部署于 GPU 服务器上的检索增强生成系统，用于查询内部文档相关问题。</p>
+    <div class="header" style="display:flex;align-items:center;justify-content:space-between;">
+        <div>
+            <h1>LAB-403 RAG 知识库内部问答系统</h1>
+            <p>基于 CPU 服务器资源，部署于 GPU 服务器上的检索增强生成系统，用于查询内部文档相关问题。</p>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+            <button id="theme-toggle" onclick="toggleTheme()" title="切换主题">🌓</button>
+            <button id="sidebar-toggle" onclick="toggleSidebar()" class="mobile-only" title="显示详情">☰</button>
+        </div>
     </div>
     <div class="layout">
         <div class="left-column" id="leftColumn">
@@ -156,11 +495,17 @@
                     <div class="input-wrap">
                         <textarea id="question" placeholder="请输入你的问题..."></textarea>
                         <div class="btn-row">
-                            <button id="submitBtn" class="btn-primary" onclick="askQuestion()">提交问题</button>
+                            <button id="submitBtn" class="btn-primary" onclick="askQuestionWithRetry()">提交问题</button>
                             <!-- 【新增】保存历史按钮 -->
                             <button id="saveBtn" class="btn-success" onclick="saveHistory()">保存历史</button>
                             <button class="btn-danger" onclick="clearHistoryUI()">清空面板</button>
                             <button class="btn-secondary" onclick="copyQuestion()">复制问题</button>
+                            <div class="mode-switch" style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;">
+                                <label style="font-size:13px;color:#666;cursor:pointer;">
+                                    <input type="checkbox" id="agentModeToggle" style="margin-right:4px;">
+                                    Agent 模式
+                                </label>
+                            </div>
                         </div>
                         <div id="status" class="status"></div>
                     </div>
@@ -211,18 +556,25 @@
         </div>
 
         <div class="right-column" id="rightColumn">
-            <!-- 状态面板略 -->
-            <div class="card">
+            <!-- RAG 模式三栏 -->
+            <div class="card card-route" id="routeCard">
                 <div class="card-header">查询分析</div>
                 <div class="card-body"><div id="routeInfo" class="route-box"><div class="muted">暂无路由信息</div></div></div>
             </div>
-            <div class="card" id="catalogCard">
+            <div class="card card-catalog" id="catalogCard">
                 <div class="card-header">目录 / 文件结果</div>
                 <div class="card-body"><div id="catalogResult" class="catalog-list"><div class="muted">暂无目录或文件结果</div></div></div>
             </div>
-            <div class="card" id="retrievalCard">
+            <div class="card card-retrieval" id="retrievalCard">
                 <div class="card-header">知识库检索结果</div>
                 <div class="card-body"><div id="retrievals" class="retrieval-list"><div class="muted">暂无检索结果</div></div></div>
+            </div>
+            <!-- Agent 推理过程卡片（默认隐藏） -->
+            <div class="card card-reasoning" id="agent-reasoning-card" style="display:none;">
+                <div class="card-header"><h3 style="margin:0;font-size:15px;">推理过程</h3></div>
+                <div class="card-body" id="agent-reasoning-body" style="max-height:600px;overflow-y:auto;">
+                    <p class="muted">等待 Agent 推理...</p>
+                </div>
             </div>
         </div>
     </div>
@@ -231,22 +583,33 @@
     </div>
 </div>
 
-<script>
+<script nonce="{{ nonce }}">
     let latestAnswerText = "";
     let currentRoute = "";
     let latestRouteInfo = null;
     let latestFileResult = null;
     let latestRetrievals = [];
+    let currentSourceMap = {};
+
+    // 历史对话状态枚举
+    const HISTORY_STATE = { SYNCED: 'synced', MODIFIED: 'modified', SAVING: 'saving' };
+    let historyState = HISTORY_STATE.SYNCED;
+
+    function updateHistoryLabel() {
+        const span = document.querySelector('.card-history .card-header span');
+        if (!span) return;
+        switch (historyState) {
+            case HISTORY_STATE.SYNCED: span.textContent = '历史对话 (已同步)'; break;
+            case HISTORY_STATE.MODIFIED: span.textContent = '历史对话 (未保存)'; break;
+            case HISTORY_STATE.SAVING: span.textContent = '历史对话 (保存中...)'; break;
+        }
+    }
 
     // 全局对话历史数组
     let currentHistory = [];
 
     function syncLayoutHeight() {
-        if (window.innerWidth <= 1100) return;
-        const layout = document.querySelector(".layout");
-        if (!layout) return;
-        const available = window.innerHeight - 44 - 120 - 36 - 4;
-        layout.style.height = Math.max(available, 480) + "px";
+        // Layout is now pure CSS flex, no JS height sync needed
     }
     window.addEventListener("load", syncLayoutHeight);
     window.addEventListener("resize", syncLayoutHeight);
@@ -255,11 +618,41 @@
     function renderMarkdown(text) { return DOMPurify.sanitize(marked.parse(text || "")); }
     function escapeHtml(text) { const d = document.createElement("div"); d.textContent = text || ""; return d.innerHTML; }
 
+    function renderSourceLinks(container, sourceMap) {
+        if (!container || !sourceMap || !Object.keys(sourceMap).length) return;
+        let html = container.innerHTML;
+        html = html.replace(/\[来源(\d+)\]/g, (match, num) => {
+            const src = sourceMap[num];
+            if (src) {
+                return `<sup class="source-link" title="${escapeHtml(src.doc_title || '')}\n${escapeHtml(src.rel_path || '')}" style="color:#1a73e8;cursor:help;text-decoration:underline;">[${num}]</sup>`;
+            }
+            return match;
+        });
+        container.innerHTML = html;
+    }
+
     function setStatus(msg = "", type = "") {
         const el = document.getElementById("status");
         el.className = "status";
         if (type) el.classList.add(type);
         el.textContent = msg;
+    }
+
+    /* ---------- 三阶段流式状态指示器 ---------- */
+    function showStatusIndicator(text) {
+        const ab = document.getElementById("answer");
+        hideStatusIndicator();  // 先移除已有的
+        const indicator = document.createElement("div");
+        indicator.className = "status-indicator";
+        indicator.id = "streamStatusIndicator";
+        indicator.innerHTML = `<span>${escapeHtml(text)}</span><span class="status-dots"><span></span><span></span><span></span></span>`;
+        ab.appendChild(indicator);
+        ab.scrollTop = ab.scrollHeight;
+    }
+
+    function hideStatusIndicator() {
+        const el = document.getElementById("streamStatusIndicator");
+        if (el) el.remove();
     }
 
     async function renderMarkdownToElement(el, text, withCursor = false) {
@@ -338,7 +731,7 @@
         currentHistory.splice(startIndex, deleteCount);
         setStatus("一轮对话已在面板移除，需点击[保存历史]才能同步到服务器。", "loading");
 
-        document.querySelector('.card-history .card-header span').textContent = "历史对话 (未保存)";
+        historyState = HISTORY_STATE.MODIFIED; updateHistoryLabel();
         await renderHistory(currentHistory);
     }
 
@@ -361,6 +754,7 @@
         const oldText = btn.textContent;
         btn.textContent = "保存中...";
         btn.disabled = true;
+        historyState = HISTORY_STATE.SAVING; updateHistoryLabel();
 
         try {
             const res = await fetch("/save_history", {
@@ -371,12 +765,14 @@
             const data = await res.json();
             if (data.success) {
                 setStatus("历史记录已保存到服务器。", "success");
-                document.querySelector('.card-history .card-header span').textContent = "历史对话 (已保存)";
+                historyState = HISTORY_STATE.SYNCED; updateHistoryLabel();
             } else {
                 setStatus("保存失败：" + data.error, "error");
+                historyState = HISTORY_STATE.MODIFIED; updateHistoryLabel();
             }
         } catch (e) {
             setStatus("保存异常：" + e, "error");
+            historyState = HISTORY_STATE.MODIFIED; updateHistoryLabel();
         } finally {
             btn.textContent = oldText;
             btn.disabled = false;
@@ -397,7 +793,7 @@
         await renderHistory(currentHistory);
         resetRightPanel();
 
-        document.querySelector('.card-history .card-header span').textContent = "历史对话 (未保存)";
+        historyState = HISTORY_STATE.MODIFIED; updateHistoryLabel();
         setStatus("面板历史已清空，如需清空云端存档，请点击 [保存历史]。", "loading");
     }
 
@@ -462,7 +858,8 @@
         box.innerHTML = headerHtml + list.map((item, idx) => {
             const pid = `preview-${idx}`; const fid = `full-${idx}`; const bid = `btn-${idx}`;
             const previewText = item.preview ?? "暂无预览"; const fullText = item.content ?? item.preview ?? "暂无全文内容";
-            return `<div class="retrieval-card"><div class="retrieval-top"><div class="retrieval-title">片段 ${escapeHtml(String(item.index ?? idx + 1))}</div><div class="retrieval-meta">标题：${escapeHtml(String(item.doc_title ?? "未知标题"))}<br>文件：${escapeHtml(String(item.file_name ?? "未知文件"))}<br>路径：${escapeHtml(String(item.rel_path ?? "未知路径"))}<br>分数：${escapeHtml(String(item.rerank_score ?? "N/A"))}</div></div><div class="retrieval-content"><div id="${pid}" class="retrieval-preview">${escapeHtml(previewText)}</div><div id="${fid}" class="retrieval-full" style="display:none;">${escapeHtml(fullText)}</div><span id="${bid}" class="toggle-link" onclick="toggleRetrieval('${pid}','${fid}','${bid}')">展开全文</span></div></div>`;
+            const scoreDisplay = item.rerank_score != null ? (item.rerank_score * 100).toFixed(1) + '%' : 'N/A';
+            return `<div class="retrieval-card"><div class="retrieval-top"><div class="retrieval-title">片段 ${escapeHtml(String(item.index ?? idx + 1))}</div><div class="retrieval-meta">标题：${escapeHtml(String(item.doc_title ?? "未知标题"))}<br>文件：${escapeHtml(String(item.file_name ?? "未知文件"))}<br>路径：${escapeHtml(String(item.rel_path ?? "未知路径"))}<br>分数：${scoreDisplay}</div></div><div class="retrieval-content"><div id="${pid}" class="retrieval-preview">${escapeHtml(previewText)}</div><div id="${fid}" class="retrieval-full" style="display:none;">${escapeHtml(fullText)}</div><span id="${bid}" class="toggle-link" onclick="toggleRetrieval('${pid}','${fid}','${bid}')">展开全文</span></div></div>`;
         }).join("");
     }
     function toggleRetrieval(pid, fid, bid) {
@@ -473,9 +870,16 @@
         else { full.style.display = "block"; preview.style.display = "none"; btn.textContent = "收起全文"; }
     }
     function resetRightPanel() {
-        currentRoute = ""; latestRouteInfo = null; latestFileResult = null; latestRetrievals = [];
+        currentRoute = ""; latestRouteInfo = null; latestFileResult = null; latestRetrievals = []; currentSourceMap = {};
         renderRouteInfo(null); renderCatalogResult(null); renderRetrievals([]);
-        document.getElementById("catalogCard").style.display = "block"; document.getElementById("retrievalCard").style.display = "block";
+        const isAgent = document.getElementById('agentModeToggle')?.checked || false;
+        if (!isAgent) {
+            document.getElementById("catalogCard").style.display = "block";
+            document.getElementById("retrievalCard").style.display = "block";
+        }
+        // 清空推理过程卡片
+        const reasoningBody = document.getElementById('agent-reasoning-body');
+        if (reasoningBody) reasoningBody.innerHTML = '<p class="muted">等待 Agent 推理...</p>';
     }
 
     async function openFullscreenPanel(type) {
@@ -484,7 +888,20 @@
         const content = document.getElementById("fullscreenContent");
         if (type === "answer") {
             title.textContent = "当前回答（全屏预览）";
-            content.innerHTML = `<div class="markdown-body">${renderMarkdown(latestAnswerText || "暂无回答")}</div>`;
+            const agentReasoningVisible = document.getElementById('agent-reasoning-card').style.display !== 'none';
+            if (agentReasoningVisible) {
+                // Agent 模式：全屏只显示最终回答
+                content.innerHTML = `<div class="markdown-body">${renderMarkdown(latestAnswerText || "暂无回答")}</div>`;
+            } else {
+                // RAG 模式或有内联步骤时，克隆完整内容
+                const answerEl = document.getElementById("answer");
+                const agentSteps = answerEl.querySelectorAll('.agent-step, .agent-tool-step');
+                if (agentSteps.length > 0) {
+                    content.innerHTML = answerEl.innerHTML;
+                } else {
+                    content.innerHTML = `<div class="markdown-body">${renderMarkdown(latestAnswerText || "暂无回答")}</div>`;
+                }
+            }
         } else {
             title.textContent = "历史对话（全屏预览）";
             const historyEl = document.getElementById("history");
@@ -499,6 +916,45 @@
     function handleOverlayClick(event) { const dialog = document.querySelector(".fullscreen-dialog"); if (!dialog) return; if (!dialog.contains(event.target)) closeFullscreenPanel(); }
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeFullscreenPanel(); });
 
+    /* ---------- 引用溯源 & 覆盖度提示 ---------- */
+    function renderCoverageAndCitations(coverage, citations, container) {
+        if (!container) container = document.getElementById("answer");
+        // 渲染覆盖度提示条
+        if (coverage && coverage.hint) {
+            const hintEl = document.createElement("div");
+            hintEl.className = "coverage-hint " + (coverage.level || "");
+            hintEl.textContent = coverage.hint;
+            container.appendChild(hintEl);
+        }
+        // 渲染引用来源列表
+        if (citations && citations.length > 0) {
+            container.insertAdjacentHTML("beforeend", buildCitationsHtml(citations));
+        }
+    }
+
+    function buildCitationsHtml(citations) {
+        const items = citations.map(function(c) {
+            const filename = (c.source || "").split("/").pop();
+            const section = c.section ? '<span class="citation-section">' + escapeHtml(c.section) + '</span>' : '';
+            const score = Math.round((c.score || 0) * 100);
+            return '<div class="citation-item"><span class="citation-source">' + escapeHtml(filename) + '</span>' + section + '<span class="citation-score">' + score + '%</span></div>';
+        }).join("");
+        return '<div class="citations-container"><div class="citations-toggle" onclick="toggleCitations(this)">\u{1F4DA} 参考来源 (' + citations.length + ') \u25B6</div><div class="citations-list">' + items + '</div></div>';
+    }
+
+    function toggleCitations(el) {
+        const list = el.nextElementSibling;
+        if (!list) return;
+        const isHidden = !list.classList.contains("show");
+        if (isHidden) {
+            list.classList.add("show");
+            el.textContent = "\u{1F4DA} 参考来源 (" + list.children.length + ") \u25BC";
+        } else {
+            list.classList.remove("show");
+            el.textContent = "\u{1F4DA} 参考来源 (" + list.children.length + ") \u25B6";
+        }
+    }
+
     async function askQuestion() {
         const qi = document.getElementById("question");
         const ab = document.getElementById("answer");
@@ -508,18 +964,20 @@
 
         currentHistory.push({ role: "user", content: q });
         await renderHistory(currentHistory);
-        document.querySelector('.card-history .card-header span').textContent = "历史对话 (未保存)";
+        historyState = HISTORY_STATE.MODIFIED; updateHistoryLabel();
 
         submitBtn.disabled = true;
         setStatus("正在分析问题...", "loading");
         ab.classList.remove("muted");
         latestAnswerText = "";
-        ab.innerHTML = "<span class='cursor-blink'></span>";
+        ab.innerHTML = "";
+        showStatusIndicator("正在处理...");
         resetRightPanel();
 
         try {
+            const useAgent = document.getElementById('agentModeToggle')?.checked || false;
             const res = await fetch("/ask_stream", {
-                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: q })
+                method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ question: q, use_agent: useAgent })
             });
             if (!res.ok) {
                 let msg = `HTTP Error: ${res.status}`;
@@ -538,9 +996,23 @@
                 for (const line of lines) {
                     if (!line.startsWith("data: ")) continue;
                     const jsonStr = line.substring(6);
+                    // [DONE] 为流结束标记，非 JSON，直接跳过
+                    if (jsonStr === "[DONE]") continue;
                     try {
                         const data = JSON.parse(jsonStr);
+                        if (data.type === "heartbeat") {
+                            // 忽略心跳，仅用于保持连接活跃
+                            continue;
+                        }
                         if (data.type === "start") setStatus("已提交问题，开始处理...", "loading");
+                        else if (data.type === "status") {
+                            // 三阶段流式反馈状态事件
+                            if (data.stage === "searching") {
+                                showStatusIndicator("正在检索知识库...");
+                            } else if (data.stage === "generating") {
+                                showStatusIndicator("正在生成回答...");
+                            }
+                        }
                         else if (data.type === "metadata" && data.stage === "route") {
                             currentRoute = data.route || "";
                             renderRouteInfo(data);
@@ -555,32 +1027,141 @@
                             else if (currentRoute === "hybrid") setStatus("目录/文件结果已获取，继续检索知识库...", "loading");
                         }
                         else if (data.type === "metadata" && data.stage === "retrieval") {
+                            currentSourceMap = data.source_map || {};
                             renderRetrievals(data.retrievals || [], data);
                             if (currentRoute === "rag_search") setStatus("检索完成，正在生成回答...", "loading");
                             else if (currentRoute === "hybrid") setStatus("混合检索完成，正在生成回答...", "loading");
                         }
                         else if (data.type === "chunk") {
+                            hideStatusIndicator();
                             latestAnswerText += data.content || "";
-                            await renderMarkdownToElement(ab, latestAnswerText, true);
+                            // Agent 模式下推理在右侧，答案区域只渲染 chunk 文本
+                            const agentReasoningVisible = document.getElementById('agent-reasoning-card').style.display !== 'none';
+                            if (agentReasoningVisible) {
+                                // Agent 模式：直接在答案区域渲染最终文本流
+                                await renderMarkdownToElement(ab, latestAnswerText, true);
+                            } else {
+                                // RAG 模式或退化情况
+                                const existingSteps = ab.querySelectorAll('.agent-step, .agent-tool-step');
+                                if (existingSteps.length > 0) {
+                                    let chunkContainer = ab.querySelector('.agent-chunk-area');
+                                    if (!chunkContainer) {
+                                        chunkContainer = document.createElement('div');
+                                        chunkContainer.className = 'agent-chunk-area markdown-body';
+                                        chunkContainer.style.cssText = 'margin-top:14px;padding-top:14px;border-top:2px solid #e0e7ff;';
+                                        ab.appendChild(chunkContainer);
+                                    }
+                                    chunkContainer.innerHTML = renderMarkdown(latestAnswerText) + "<span class='cursor-blink'></span>";
+                                } else {
+                                    await renderMarkdownToElement(ab, latestAnswerText, true);
+                                }
+                            }
                             ab.scrollTop = ab.scrollHeight;
                         }
                         else if (data.type === "final") {
-                            if (data.content) { latestAnswerText = data.content; await renderMarkdownToElement(ab, latestAnswerText, false); }
+                            if (data.content) latestAnswerText = data.content;
+                            const agentReasoningVisible = document.getElementById('agent-reasoning-card').style.display !== 'none';
+                            if (agentReasoningVisible && latestAnswerText) {
+                                // Agent 模式：答案区域只显示最终回答
+                                await renderMarkdownToElement(ab, latestAnswerText, false);
+                                ab.scrollTop = 0;
+                            } else {
+                                // RAG 模式或非 Agent 逻辑
+                                const agentSteps = ab.querySelectorAll('.agent-step, .agent-tool-step');
+                                if (agentSteps.length > 0 && latestAnswerText) {
+                                    const cursor = ab.querySelector('.cursor-blink');
+                                    if (cursor) cursor.remove();
+                                    let finalDiv = ab.querySelector('.agent-chunk-area');
+                                    if (!finalDiv) {
+                                        finalDiv = document.createElement('div');
+                                        finalDiv.className = 'agent-final-answer markdown-body';
+                                        finalDiv.style.cssText = 'margin-top:14px;padding-top:14px;border-top:2px solid #e0e7ff;';
+                                        ab.appendChild(finalDiv);
+                                    } else {
+                                        finalDiv.className = 'agent-final-answer markdown-body';
+                                    }
+                                    finalDiv.innerHTML = '<div style="font-size:13px;color:#6366f1;font-weight:600;margin-bottom:8px;">📝 最终回答</div>' + renderMarkdown(latestAnswerText);
+                                    finalDiv.querySelectorAll("pre code").forEach(block => { try { hljs.highlightElement(block); } catch (e) {} });
+                                    if (window.MathJax && window.MathJax.typesetPromise) { try { await MathJax.typesetPromise([finalDiv]); } catch (err) {} }
+                                    ab.scrollTop = 0;
+                                } else if (latestAnswerText) {
+                                    await renderMarkdownToElement(ab, latestAnswerText, false);
+                                    ab.scrollTop = 0;
+                                }
+                            }
                             if (data.route && !latestRouteInfo) renderRouteInfo({ route: data.route, route_target: "", route_reason: "" });
                             if (data.file_result) renderCatalogResult(data.file_result);
-                            if (data.retrievals && data.retrievals.length) renderRetrievals(data.retrievals, { rewritten_question: data.rewritten_question || "", keywords: data.keywords || [], queries: data.queries || [] });
+                            if (data.source_map && Object.keys(data.source_map).length) currentSourceMap = data.source_map;
+                            renderSourceLinks(ab, currentSourceMap);
+
+                            // final 事件中也可能携带 coverage/citations
+                            if (data.coverage || (data.citations && data.citations.length > 0)) {
+                                renderCoverageAndCitations(data.coverage, data.citations, ab);
+                            }
 
                             setStatus("回答完成。(记得点击保存以防丢失)", "success");
                             currentHistory.push({ role: "assistant", content: latestAnswerText });
+                            historyState = HISTORY_STATE.MODIFIED; updateHistoryLabel();
                             await renderHistory(currentHistory);
                         }
+                        // 处理独立的 coverage 元数据事件（流式回答结束后发送）
+                        else if (data.type === "metadata" && data.stage === "coverage") {
+                            renderCoverageAndCitations(data.coverage, data.citations, ab);
+                        }
+                        else if (data.type === "step_llm") {
+                            const stepDiv = document.createElement('div');
+                            stepDiv.className = 'agent-step';
+                            stepDiv.innerHTML = `
+                                <details open style="margin:8px 0;border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;background:#f8fafc;">
+                                    <summary style="cursor:pointer;font-size:13px;color:#475569;font-weight:500;">
+                                        \u{1F914} 思考步骤 ${data.step || ''}
+                                    </summary>
+                                    <pre style="margin:8px 0 0;white-space:pre-wrap;font-size:12px;color:#334155;line-height:1.5;">${escapeHtml(data.content || '')}</pre>
+                                </details>
+                            `;
+                            const reasoningBody = document.getElementById('agent-reasoning-body');
+                            if (reasoningBody && document.getElementById('agent-reasoning-card').style.display !== 'none') {
+                                // 清除占位文字
+                                if (reasoningBody.querySelector('.muted')) reasoningBody.innerHTML = '';
+                                reasoningBody.appendChild(stepDiv);
+                                reasoningBody.scrollTop = reasoningBody.scrollHeight;
+                            } else {
+                                ab.appendChild(stepDiv);
+                                ab.scrollTop = ab.scrollHeight;
+                            }
+                        }
+                        else if (data.type === "step_tool") {
+                            const toolDiv = document.createElement('div');
+                            toolDiv.className = 'agent-tool-step';
+                            toolDiv.innerHTML = `
+                                <details open style="margin:8px 0;border:1px solid #d1fae5;border-radius:6px;padding:8px 12px;background:#f0fdf4;">
+                                    <summary style="cursor:pointer;font-size:13px;color:#059669;font-weight:500;">
+                                        \u{1F527} 调用工具: ${escapeHtml(data.tool || '')}("${escapeHtml(data.arg || '')}")
+                                    </summary>
+                                    <pre style="margin:8px 0 0;white-space:pre-wrap;font-size:12px;color:#334155;line-height:1.5;max-height:200px;overflow-y:auto;">${escapeHtml(data.observation || '')}</pre>
+                                </details>
+                            `;
+                            const reasoningBody = document.getElementById('agent-reasoning-body');
+                            if (reasoningBody && document.getElementById('agent-reasoning-card').style.display !== 'none') {
+                                if (reasoningBody.querySelector('.muted')) reasoningBody.innerHTML = '';
+                                reasoningBody.appendChild(toolDiv);
+                                reasoningBody.scrollTop = reasoningBody.scrollHeight;
+                            } else {
+                                ab.appendChild(toolDiv);
+                                ab.scrollTop = ab.scrollHeight;
+                            }
+                        }
                         else if (data.type === "error") {
-                            const errorMsg = "生成异常: " + (data.content || "未知错误");
+                            const errorMsg = "生成异常: " + (data.message || data.content || "未知错误");
                             setStatus(errorMsg, "error");
                             latestAnswerText = (latestAnswerText || "") + "\n\n**[" + errorMsg + "]**";
                             await renderMarkdownToElement(ab, latestAnswerText, false);
                             currentHistory.push({ role: "assistant", content: latestAnswerText });
                             await renderHistory(currentHistory);
+                        }
+                        else {
+                            // 兜底：忽略未知事件类型，防止后续协议扩展导致前端报错
+                            console.debug("SSE: 忽略未知事件类型:", data.type);
                         }
                     } catch (err) { console.error("JSON parse error:", jsonStr, err); }
                 }
@@ -593,6 +1174,24 @@
             await renderHistory(currentHistory);
         } finally {
             submitBtn.disabled = false;
+        }
+    }
+
+    // SSE 连接异常自动重试（指数退避）
+    async function askQuestionWithRetry(maxRetries = 2) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await askQuestion();
+                return;  // 成功则返回
+            } catch (e) {
+                if (attempt < maxRetries && e.name !== 'AbortError') {
+                    const waitMs = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+                    setStatus("连接异常，" + (waitMs/1000) + "秒后重试...", "loading");
+                    await new Promise(r => setTimeout(r, waitMs));
+                } else {
+                    throw e;  // 最后一次或用户取消，抛出异常
+                }
+            }
         }
     }
 
@@ -623,12 +1222,63 @@
         } catch (e) { setStatus("复制失败：" + e, "error"); }
     }
 
+    // Agent 模式切换：隐藏/显示右侧面板
+    function toggleAgentMode(isAgent) {
+        document.querySelectorAll('#rightColumn .card-route, #rightColumn .card-catalog, #rightColumn .card-retrieval').forEach(el => {
+            el.style.display = isAgent ? 'none' : '';
+        });
+        const agentCard = document.getElementById('agent-reasoning-card');
+        if (agentCard) agentCard.style.display = isAgent ? '' : 'none';
+    }
+
+    document.getElementById('agentModeToggle').addEventListener('change', function() {
+        toggleAgentMode(this.checked);
+    });
+
+    // 主题切换
+    function toggleTheme() {
+        const html = document.documentElement;
+        const current = html.getAttribute('data-theme');
+        const next = current === 'dark' ? 'light' : 'dark';
+        html.setAttribute('data-theme', next);
+        localStorage.setItem('theme', next);
+    }
+    // 初始化时恢复用户选择
+    (function() {
+        const saved = localStorage.getItem('theme');
+        if (saved) {
+            document.documentElement.setAttribute('data-theme', saved);
+        }
+    })();
+
+    // 侧边栏切换（移动端）
+    function toggleSidebar() {
+        const rightCol = document.getElementById('rightColumn');
+        if (rightCol) {
+            rightCol.classList.toggle('visible');
+        }
+    }
+
+    // 页面卸载前检查未保存的历史记录
+    window.addEventListener('beforeunload', function(e) {
+        if (historyState === HISTORY_STATE.MODIFIED) {
+            e.preventDefault();
+            e.returnValue = '历史记录未保存，确定要离开吗？';
+        }
+    });
+
     window.addEventListener("DOMContentLoaded", async () => {
         syncLayoutHeight();
         currentHistory = {{ history | tojson | safe }} || [];
         await renderHistory(currentHistory);
-        document.querySelector('.card-history .card-header span').textContent = "历史对话 (已读取云端存档)";
+        historyState = HISTORY_STATE.SYNCED; updateHistoryLabel();
         resetRightPanel();
+        // 初始化时同步 Agent 模式状态
+        toggleAgentMode(document.getElementById('agentModeToggle').checked);
+    });
+</script>
+</body>
+</html> toggleAgentMode(document.getElementById('agentModeToggle').checked);
     });
 </script>
 </body>
