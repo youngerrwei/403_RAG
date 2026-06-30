@@ -62,16 +62,23 @@ python create_user.py
 # Step 3: 转换文档为 Markdown（PDF/DOCX/PPTX → .md）
 bash convert_to_md.sh --full
 
-# Step 4: 首次全量入库
+# Step 4: 启动 vLLM 推理服务（入库摘要增强需要 vLLM）
+bash start_vllm.sh --background
+#   脚本会自动等待 vLLM 就绪（最多 120 秒），看到 "✓ vLLM 服务已就绪" 后继续
+
+# Step 5: 首次全量入库（需要 vLLM 已就绪，用于生成摘要增强检索质量）
 bash auto_ingest.sh --full
 
-# Step 5: 启动全部服务
+# Step 6: 启动 Web 服务（会检测到 vLLM 已运行，仅启动 web_app）
 bash start_rag.sh start
 
-# Step 6: 验证服务状态
+# Step 7: 验证服务状态
 curl http://127.0.0.1:5000/api/health
 # 期望返回: {"status": "ok", "components": {...}}
 ```
+
+> **注意**：Step 4 必须在 Step 5 之前完成。入库时默认启用摘要增强（`ENABLE_SUMMARY_AUGMENTATION=true`），
+> 需要 vLLM 服务生成文档摘要以提升检索质量。若 vLLM 未运行，入库仍可完成但会跳过摘要生成。
 
 ### 日常运维流程
 
