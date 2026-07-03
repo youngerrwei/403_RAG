@@ -220,10 +220,10 @@
         <div class="form-group">
             <input id="password" type="password" placeholder=" " />
             <label for="password">密码</label>
-            <button type="button" class="pwd-toggle" onclick="togglePassword()">👁</button>
+            <button type="button" class="pwd-toggle" id="pwdToggleBtn">👁</button>
         </div>
 
-        <button id="loginBtn" onclick="login()">登录</button>
+        <button id="loginBtn">登录</button>
         <div id="status" class="status"></div>
     </div>
 
@@ -288,6 +288,9 @@
             }
         }
 
+        // 事件绑定（避免 onclick 内联属性被 CSP 阻止）
+        document.getElementById("pwdToggleBtn").addEventListener("click", togglePassword);
+        document.getElementById("loginBtn").addEventListener("click", login);
         document.addEventListener("keydown", function (e) {
             if (e.key === "Enter") {
                 login();

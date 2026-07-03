@@ -482,8 +482,8 @@
             <p>基于 CPU 服务器资源，部署于 GPU 服务器上的检索增强生成系统，用于查询内部文档相关问题。</p>
         </div>
         <div style="display:flex;align-items:center;gap:8px;">
-            <button id="theme-toggle" onclick="toggleTheme()" title="切换主题">🌓</button>
-            <button id="sidebar-toggle" onclick="toggleSidebar()" class="mobile-only" title="显示详情">☰</button>
+            <button id="theme-toggle" title="切换主题">🌓</button>
+            <button id="sidebar-toggle" class="mobile-only" title="显示详情">☰</button>
         </div>
     </div>
     <div class="layout">
@@ -495,11 +495,11 @@
                     <div class="input-wrap">
                         <textarea id="question" placeholder="请输入你的问题..."></textarea>
                         <div class="btn-row">
-                            <button id="submitBtn" class="btn-primary" onclick="askQuestionWithRetry()">提交问题</button>
+                            <button id="submitBtn" class="btn-primary">提交问题</button>
                             <!-- 【新增】保存历史按钮 -->
-                            <button id="saveBtn" class="btn-success" onclick="saveHistory()">保存历史</button>
-                            <button class="btn-danger" onclick="clearHistoryUI()">清空面板</button>
-                            <button class="btn-secondary" onclick="copyQuestion()">复制问题</button>
+                            <button id="saveBtn" class="btn-success">保存历史</button>
+                            <button id="clearBtn" class="btn-danger">清空面板</button>
+                            <button id="copyQuestionBtn" class="btn-secondary">复制问题</button>
                             <div class="mode-switch" style="display:inline-flex;align-items:center;gap:6px;margin-left:12px;">
                                 <label style="font-size:13px;color:#666;cursor:pointer;">
                                     <input type="checkbox" id="agentModeToggle" style="margin-right:4px;">
@@ -516,8 +516,8 @@
                 <div class="card-header">
                     <span>当前回答</span>
                     <div class="card-actions">
-                        <button class="btn-secondary" onclick="copyLatestAnswer()">复制</button>
-                        <button class="btn-secondary" onclick="openFullscreenPanel('answer')">全屏</button>
+                        <button id="copyAnswerBtn" class="btn-secondary">复制</button>
+                        <button id="fullscreenAnswerBtn" class="btn-secondary">全屏</button>
                     </div>
                 </div>
                 <div class="card-body">
@@ -529,7 +529,7 @@
                 <div class="card-header">
                     <span>历史对话 (未保存)</span>
                     <div class="card-actions">
-                        <button class="btn-secondary" onclick="openFullscreenPanel('history')">全屏</button>
+                        <button id="fullscreenHistoryBtn" class="btn-secondary">全屏</button>
                     </div>
                 </div>
                 <div class="card-body">
@@ -541,12 +541,12 @@
         </div>
 
         <!-- 全屏面板 -->
-        <div id="fullscreenOverlay" class="fullscreen-overlay" style="display:none;" onclick="handleOverlayClick(event)">
+        <div id="fullscreenOverlay" class="fullscreen-overlay" style="display:none;">
             <div class="fullscreen-dialog">
                 <div class="fullscreen-header">
                     <span id="fullscreenTitle">全屏预览</span>
                     <div class="card-actions">
-                        <button class="btn-secondary" onclick="closeFullscreenPanel()">关闭</button>
+                        <button id="closeFullscreenBtn" class="btn-secondary">关闭</button>
                     </div>
                 </div>
                 <div class="fullscreen-body">
@@ -692,7 +692,7 @@
             // 包裹一轮对话的容器
             html += `<div class="history-pair">`;
             // 添加右上角的删除按钮，传入当前这条在数组中的索引起点
-            html += `<button class="btn-delete-pair" onclick="deleteHistoryPair(${i})" title="删除此轮对话">删除这轮</button>`;
+            html += `<button class="btn-delete-pair" data-idx="${i}" title="删除此轮对话">删除这轮</button>`;
 
             if (isUser) {
                 html += createMsgHtml(history[i]);
@@ -859,7 +859,7 @@
             const pid = `preview-${idx}`; const fid = `full-${idx}`; const bid = `btn-${idx}`;
             const previewText = item.preview ?? "暂无预览"; const fullText = item.content ?? item.preview ?? "暂无全文内容";
             const scoreDisplay = item.rerank_score != null ? (item.rerank_score * 100).toFixed(1) + '%' : 'N/A';
-            return `<div class="retrieval-card"><div class="retrieval-top"><div class="retrieval-title">片段 ${escapeHtml(String(item.index ?? idx + 1))}</div><div class="retrieval-meta">标题：${escapeHtml(String(item.doc_title ?? "未知标题"))}<br>文件：${escapeHtml(String(item.file_name ?? "未知文件"))}<br>路径：${escapeHtml(String(item.rel_path ?? "未知路径"))}<br>分数：${scoreDisplay}</div></div><div class="retrieval-content"><div id="${pid}" class="retrieval-preview">${escapeHtml(previewText)}</div><div id="${fid}" class="retrieval-full" style="display:none;">${escapeHtml(fullText)}</div><span id="${bid}" class="toggle-link" onclick="toggleRetrieval('${pid}','${fid}','${bid}')">展开全文</span></div></div>`;
+            return `<div class="retrieval-card"><div class="retrieval-top"><div class="retrieval-title">片段 ${escapeHtml(String(item.index ?? idx + 1))}</div><div class="retrieval-meta">标题：${escapeHtml(String(item.doc_title ?? "未知标题"))}<br>文件：${escapeHtml(String(item.file_name ?? "未知文件"))}<br>路径：${escapeHtml(String(item.rel_path ?? "未知路径"))}<br>分数：${scoreDisplay}</div></div><div class="retrieval-content"><div id="${pid}" class="retrieval-preview">${escapeHtml(previewText)}</div><div id="${fid}" class="retrieval-full" style="display:none;">${escapeHtml(fullText)}</div><span id="${bid}" class="toggle-link" data-pid="${pid}" data-fid="${fid}">展开全文</span></div></div>`;
         }).join("");
     }
     function toggleRetrieval(pid, fid, bid) {
@@ -939,7 +939,7 @@
             const score = Math.round((c.score || 0) * 100);
             return '<div class="citation-item"><span class="citation-source">' + escapeHtml(filename) + '</span>' + section + '<span class="citation-score">' + score + '%</span></div>';
         }).join("");
-        return '<div class="citations-container"><div class="citations-toggle" onclick="toggleCitations(this)">\u{1F4DA} 参考来源 (' + citations.length + ') \u25B6</div><div class="citations-list">' + items + '</div></div>';
+        return '<div class="citations-container"><div class="citations-toggle">\u{1F4DA} 参考来源 (' + citations.length + ') \u25B6</div><div class="citations-list">' + items + '</div></div>';
     }
 
     function toggleCitations(el) {
@@ -1267,6 +1267,39 @@
         }
     });
 
+    // ===== 事件绑定（避免 onclick 内联属性被 CSP 阻止）=====
+    document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
+    document.getElementById("sidebar-toggle").addEventListener("click", toggleSidebar);
+    document.getElementById("submitBtn").addEventListener("click", askQuestionWithRetry);
+    document.getElementById("saveBtn").addEventListener("click", saveHistory);
+    document.getElementById("clearBtn").addEventListener("click", clearHistoryUI);
+    document.getElementById("copyQuestionBtn").addEventListener("click", copyQuestion);
+    document.getElementById("copyAnswerBtn").addEventListener("click", copyLatestAnswer);
+    document.getElementById("fullscreenAnswerBtn").addEventListener("click", function() { openFullscreenPanel('answer'); });
+    document.getElementById("fullscreenHistoryBtn").addEventListener("click", function() { openFullscreenPanel('history'); });
+    document.getElementById("fullscreenOverlay").addEventListener("click", handleOverlayClick);
+    document.getElementById("closeFullscreenBtn").addEventListener("click", closeFullscreenPanel);
+
+    // 事件委托：处理动态生成的元素点击
+    document.addEventListener("click", function(e) {
+        // 删除历史对话
+        if (e.target.classList.contains("btn-delete-pair")) {
+            const idx = parseInt(e.target.dataset.idx);
+            if (!isNaN(idx)) deleteHistoryPair(idx);
+        }
+        // 展开/折叠检索片段
+        if (e.target.classList.contains("toggle-link")) {
+            const pid = e.target.dataset.pid;
+            const fid = e.target.dataset.fid;
+            const bid = e.target.id;
+            toggleRetrieval(pid, fid, bid);
+        }
+        // 展开/折叠引用来源
+        if (e.target.classList.contains("citations-toggle")) {
+            toggleCitations(e.target);
+        }
+    });
+
     window.addEventListener("DOMContentLoaded", async () => {
         syncLayoutHeight();
         currentHistory = {{ history | tojson | safe }} || [];
@@ -1275,10 +1308,6 @@
         resetRightPanel();
         // 初始化时同步 Agent 模式状态
         toggleAgentMode(document.getElementById('agentModeToggle').checked);
-    });
-</script>
-</body>
-</html> toggleAgentMode(document.getElementById('agentModeToggle').checked);
     });
 </script>
 </body>

@@ -130,14 +130,17 @@ def _release_concurrent(exc=None):
 
 @app.after_request
 def _set_security_headers(response):
-    # Content Security Policy - 使用 nonce 替代 unsafe-inline
+    # Content Security Policy
+    # script-src: nonce 保护内联脚本，允许 CDN 外部脚本
+    # style-src: 允许 unsafe-inline（内联样式安全风险极低，且 MathJax 等库必须用动态样式）
+    # connect-src: 允许 self 和 CDN（source map 等）
     nonce = getattr(g, 'csp_nonce', '')
     response.headers["Content-Security-Policy"] = (
         f"default-src 'self'; "
         f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
-        f"style-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+        f"style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
         f"font-src 'self' https://cdn.jsdelivr.net; "
-        f"connect-src 'self'; "
+        f"connect-src 'self' https://cdn.jsdelivr.net; "
         f"frame-ancestors 'self'"
     )
     response.headers["X-Content-Type-Options"] = "nosniff"
