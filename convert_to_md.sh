@@ -1,5 +1,6 @@
 #!/bin/bash
 # 文件格式转换脚本：使用 MinerU/Marker/Docling 将文档转换为 Markdown
+# 运行环境：MinerU 运行在独立的 conda 环境 rag-mineru（避免与 vLLM 的依赖冲突）
 # 用法:
 #   bash convert_to_md.sh                        # 增量转换（仅处理新增/修改文件）
 #   bash convert_to_md.sh --full                 # 全量转换
@@ -59,6 +60,35 @@ log_debug() {
 # ========== 初始化目录 ==========
 mkdir -p "${LOG_DIR}"
 mkdir -p "${SCRIPT_DIR}/data"
+
+# ========== 检查 rag-mineru conda 环境 ==========
+# MinerU 运行在独立的 conda 环境中，避免与 vLLM/RAG 主环境的 PyTorch 版本冲突
+CONDA_ENV_NAME="rag-mineru"
+
+# 查找 conda 命令
+CONDA_CMD=""
+if command -v conda &>/dev/null; then
+    CONDA_CMD="conda"
+elif [[ -f "$HOME/miniconda3/bin/conda" ]]; then
+    CONDA_CMD="$HOME/miniconda3/bin/conda"
+elif [[ -f "$HOME/anaconda3/bin/conda" ]]; then
+    CONDA_CMD="$HOME/anaconda3/bin/conda"
+fi
+
+if [[ -z "$CONDA_CMD" ]]; then
+    log_error "未找到 conda 命令，请先安装 Miniconda/Anaconda"
+    exit 1
+fi
+
+# 检查 rag-mineru 环境是否存在
+if ! $CONDA_CMD env list 2>/dev/null | grep -qE "^${CONDA_ENV_NAME}\s"; then
+    log_error "conda 环境 '${CONDA_ENV_NAME}' 不存在"
+    echo -e "${YELLOW}[提示] 请先运行安装脚本创建环境:${NC}"
+    echo "        bash setup_env.sh --mineru"
+    exit 1
+fi
+
+log_info "使用 conda 环境: ${CONDA_ENV_NAME}"
 
 # ========== 帮助信息 ==========
 show_help() {
@@ -195,28 +225,22 @@ fi
 AVAILABLE_ENGINES=()
 
 detect_engines() {
-    # 检测 MinerU
-    if command -v mineru &>/dev/null; then
+    # 检测 MinerU（在 rag-mineru conda 环境中检查）
+    if $CONDA_CMD run -n "$CONDA_ENV_NAME" mineru --help &>/dev/null 2>&1; then
         AVAILABLE_ENGINES+=("mineru")
-        log_debug "检测到引擎: MinerU ($(command -v mineru))"
+        log_debug "检测到引擎: MinerU (在 ${CONDA_ENV_NAME} 环境中)"
     fi
 
-    # 检测 Marker
-    if command -v marker_single &>/dev/null || command -v marker &>/dev/null; then
+    # 检测 Marker（在 rag-mineru conda 环境中检查）
+    if $CONDA_CMD run -n "$CONDA_ENV_NAME" bash -c "command -v marker_single || command -v marker" &>/dev/null 2>&1; then
         AVAILABLE_ENGINES+=("marker")
-        local marker_cmd=""
-        if command -v marker_single &>/dev/null; then
-            marker_cmd="$(command -v marker_single)"
-        else
-            marker_cmd="$(command -v marker)"
-        fi
-        log_debug "检测到引擎: Marker (${marker_cmd})"
+        log_debug "检测到引擎: Marker (在 ${CONDA_ENV_NAME} 环境中)"
     fi
 
-    # 检测 Docling
-    if command -v docling &>/dev/null; then
+    # 检测 Docling（在 rag-mineru conda 环境中检查）
+    if $CONDA_CMD run -n "$CONDA_ENV_NAME" docling --help &>/dev/null 2>&1; then
         AVAILABLE_ENGINES+=("docling")
-        log_debug "检测到引擎: Docling ($(command -v docling))"
+        log_debug "检测到引擎: Docling (在 ${CONDA_ENV_NAME} 环境中)"
     fi
 }
 
@@ -280,7 +304,7 @@ show_install_hints() {
 
 # ========== 转换函数 ==========
 
-# MinerU 转换单个文件
+# MinerU 转换单个文件（通过 conda run 在 rag-mineru 环境中执行）
 convert_with_mineru() {
     local source_file="$1"
     local target_md="$2"
@@ -291,8 +315,8 @@ convert_with_mineru() {
     local basename_noext
     basename_noext="$(basename "$source_file" | sed 's/\.[^.]*$//')"
 
-    # 调用 MinerU 转换
-    if ! mineru -p "$source_file" -o "$tmp_dir" -b "$BACKEND" >> "${LOG_FILE}" 2>&1; then
+    # 通过 conda run 在 rag-mineru 环境中调用 MinerU
+    if ! $CONDA_CMD run -n "$CONDA_ENV_NAME" mineru -p "$source_file" -o "$tmp_dir" -b "$BACKEND" >> "${LOG_FILE}" 2>&1; then
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -322,7 +346,7 @@ convert_with_mineru() {
     return 0
 }
 
-# Marker 转换单个文件
+# Marker 转换单个文件（通过 conda run 在 rag-mineru 环境中执行）
 convert_with_marker() {
     local source_file="$1"
     local target_md="$2"
@@ -333,24 +357,18 @@ convert_with_marker() {
     local basename_noext
     basename_noext="$(basename "$source_file" | sed 's/\.[^.]*$//')"
 
-    # 设置 Marker GPU 环境
-    export TORCH_DEVICE="${DEVICE}"
-
+    # 调用 Marker（通过 conda run 在 rag-mineru 环境中执行）
     # 优先使用 marker_single
-    local marker_cmd=""
-    if command -v marker_single &>/dev/null; then
-        marker_cmd="marker_single"
-    elif command -v marker &>/dev/null; then
-        marker_cmd="marker"
-    fi
-
-    if [[ -z "$marker_cmd" ]]; then
-        rm -rf "$tmp_dir"
-        return 1
-    fi
-
-    # 调用 Marker
-    if ! "$marker_cmd" "$source_file" --output_dir "$tmp_dir" --output_format markdown >> "${LOG_FILE}" 2>&1; then
+    if ! $CONDA_CMD run -n "$CONDA_ENV_NAME" \
+        env TORCH_DEVICE="${DEVICE}" bash -c "
+            if command -v marker_single &>/dev/null; then
+                marker_single '$source_file' --output_dir '$tmp_dir' --output_format markdown
+            elif command -v marker &>/dev/null; then
+                marker '$source_file' --output_dir '$tmp_dir' --output_format markdown
+            else
+                exit 1
+            fi
+        " >> "${LOG_FILE}" 2>&1; then
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -375,7 +393,7 @@ convert_with_marker() {
     return 0
 }
 
-# Docling 转换单个文件
+# Docling 转换单个文件（通过 conda run 在 rag-mineru 环境中执行）
 convert_with_docling() {
     local source_file="$1"
     local target_md="$2"
@@ -386,8 +404,8 @@ convert_with_docling() {
     local basename_noext
     basename_noext="$(basename "$source_file" | sed 's/\.[^.]*$//')"
 
-    # 调用 Docling
-    if ! docling "$source_file" --to md --output "$tmp_dir" >> "${LOG_FILE}" 2>&1; then
+    # 通过 conda run 在 rag-mineru 环境中调用 Docling
+    if ! $CONDA_CMD run -n "$CONDA_ENV_NAME" docling "$source_file" --to md --output "$tmp_dir" >> "${LOG_FILE}" 2>&1; then
         rm -rf "$tmp_dir"
         return 1
     fi
@@ -500,7 +518,7 @@ setup_gpu_env
 
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║          文档转 Markdown 工具 (MinerU/Marker/Docling)    ║${NC}"
+echo -e "${CYAN}║          文档转 Markdown 工具 (MinerU/Marker/Docling)      ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 

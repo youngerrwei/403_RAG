@@ -2,6 +2,11 @@
 # ==============================================================================
 # RAG 系统一键启动/停止/重启脚本
 # 组件：vLLM 推理服务 + web_app.py (Flask + RAG Agent)
+#
+# 环境说明：
+#   - vLLM 服务运行在 conda 环境 rag-vllm 中（由 start_vllm.sh 内部处理）
+#   - web_app.py 运行在当前环境（rag）中
+#
 # 用法：
 #   bash start_rag.sh start    - 启动全部服务
 #   bash start_rag.sh stop     - 停止全部服务
@@ -42,13 +47,14 @@ fi
 
 # 设置默认值（与 .env 推荐值保持一致）
 VLLM_PORT="${VLLM_PORT:-8000}"
-VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-./models/Qwen3-8B-Instruct}"
+VLLM_API_KEY="${VLLM_API_KEY:-lab-secret-key}"
+VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-models/Qwen3-8B-Instruct}"
 VLLM_HOST="${VLLM_HOST:-0.0.0.0}"
 VLLM_BASE_URL="${VLLM_BASE_URL:-http://127.0.0.1:8000/v1}"
 QDRANT_HOST="${QDRANT_HOST:-172.18.216.71}"
 QDRANT_PORT="${QDRANT_PORT:-6333}"
-EMBEDDING_MODEL_NAME="${EMBEDDING_MODEL_NAME:-./models/bge-m3}"
-RERANKER_MODEL_NAME="${RERANKER_MODEL_NAME:-./models/bge-reranker-v2-m3}"
+EMBEDDING_MODEL_NAME="${EMBEDDING_MODEL_NAME:-models/bge-m3}"
+RERANKER_MODEL_NAME="${RERANKER_MODEL_NAME:-models/bge-reranker-v2-m3}"
 DOCS_PATH="${DOCS_PATH:-/mnt/cpu_share}"
 QDRANT_COLLECTION_NAME="${QDRANT_COLLECTION_NAME:-lab_knowledge_base}"
 QDRANT_PARENT_COLLECTION="${QDRANT_PARENT_COLLECTION:-lab_knowledge_base_parents}"
@@ -210,7 +216,8 @@ do_start() {
     echo ""
 
     # -------------------- Step 1: 检查/启动 vLLM --------------------
-    echo ">>> Step 1: 检查/启动 vLLM 推理服务"
+    # vLLM 运行在独立的 conda 环境 rag-vllm 中，由 start_vllm.sh 内部处理环境切换
+    echo ">>> Step 1: 检查/启动 vLLM 推理服务（环境: rag-vllm）"
     echo "    模型: $VLLM_MODEL_NAME"
     echo "    端口: $VLLM_PORT"
     echo ""
@@ -218,10 +225,15 @@ do_start() {
     if check_port "$VLLM_PORT"; then
         # 端口已占用，检查模型是否匹配
         echo "[信息] 端口 $VLLM_PORT 已被占用，检查模型配置..."
-        CURRENT_MODEL=$(curl -s "http://127.0.0.1:${VLLM_PORT}/v1/models" 2>/dev/null \
+        # 注意：vLLM 配置了 API Key 认证，curl 需要携带 Authorization 头
+        CURRENT_MODEL=$(curl -s -H "Authorization: Bearer ${VLLM_API_KEY}" "http://127.0.0.1:${VLLM_PORT}/v1/models" 2>/dev/null \
             | python3 -c "import sys,json; data=json.load(sys.stdin); print(data['data'][0]['id'])" 2>/dev/null || echo "")
 
-        if [ "$CURRENT_MODEL" = "$VLLM_MODEL_NAME" ]; then
+        # 路径标准化比较：去除 ./ 前缀，避免 './models/x' 与 'models/x' 不匹配
+        NORMALIZED_CURRENT=$(echo "$CURRENT_MODEL" | sed 's|^\./||')
+        NORMALIZED_EXPECT=$(echo "$VLLM_MODEL_NAME" | sed 's|^\./||')
+
+        if [ "$NORMALIZED_CURRENT" = "$NORMALIZED_EXPECT" ]; then
             echo "[信息] ✓ vLLM 已运行且配置正确，跳过"
         else
             echo "[信息] 当前模型: '$CURRENT_MODEL'，期望模型: '$VLLM_MODEL_NAME'"
@@ -247,7 +259,8 @@ do_start() {
     echo ""
 
     # -------------------- Step 2: 启动 web_app.py --------------------
-    echo ">>> Step 2: 检查/启动 web_app.py"
+    # web_app.py 运行在当前环境（rag）中，无需切换 conda 环境
+    echo ">>> Step 2: 检查/启动 web_app.py（当前环境）"
     echo "    端口: $WEBAPP_PORT"
     echo ""
 

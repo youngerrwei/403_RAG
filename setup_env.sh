@@ -1,24 +1,38 @@
 #!/bin/bash
 # ==============================================================================
-# RAG 知识库系统 - 环境准备脚本
-# 封装项目初始化所需的全部环境配置步骤
+# RAG 知识库系统 - 多环境安装脚本
+# 背景：vLLM 和 MinerU 无法共存于同一 conda 环境（PyTorch/flashinfer/paddlepaddle 冲突）
+# 方案：创建独立的 conda 环境
+#
+# 环境规划：
+#   rag-vllm   — vLLM 推理服务 (Python 3.10 + PyTorch 2.5.1+cu124 + vLLM 0.8.5.post1)
+#   rag-mineru — MinerU 文档转换 (Python 3.10 + PyTorch 2.5.1+cu124 + MinerU)
+#   rag        — RAG 主应用 (用户已有环境，仅安装核心依赖)
+#
 # 用法:
-#   bash setup_env.sh                  # 执行全部环境准备步骤
-#   bash setup_env.sh --skip-deps      # 跳过 pip 依赖安装
-#   bash setup_env.sh --skip-models    # 跳过模型检查/下载
-#   bash setup_env.sh --skip-converter # 跳过文档转换工具安装
-#   bash setup_env.sh --help           # 显示帮助信息
+#   bash setup_env.sh              # 安装所有环境
+#   bash setup_env.sh --vllm       # 仅安装 vLLM 环境
+#   bash setup_env.sh --mineru     # 仅安装 MinerU 环境
+#   bash setup_env.sh --rag        # 仅安装 RAG 主环境依赖
+#   bash setup_env.sh --force      # 强制重建已存在的环境
+#   bash setup_env.sh --help       # 显示帮助
 # ==============================================================================
 
-set -euo pipefail
+# 注意：不使用 set -e，因为 conda 激活/run 命令失败不应中断整体流程
+set -uo pipefail
 
 # ========== 基础配置 ==========
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
-ENV_EXAMPLE_FILE="${SCRIPT_DIR}/.env.example"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/setup_env.log"
-LOCK_FILE="/tmp/setup_env.lock"
+
+# conda 环境名称
+ENV_VLLM="rag-vllm"
+ENV_MINERU="rag-mineru"
+
+# PyTorch 版本（统一使用 cu124）
+PYTORCH_PACKAGES="torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
+PYTORCH_INDEX_URL="https://download.pytorch.org/whl/cu124"
 
 # ========== 颜色定义 ==========
 RED='\033[0;31m'
@@ -26,7 +40,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 # ========== 日志函数 ==========
 log_info() {
@@ -50,19 +64,10 @@ log_error() {
     echo "[ERROR] [${timestamp}] $*" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
-log_debug() {
-    local timestamp
-    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo -e "${BLUE}[DEBUG]${NC} [${timestamp}] $*"
-    echo "[DEBUG] [${timestamp}] $*" >> "${LOG_FILE}" 2>/dev/null || true
-}
-
 # ========== 结果追踪 ==========
-# 状态: OK / FAIL / SKIP
 declare -a REPORT_ITEMS=()
 declare -a REPORT_STATUS=()
 declare -a REPORT_DETAILS=()
-declare -a FIX_SUGGESTIONS=()
 HAS_FAILURE=0
 
 report_add() {
@@ -77,65 +82,80 @@ report_add() {
     fi
 }
 
-fix_add() {
-    FIX_SUGGESTIONS+=("$1")
-}
-
 # ========== 帮助信息 ==========
 show_help() {
     cat << 'EOF'
-RAG 知识库系统 - 环境准备脚本
+RAG 知识库系统 - 多环境安装脚本
 
 用法:
   bash setup_env.sh [选项]
 
 选项:
-  --skip-deps        跳过 pip 依赖安装（适用于依赖已装好的环境）
-  --skip-models      跳过模型检查/下载
-  --skip-converter   跳过文档转换工具安装
-  --help             显示帮助信息
+  --vllm          仅安装 vLLM 环境 (rag-vllm)
+  --mineru        仅安装 MinerU 环境 (rag-mineru)
+  --rag           仅安装 RAG 主环境依赖（在当前环境中）
+  --skip-vllm     跳过 vLLM 环境安装
+  --skip-mineru   跳过 MinerU 环境安装
+  --force         强制重建已存在的 conda 环境（先删除再创建）
+  --help          显示帮助信息
 
-步骤说明:
-  Step 1: 环境检测      - 检查 Python 3.8+、pip、CUDA、操作系统
-  Step 2: Python 依赖   - 安装项目核心 pip 依赖
-  Step 3: 文档转换工具  - 按优先级安装 MinerU > Marker > Docling
-  Step 4: 模型检查      - 检查 LLM、Embedding、Reranker 模型是否存在
-  Step 5: 配置文件      - 检查/初始化 .env 配置文件
-  Step 6: 目录创建      - 创建 logs/、data/、data/chat_histories/
-  Step 7: 用户创建引导  - 提示手动运行 create_user.py
-
-错误处理:
-  - 致命错误（如 Python 不存在）立即中止
-  - 非致命错误（如某工具安装失败）记录并继续
-  - 脚本结束时输出完整环境检查报告
-
-返回码:
-  0 - 全部成功
-  1 - 存在失败项
+环境说明:
+  rag-vllm   — vLLM 推理服务
+               Python 3.10 + PyTorch 2.5.1+cu124 + vLLM 0.8.5.post1
+  rag-mineru — MinerU 文档转换
+               Python 3.10 + PyTorch 2.5.1+cu124 + MinerU (via uv)
+  rag        — RAG 主应用（用户已有环境）
+               Flask + LangChain + Qdrant + sentence-transformers 等
 
 示例:
-  bash setup_env.sh                           # 完整环境准备
-  bash setup_env.sh --skip-deps --skip-models # 仅检查配置和创建目录
+  bash setup_env.sh                    # 安装所有环境
+  bash setup_env.sh --vllm             # 仅安装 vLLM 环境
+  bash setup_env.sh --mineru --force   # 强制重建 MinerU 环境
+  bash setup_env.sh --rag              # 仅安装 RAG 核心依赖
+  bash setup_env.sh --skip-vllm        # 跳过 vLLM，安装其余环境
 EOF
 }
 
 # ========== 参数解析 ==========
-SKIP_DEPS=false
-SKIP_MODELS=false
-SKIP_CONVERTER=false
+INSTALL_VLLM=true
+INSTALL_MINERU=true
+INSTALL_RAG=true
+FORCE=false
+ONLY_MODE=false  # 是否指定了 --vllm/--mineru/--rag（仅安装模式）
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --skip-deps)
-            SKIP_DEPS=true
+        --vllm)
+            ONLY_MODE=true
+            INSTALL_VLLM=true
+            INSTALL_MINERU=false
+            INSTALL_RAG=false
             shift
             ;;
-        --skip-models)
-            SKIP_MODELS=true
+        --mineru)
+            ONLY_MODE=true
+            INSTALL_VLLM=false
+            INSTALL_MINERU=true
+            INSTALL_RAG=false
             shift
             ;;
-        --skip-converter)
-            SKIP_CONVERTER=true
+        --rag)
+            ONLY_MODE=true
+            INSTALL_VLLM=false
+            INSTALL_MINERU=false
+            INSTALL_RAG=true
+            shift
+            ;;
+        --skip-vllm)
+            INSTALL_VLLM=false
+            shift
+            ;;
+        --skip-mineru)
+            INSTALL_MINERU=false
+            shift
+            ;;
+        --force)
+            FORCE=true
             shift
             ;;
         --help|-h)
@@ -150,387 +170,291 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ========== 初始化日志目录 ==========
+# ========== 初始化 ==========
 mkdir -p "${LOG_DIR}" 2>/dev/null || true
 
-# ========== 文件锁防止并发执行 ==========
-exec 200>"${LOCK_FILE}"
-if ! flock -n 200 2>/dev/null; then
-    log_error "另一个 setup_env 实例正在运行，退出"
-    exit 1
-fi
-
-# ========== 主流程开始 ==========
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║         RAG 知识库系统 - 环境准备脚本                    ║${NC}"
+echo -e "${CYAN}║       RAG 知识库系统 - 多环境安装脚本                     ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-log_info "========== 开始环境准备 =========="
+log_info "========== 开始环境安装 =========="
 log_info "工作目录: ${SCRIPT_DIR}"
+log_info "安装计划: vLLM=${INSTALL_VLLM}, MinerU=${INSTALL_MINERU}, RAG=${INSTALL_RAG}, Force=${FORCE}"
 
-# ==============================================================================
-# Step 1: 环境检测
-# ==============================================================================
-echo -e "${BLUE}━━━ Step 1: 环境检测 ━━━${NC}"
+# ========== 检查 conda 是否可用 ==========
+echo -e "${BLUE}━━━ 前置检查: conda 可用性 ━━━${NC}"
 echo ""
 
-# 1.1 检查操作系统类型
-OS_TYPE="unknown"
-case "$(uname -s)" in
-    Linux*)   OS_TYPE="Linux" ;;
-    Darwin*)  OS_TYPE="macOS" ;;
-    CYGWIN*|MINGW*|MSYS*) OS_TYPE="Windows" ;;
-esac
-log_info "操作系统: ${OS_TYPE} ($(uname -s) $(uname -m))"
-report_add "操作系统检测" "OK" "${OS_TYPE} ($(uname -m))"
-
-# 1.2 检查 Python 3.8+
-PYTHON_CMD=""
-PYTHON_VERSION=""
-if command -v python3 &>/dev/null; then
-    PYTHON_CMD="python3"
-elif command -v python &>/dev/null; then
-    PYTHON_CMD="python"
+CONDA_CMD=""
+if command -v conda &>/dev/null; then
+    CONDA_CMD="conda"
+elif [[ -f "$HOME/miniconda3/bin/conda" ]]; then
+    CONDA_CMD="$HOME/miniconda3/bin/conda"
+elif [[ -f "$HOME/anaconda3/bin/conda" ]]; then
+    CONDA_CMD="$HOME/anaconda3/bin/conda"
 fi
 
-if [[ -n "$PYTHON_CMD" ]]; then
-    PYTHON_VERSION=$($PYTHON_CMD --version 2>&1 | grep -oP '\d+\.\d+\.\d+' || $PYTHON_CMD --version 2>&1 | sed 's/Python //')
-    # 检查版本是否 >= 3.8
-    PYTHON_MAJOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo "0")
-    PYTHON_MINOR=$($PYTHON_CMD -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
-
-    if [[ "$PYTHON_MAJOR" -ge 3 && "$PYTHON_MINOR" -ge 8 ]]; then
-        log_info "Python: ${PYTHON_VERSION} (${PYTHON_CMD}) ✓"
-        report_add "Python 3.8+" "OK" "${PYTHON_VERSION}"
-    else
-        log_error "Python 版本过低: ${PYTHON_VERSION}，需要 3.8+"
-        report_add "Python 3.8+" "FAIL" "当前版本 ${PYTHON_VERSION}，需要 3.8+"
-        fix_add "请升级 Python 到 3.8 或更高版本"
-        echo -e "${RED}[致命错误] Python 版本不满足要求，中止执行${NC}"
-        # 致命错误，跳转到报告
-        HAS_FAILURE=1
-        # 打印报告后退出
-        echo ""
-        echo -e "${CYAN}━━━ 环境检查报告 ━━━${NC}"
-        echo ""
-        for i in "${!REPORT_ITEMS[@]}"; do
-            case "${REPORT_STATUS[$i]}" in
-                OK)   echo -e "  ${GREEN}✓${NC} ${REPORT_ITEMS[$i]} — ${REPORT_DETAILS[$i]}" ;;
-                FAIL) echo -e "  ${RED}✗${NC} ${REPORT_ITEMS[$i]} — ${REPORT_DETAILS[$i]}" ;;
-                SKIP) echo -e "  ${YELLOW}⚠${NC} ${REPORT_ITEMS[$i]} — ${REPORT_DETAILS[$i]}" ;;
-            esac
-        done
-        echo ""
-        echo -e "${RED}修复建议：${NC}"
-        for s in "${FIX_SUGGESTIONS[@]}"; do
-            echo -e "  • $s"
-        done
-        exit 1
-    fi
-else
-    log_error "未找到 Python，请先安装 Python 3.8+"
-    report_add "Python 3.8+" "FAIL" "未找到 python3 或 python 命令"
-    fix_add "请安装 Python 3.8+: https://www.python.org/downloads/"
-    echo -e "${RED}[致命错误] Python 未安装，中止执行${NC}"
+if [[ -z "$CONDA_CMD" ]]; then
+    log_error "未找到 conda 命令！请先安装 Miniconda 或 Anaconda"
+    echo ""
+    echo -e "${YELLOW}安装方法：${NC}"
+    echo "  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+    echo "  bash Miniconda3-latest-Linux-x86_64.sh"
+    echo ""
     exit 1
 fi
 
-# 1.3 检查 pip
-PIP_CMD=""
-if command -v pip3 &>/dev/null; then
-    PIP_CMD="pip3"
-elif command -v pip &>/dev/null; then
-    PIP_CMD="pip"
-elif $PYTHON_CMD -m pip --version &>/dev/null; then
-    PIP_CMD="$PYTHON_CMD -m pip"
-fi
-
-if [[ -n "$PIP_CMD" ]]; then
-    PIP_VERSION=$($PIP_CMD --version 2>&1 | head -1)
-    log_info "pip: ${PIP_VERSION} ✓"
-    report_add "pip 可用" "OK" "$(echo "$PIP_VERSION" | awk '{print $2}')"
-else
-    log_error "未找到 pip，请先安装 pip"
-    report_add "pip 可用" "FAIL" "未找到 pip/pip3 命令"
-    fix_add "安装 pip: $PYTHON_CMD -m ensurepip --upgrade"
-    echo -e "${RED}[致命错误] pip 不可用，中止执行${NC}"
-    exit 1
-fi
-
-# 1.4 检查 CUDA 可用性
-CUDA_AVAILABLE=false
-if command -v nvidia-smi &>/dev/null; then
-    CUDA_INFO=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1 || echo "")
-    if [[ -n "$CUDA_INFO" ]]; then
-        CUDA_AVAILABLE=true
-        log_info "CUDA: 可用 (${CUDA_INFO})"
-        report_add "CUDA/GPU" "OK" "${CUDA_INFO}"
-    else
-        log_warn "nvidia-smi 存在但无法获取 GPU 信息"
-        report_add "CUDA/GPU" "SKIP" "nvidia-smi 存在但无 GPU 信息"
-    fi
-else
-    log_warn "nvidia-smi 不可用，将以 CPU 模式运行（性能受限）"
-    report_add "CUDA/GPU" "SKIP" "未检测到 nvidia-smi，CPU 模式"
-fi
-
+CONDA_VERSION=$($CONDA_CMD --version 2>&1 | head -1)
+log_info "conda 可用: ${CONDA_VERSION} (${CONDA_CMD})"
 echo ""
 
-# ==============================================================================
-# Step 2: Python 依赖安装
-# ==============================================================================
-echo -e "${BLUE}━━━ Step 2: Python 依赖安装 ━━━${NC}"
-echo ""
+# ========== 检查 conda 环境是否存在 ==========
+check_env_exists() {
+    local env_name="$1"
+    $CONDA_CMD env list 2>/dev/null | grep -qE "^${env_name}\s"
+}
 
-if [[ "$SKIP_DEPS" == "true" ]]; then
-    log_info "跳过 pip 依赖安装（--skip-deps）"
-    report_add "Python 依赖安装" "SKIP" "用户指定跳过"
-else
-    CORE_DEPS=(
-        "flask"
-        "python-dotenv"
-        "langchain"
-        "langchain-openai"
-        "langchain-huggingface"
-        "langchain-qdrant"
-        "qdrant-client"
-        "sentence-transformers"
-        "tiktoken"
-        "vllm"
-    )
+# ========== 安装 vLLM 环境 ==========
+install_vllm_env() {
+    echo -e "${BLUE}━━━ 安装 vLLM 环境 (${ENV_VLLM}) ━━━${NC}"
+    echo ""
 
-    log_info "开始安装核心 Python 依赖（共 ${#CORE_DEPS[@]} 个包）..."
-    DEPS_STR="${CORE_DEPS[*]}"
-
-    # 使用子 shell 避免 set -e 中断整体流程
-    if ( $PIP_CMD install $DEPS_STR 2>&1 | tee -a "${LOG_FILE}" | tail -5 ); then
-        log_info "Python 依赖安装完成 ✓"
-        report_add "Python 依赖安装" "OK" "已安装 ${#CORE_DEPS[@]} 个核心包"
-    else
-        log_error "Python 依赖安装失败（部分包可能未安装成功）"
-        report_add "Python 依赖安装" "FAIL" "pip install 返回错误"
-        fix_add "手动执行: $PIP_CMD install ${DEPS_STR}"
-    fi
-fi
-
-echo ""
-
-# ==============================================================================
-# Step 3: 文档转换工具安装
-# ==============================================================================
-echo -e "${BLUE}━━━ Step 3: 文档转换工具安装 ━━━${NC}"
-echo ""
-
-if [[ "$SKIP_CONVERTER" == "true" ]]; then
-    log_info "跳过文档转换工具安装（--skip-converter）"
-    report_add "文档转换工具" "SKIP" "用户指定跳过"
-else
-    CONVERTER_INSTALLED=false
-    CONVERTER_NAME=""
-
-    # 先检查是否已有可用的转换工具
-    if command -v mineru &>/dev/null; then
-        log_info "MinerU 已安装，跳过转换工具安装"
-        CONVERTER_INSTALLED=true
-        CONVERTER_NAME="MinerU（已存在）"
-    elif command -v marker_single &>/dev/null || command -v marker &>/dev/null; then
-        log_info "Marker 已安装，跳过转换工具安装"
-        CONVERTER_INSTALLED=true
-        CONVERTER_NAME="Marker（已存在）"
-    elif command -v docling &>/dev/null; then
-        log_info "Docling 已安装，跳过转换工具安装"
-        CONVERTER_INSTALLED=true
-        CONVERTER_NAME="Docling（已存在）"
-    fi
-
-    if [[ "$CONVERTER_INSTALLED" == "false" ]]; then
-        # 按优先级尝试安装：MinerU > Marker > Docling
-        log_info "尝试安装 MinerU（优先级最高）..."
-        if ( $PIP_CMD install uv >> "${LOG_FILE}" 2>&1 && uv pip install -U "mineru[all]" >> "${LOG_FILE}" 2>&1 ); then
-            log_info "MinerU 安装成功 ✓"
-            CONVERTER_INSTALLED=true
-            CONVERTER_NAME="MinerU"
+    # 检查环境是否已存在
+    if check_env_exists "$ENV_VLLM"; then
+        if [[ "$FORCE" == "true" ]]; then
+            log_warn "环境 ${ENV_VLLM} 已存在，--force 模式下将删除并重建"
+            $CONDA_CMD env remove -n "$ENV_VLLM" -y 2>&1 | tee -a "${LOG_FILE}" | tail -3
         else
-            log_warn "MinerU 安装失败，尝试 Marker..."
-
-            if ( $PIP_CMD install "marker-pdf[full]" >> "${LOG_FILE}" 2>&1 ); then
-                log_info "Marker 安装成功 ✓"
-                CONVERTER_INSTALLED=true
-                CONVERTER_NAME="Marker"
-            else
-                log_warn "Marker 安装失败，尝试 Docling..."
-
-                if ( $PIP_CMD install docling >> "${LOG_FILE}" 2>&1 ); then
-                    log_info "Docling 安装成功 ✓"
-                    CONVERTER_INSTALLED=true
-                    CONVERTER_NAME="Docling"
-                else
-                    log_error "所有文档转换工具安装失败"
-                fi
-            fi
+            log_info "环境 ${ENV_VLLM} 已存在，跳过创建（使用 --force 可强制重建）"
+            report_add "vLLM 环境 (${ENV_VLLM})" "SKIP" "环境已存在"
+            echo ""
+            return 0
         fi
     fi
 
-    if [[ "$CONVERTER_INSTALLED" == "true" ]]; then
-        report_add "文档转换工具" "OK" "${CONVERTER_NAME}"
-    else
-        report_add "文档转换工具" "FAIL" "MinerU/Marker/Docling 均安装失败"
-        fix_add "手动安装文档转换工具（任选一）："
-        fix_add "  MinerU: pip install uv && uv pip install -U \"mineru[all]\""
-        fix_add "  Marker: pip install marker-pdf[full]"
-        fix_add "  Docling: pip install docling"
-    fi
-fi
-
-echo ""
-
-# ==============================================================================
-# Step 4: 模型检查
-# ==============================================================================
-echo -e "${BLUE}━━━ Step 4: 模型检查 ━━━${NC}"
-echo ""
-
-if [[ "$SKIP_MODELS" == "true" ]]; then
-    log_info "跳过模型检查（--skip-models）"
-    report_add "LLM 模型" "SKIP" "用户指定跳过"
-    report_add "Embedding 模型" "SKIP" "用户指定跳过"
-    report_add "Reranker 模型" "SKIP" "用户指定跳过"
-else
-    # 4.1 检查 LLM 模型
-    LLM_MODEL_PATH="${SCRIPT_DIR}/models/Qwen3-8B-Instruct"
-    if [[ -d "$LLM_MODEL_PATH" ]]; then
-        log_info "LLM 模型存在: ${LLM_MODEL_PATH} ✓"
-        report_add "LLM 模型 (Qwen3-8B)" "OK" "${LLM_MODEL_PATH}"
-    else
-        log_warn "LLM 模型不存在: ${LLM_MODEL_PATH}"
-        report_add "LLM 模型 (Qwen3-8B)" "FAIL" "目录不存在"
-        fix_add "下载 LLM 模型: bash download_model.sh"
+    # 创建 conda 环境
+    log_info "创建 conda 环境: ${ENV_VLLM} (Python 3.10)..."
+    if ! $CONDA_CMD create -n "$ENV_VLLM" python=3.10 -y 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+        log_error "创建 conda 环境 ${ENV_VLLM} 失败"
+        report_add "vLLM 环境 (${ENV_VLLM})" "FAIL" "conda create 失败"
+        echo ""
+        return 1
     fi
 
-    # 4.2 检查 Embedding 模型
-    EMBEDDING_MODEL_PATH="${SCRIPT_DIR}/models/bge-m3"
-    if [[ -d "$EMBEDDING_MODEL_PATH" ]]; then
-        log_info "Embedding 模型存在: ${EMBEDDING_MODEL_PATH} ✓"
-        report_add "Embedding 模型 (bge-m3)" "OK" "${EMBEDDING_MODEL_PATH}"
-    else
-        log_warn "Embedding 模型不存在: ${EMBEDDING_MODEL_PATH}"
-        report_add "Embedding 模型 (bge-m3)" "FAIL" "目录不存在"
-        fix_add "下载 Embedding 模型到 ./models/bge-m3 目录"
+    # 安装 PyTorch（必须先装，确保 CUDA 12.4 版本）
+    log_info "安装 PyTorch 2.5.1+cu124..."
+    if ! $CONDA_CMD run -n "$ENV_VLLM" pip install $PYTORCH_PACKAGES \
+        --index-url "$PYTORCH_INDEX_URL" 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+        log_error "PyTorch 安装失败"
+        report_add "vLLM 环境 (${ENV_VLLM})" "FAIL" "PyTorch 安装失败"
+        echo ""
+        return 1
     fi
 
-    # 4.3 检查 Reranker 模型
-    RERANKER_MODEL_PATH="${SCRIPT_DIR}/models/bge-reranker-v2-m3"
-    if [[ -d "$RERANKER_MODEL_PATH" ]]; then
-        log_info "Reranker 模型存在: ${RERANKER_MODEL_PATH} ✓"
-        report_add "Reranker 模型 (bge-reranker-v2-m3)" "OK" "${RERANKER_MODEL_PATH}"
-    else
-        log_warn "Reranker 模型不存在: ${RERANKER_MODEL_PATH}"
-        report_add "Reranker 模型 (bge-reranker-v2-m3)" "FAIL" "目录不存在"
-        fix_add "下载 Reranker 模型到 ./models/bge-reranker-v2-m3 目录"
+    # 安装 vLLM
+    log_info "安装 vLLM 0.8.5.post1..."
+    if ! $CONDA_CMD run -n "$ENV_VLLM" pip install vllm==0.8.5.post1 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+        log_error "vLLM 安装失败"
+        report_add "vLLM 环境 (${ENV_VLLM})" "FAIL" "vLLM 安装失败"
+        echo ""
+        return 1
     fi
-fi
 
-echo ""
-
-# ==============================================================================
-# Step 5: 配置文件检查
-# ==============================================================================
-echo -e "${BLUE}━━━ Step 5: 配置文件检查 ━━━${NC}"
-echo ""
-
-if [[ -f "$ENV_FILE" ]]; then
-    log_info ".env 文件存在: ${ENV_FILE} ✓"
-
-    # 检查 FLASK_SECRET_KEY 是否为默认值
-    SECRET_KEY=$(grep -E "^FLASK_SECRET_KEY=" "$ENV_FILE" 2>/dev/null | cut -d'=' -f2- || echo "")
-    if [[ "$SECRET_KEY" == "lab403-rag-secret-key-change-me-in-production" ]]; then
-        log_warn "FLASK_SECRET_KEY 仍为默认值，建议修改为随机强密钥"
-        report_add ".env 配置文件" "OK" "存在，但 SECRET_KEY 需修改"
-        fix_add "修改 .env 中的 FLASK_SECRET_KEY 为随机强密钥"
-        fix_add "  生成方法: python3 -c \"import secrets; print(secrets.token_hex(32))\""
+    # 验证安装
+    log_info "验证 vLLM 安装..."
+    if $CONDA_CMD run -n "$ENV_VLLM" python -c "import vllm; print(f'vLLM version: {vllm.__version__}')" 2>&1; then
+        log_info "vLLM 环境安装完成 ✓"
+        report_add "vLLM 环境 (${ENV_VLLM})" "OK" "vLLM 0.8.5.post1 + PyTorch 2.5.1+cu124"
     else
-        report_add ".env 配置文件" "OK" "存在且 SECRET_KEY 已自定义"
+        log_error "vLLM import 验证失败"
+        report_add "vLLM 环境 (${ENV_VLLM})" "FAIL" "import vllm 失败"
+        echo ""
+        return 1
     fi
-else
-    log_warn ".env 文件不存在"
-    # 尝试从 .env.example 复制
-    if [[ -f "$ENV_EXAMPLE_FILE" ]]; then
-        log_info "从 .env.example 复制为 .env"
-        cp "$ENV_EXAMPLE_FILE" "$ENV_FILE"
-        report_add ".env 配置文件" "OK" "已从 .env.example 创建"
-        fix_add "请编辑 .env 文件，确认配置项（尤其是 GPU 分配和 Qdrant 地址）"
-    else
-        log_error ".env 和 .env.example 均不存在，需要手动创建配置文件"
-        report_add ".env 配置文件" "FAIL" ".env 不存在且无 .env.example"
-        fix_add "请参考 README.md 手动创建 .env 配置文件"
-    fi
-fi
 
-echo ""
-
-# ==============================================================================
-# Step 6: 目录创建
-# ==============================================================================
-echo -e "${BLUE}━━━ Step 6: 目录创建 ━━━${NC}"
-echo ""
-
-DIRS_TO_CREATE=(
-    "${SCRIPT_DIR}/logs"
-    "${SCRIPT_DIR}/data"
-    "${SCRIPT_DIR}/data/chat_histories"
-)
-
-DIRS_CREATED=0
-for dir in "${DIRS_TO_CREATE[@]}"; do
-    if [[ ! -d "$dir" ]]; then
-        mkdir -p "$dir"
-        log_info "已创建目录: ${dir}"
-        DIRS_CREATED=$((DIRS_CREATED + 1))
-    else
-        log_debug "目录已存在: ${dir}"
-    fi
-done
-
-if [[ $DIRS_CREATED -gt 0 ]]; then
-    report_add "必要目录创建" "OK" "新建 ${DIRS_CREATED} 个目录"
-else
-    report_add "必要目录创建" "OK" "所有目录已存在"
-fi
-
-echo ""
-
-# ==============================================================================
-# Step 7: 用户创建引导
-# ==============================================================================
-echo -e "${BLUE}━━━ Step 7: 用户创建引导 ━━━${NC}"
-echo ""
-
-if [[ -f "${SCRIPT_DIR}/create_user.py" ]]; then
-    log_info "用户创建脚本存在: create_user.py"
-    echo -e "  ${YELLOW}提示${NC}: 如需创建登录账号，请手动运行："
-    echo -e "    ${GREEN}cd ${SCRIPT_DIR} && $PYTHON_CMD create_user.py${NC}"
     echo ""
-    report_add "用户创建引导" "OK" "请手动运行 create_user.py"
-else
-    log_warn "未找到 create_user.py"
-    report_add "用户创建引导" "SKIP" "create_user.py 不存在"
+    return 0
+}
+
+# ========== 安装 MinerU 环境 ==========
+install_mineru_env() {
+    echo -e "${BLUE}━━━ 安装 MinerU 环境 (${ENV_MINERU}) ━━━${NC}"
+    echo ""
+
+    # 检查环境是否已存在
+    if check_env_exists "$ENV_MINERU"; then
+        if [[ "$FORCE" == "true" ]]; then
+            log_warn "环境 ${ENV_MINERU} 已存在，--force 模式下将删除并重建"
+            $CONDA_CMD env remove -n "$ENV_MINERU" -y 2>&1 | tee -a "${LOG_FILE}" | tail -3
+        else
+            log_info "环境 ${ENV_MINERU} 已存在，跳过创建（使用 --force 可强制重建）"
+            report_add "MinerU 环境 (${ENV_MINERU})" "SKIP" "环境已存在"
+            echo ""
+            return 0
+        fi
+    fi
+
+    # 创建 conda 环境
+    log_info "创建 conda 环境: ${ENV_MINERU} (Python 3.10)..."
+    if ! $CONDA_CMD create -n "$ENV_MINERU" python=3.10 -y 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+        log_error "创建 conda 环境 ${ENV_MINERU} 失败"
+        report_add "MinerU 环境 (${ENV_MINERU})" "FAIL" "conda create 失败"
+        echo ""
+        return 1
+    fi
+
+    # 安装 PyTorch GPU 版
+    log_info "安装 PyTorch 2.5.1+cu124..."
+    if ! $CONDA_CMD run -n "$ENV_MINERU" pip install $PYTORCH_PACKAGES \
+        --index-url "$PYTORCH_INDEX_URL" 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+        log_error "PyTorch 安装失败"
+        report_add "MinerU 环境 (${ENV_MINERU})" "FAIL" "PyTorch 安装失败"
+        echo ""
+        return 1
+    fi
+
+    # 用 uv 安装 MinerU
+    log_info "安装 uv 包管理器..."
+    if ! $CONDA_CMD run -n "$ENV_MINERU" pip install uv 2>&1 | tee -a "${LOG_FILE}" | tail -3; then
+        log_error "uv 安装失败"
+        report_add "MinerU 环境 (${ENV_MINERU})" "FAIL" "uv 安装失败"
+        echo ""
+        return 1
+    fi
+
+    log_info "使用 uv 安装 MinerU..."
+    if ! $CONDA_CMD run -n "$ENV_MINERU" uv pip install -U "mineru[all]" 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+        log_error "MinerU 安装失败"
+        report_add "MinerU 环境 (${ENV_MINERU})" "FAIL" "MinerU 安装失败"
+        echo ""
+        return 1
+    fi
+
+    # 验证安装（新版 MinerU import 名为 mineru，旧版为 magic_pdf）
+    log_info "验证 MinerU 安装..."
+    local mineru_verify_script="
+try:
+    import mineru
+    print(f'MinerU {mineru.__version__} imported successfully')
+except ImportError:
+    import magic_pdf
+    print(f'MinerU (magic-pdf) {magic_pdf.__version__} imported successfully')
+"
+    if $CONDA_CMD run -n "$ENV_MINERU" python -c "$mineru_verify_script" 2>&1; then
+        log_info "MinerU 环境安装完成 ✓"
+        report_add "MinerU 环境 (${ENV_MINERU})" "OK" "MinerU + PyTorch 2.5.1+cu124"
+    else
+        # import 均失败时，尝试 CLI 验证
+        if $CONDA_CMD run -n "$ENV_MINERU" magic-pdf --version &>/dev/null; then
+            log_info "MinerU 环境安装完成 ✓（magic-pdf CLI 可用）"
+            report_add "MinerU 环境 (${ENV_MINERU})" "OK" "MinerU CLI + PyTorch 2.5.1+cu124"
+        else
+            log_warn "MinerU import 验证未通过，但安装过程无报错，可能需要手动验证"
+            report_add "MinerU 环境 (${ENV_MINERU})" "OK" "安装完成（建议手动验证）"
+        fi
+    fi
+
+    echo ""
+    return 0
+}
+
+# ========== 安装 RAG 主环境依赖 ==========
+install_rag_deps() {
+    echo -e "${BLUE}━━━ 安装 RAG 主环境依赖 ━━━${NC}"
+    echo ""
+
+    # RAG 核心依赖列表
+    local RAG_DEPS="flask python-dotenv langchain langchain-openai langchain-huggingface langchain-qdrant qdrant-client sentence-transformers tiktoken"
+
+    # 确定安装目标环境
+    local PIP_CMD=""
+    local PYTHON_CMD=""
+    local TARGET_ENV=""
+
+    if [[ -n "${CONDA_DEFAULT_ENV:-}" ]] && [[ "${CONDA_DEFAULT_ENV}" != "base" ]]; then
+        # 当前已在非 base 的 conda 环境中，直接使用
+        TARGET_ENV="${CONDA_DEFAULT_ENV}"
+        PIP_CMD="pip"
+        PYTHON_CMD="python"
+        log_info "在当前环境 (${TARGET_ENV}) 中安装 RAG 核心依赖..."
+    elif $CONDA_CMD env list 2>/dev/null | grep -qE "^rag\s"; then
+        # 当前在 base 或无环境，但存在名为 'rag' 的 conda 环境
+        TARGET_ENV="rag"
+        PIP_CMD="$CONDA_CMD run -n rag pip"
+        PYTHON_CMD="$CONDA_CMD run -n rag python"
+        log_info "检测到 rag 环境，将在其中安装 RAG 核心依赖..."
+    else
+        # 既不在有效环境中，也找不到 rag 环境
+        log_error "当前处于 base 环境或未激活任何 conda 环境"
+        log_error "且未找到名为 'rag' 的 conda 环境"
+        echo ""
+        echo -e "${YELLOW}请先激活或创建 RAG 环境：${NC}"
+        echo "  方式 1: conda activate rag   # 激活已有环境后重新运行"
+        echo "  方式 2: conda create -n rag python=3.10 && conda activate rag"
+        echo ""
+        report_add "RAG 主环境依赖" "FAIL" "未在有效 conda 环境中（当前: ${CONDA_DEFAULT_ENV:-未激活}）"
+        return 1
+    fi
+
+    log_info "目标环境: ${TARGET_ENV}"
+
+    # 安装依赖
+    if $PIP_CMD install $RAG_DEPS 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+        log_info "RAG 核心依赖安装完成 ✓"
+        report_add "RAG 主环境依赖" "OK" "flask, langchain, qdrant-client 等核心包 (env: ${TARGET_ENV})"
+    else
+        log_error "RAG 核心依赖安装失败"
+        report_add "RAG 主环境依赖" "FAIL" "pip install 返回错误"
+        return 1
+    fi
+
+    # 验证关键 import
+    log_info "验证关键依赖..."
+    local verify_ok=true
+    for pkg in flask dotenv langchain qdrant_client sentence_transformers; do
+        if ! $PYTHON_CMD -c "import $pkg" 2>/dev/null; then
+            log_warn "  ✗ import $pkg 失败"
+            verify_ok=false
+        fi
+    done
+
+    if [[ "$verify_ok" == "true" ]]; then
+        log_info "所有关键依赖验证通过 ✓"
+    else
+        log_warn "部分依赖 import 验证未通过，请检查安装日志"
+    fi
+
+    echo ""
+    return 0
+}
+
+# ========== 主流程 ==========
+
+# 执行安装
+if [[ "$INSTALL_VLLM" == "true" ]]; then
+    install_vllm_env || true
 fi
 
-echo ""
+if [[ "$INSTALL_MINERU" == "true" ]]; then
+    install_mineru_env || true
+fi
 
-# ==============================================================================
-# 环境检查报告
-# ==============================================================================
+if [[ "$INSTALL_RAG" == "true" ]]; then
+    install_rag_deps || true
+fi
+
+# ========== 环境状态报告 ==========
+echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║                   环境检查报告                           ║${NC}"
+echo -e "${CYAN}║                   环境安装报告                           ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
 # 打印报告表格
-printf "  %-4s %-34s %s\n" "状态" "检查项" "详情"
-printf "  %-4s %-34s %s\n" "────" "──────────────────────────────────" "──────────────────────"
+printf "  %-4s %-30s %s\n" "状态" "检查项" "详情"
+printf "  %-4s %-30s %s\n" "────" "──────────────────────────────" "──────────────────────────"
 
 for i in "${!REPORT_ITEMS[@]}"; do
     local_status="${REPORT_STATUS[$i]}"
@@ -539,50 +463,58 @@ for i in "${!REPORT_ITEMS[@]}"; do
 
     case "$local_status" in
         OK)
-            printf "  ${GREEN} ✓ ${NC} %-34s %s\n" "$local_item" "$local_detail"
+            printf "  ${GREEN} ✓ ${NC} %-30s %s\n" "$local_item" "$local_detail"
             ;;
         FAIL)
-            printf "  ${RED} ✗ ${NC} %-34s %s\n" "$local_item" "$local_detail"
+            printf "  ${RED} ✗ ${NC} %-30s %s\n" "$local_item" "$local_detail"
             ;;
         SKIP)
-            printf "  ${YELLOW} ⚠ ${NC} %-34s %s\n" "$local_item" "$local_detail"
+            printf "  ${YELLOW} ⚠ ${NC} %-30s %s\n" "$local_item" "$local_detail"
             ;;
     esac
 done
 
 echo ""
 
-# 输出修复建议（如有）
-if [[ ${#FIX_SUGGESTIONS[@]} -gt 0 ]]; then
-    echo -e "${YELLOW}修复建议：${NC}"
-    echo ""
-    for suggestion in "${FIX_SUGGESTIONS[@]}"; do
-        echo -e "  • ${suggestion}"
-    done
-    echo ""
+# 显示 conda 环境状态总览
+echo -e "${BLUE}━━━ Conda 环境状态 ━━━${NC}"
+echo ""
+if check_env_exists "$ENV_VLLM"; then
+    echo -e "  ${GREEN}●${NC} ${ENV_VLLM}    — 已创建"
+else
+    echo -e "  ${RED}○${NC} ${ENV_VLLM}    — 未创建"
 fi
+if check_env_exists "$ENV_MINERU"; then
+    echo -e "  ${GREEN}●${NC} ${ENV_MINERU}  — 已创建"
+else
+    echo -e "  ${RED}○${NC} ${ENV_MINERU}  — 未创建"
+fi
+echo ""
 
 # 汇总结论
 if [[ $HAS_FAILURE -eq 0 ]]; then
     echo -e "${GREEN}══════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  ✓ 环境准备完成！所有检查项均已通过${NC}"
+    echo -e "${GREEN}  ✓ 环境安装完成！${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════${NC}"
     echo ""
     echo -e "  后续步骤："
-    echo -e "    1. 编辑 .env 确认配置（如尚未配置）"
-    echo -e "    2. 运行 ${GREEN}python create_user.py${NC} 创建账号"
-    echo -e "    3. 运行 ${GREEN}bash convert_to_md.sh --full${NC} 转换文档"
-    echo -e "    4. 运行 ${GREEN}bash auto_ingest.sh --full${NC} 首次入库"
-    echo -e "    5. 运行 ${GREEN}bash start_rag.sh start${NC} 启动服务"
+    echo -e "    1. 启动 vLLM:      ${GREEN}bash start_vllm.sh --background${NC}"
+    echo -e "    2. 转换文档:       ${GREEN}bash convert_to_md.sh --full${NC}"
+    echo -e "    3. 知识入库:       ${GREEN}bash auto_ingest.sh --full${NC}"
+    echo -e "    4. 启动 RAG 系统:  ${GREEN}bash start_rag.sh start${NC}"
     echo ""
 else
     echo -e "${RED}══════════════════════════════════════════════════════════${NC}"
-    echo -e "${RED}  ✗ 环境准备存在失败项，请根据上方建议修复后重试${NC}"
+    echo -e "${RED}  ✗ 部分环境安装失败，请根据上方信息排查${NC}"
     echo -e "${RED}══════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo -e "  排查建议："
+    echo -e "    • 检查日志: ${LOG_FILE}"
+    echo -e "    • 使用 --force 强制重建失败的环境"
+    echo -e "    • 确保网络连接正常（需要下载 PyTorch/vLLM/MinerU）"
     echo ""
 fi
 
-log_info "========== 环境准备结束 (失败项: ${HAS_FAILURE}) =========="
+log_info "========== 环境安装结束 (失败项: ${HAS_FAILURE}) =========="
 
-# 返回码：0=全部成功，1=存在失败项
 exit $HAS_FAILURE
