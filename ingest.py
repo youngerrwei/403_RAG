@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import hashlib
 import time
 import uuid as uuid_module
@@ -440,6 +441,37 @@ def build_contextual_prefix(metadata: dict, parent_summary: str = "", injection_
     return ""
 
 
+# ==================== 摘要缓存文件路径 ====================
+
+# 统一摘要缓存文件，key 为 parent_id（包含 content_hash，内容变化时自动失效）
+SUMMARY_CACHE_FILE = os.path.join(os.path.dirname(__file__), "data", ".summary_cache.json")
+
+
+def save_summary_cache(summary_map: dict, cache_file: str):
+    """将摘要缓存持久化到 JSON 文件，确保后续步骤失败时摘要不丢失"""
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    try:
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(summary_map, f, ensure_ascii=False, indent=2)
+        log(f"摘要缓存已保存到: {cache_file}（共 {len(summary_map)} 条）")
+    except Exception as e:
+        log(f"[WARN] 保存摘要缓存失败: {e}")
+
+
+def load_summary_cache(cache_file: str) -> dict:
+    """从本地加载摘要缓存，支持断点续做"""
+    if not os.path.exists(cache_file):
+        return {}
+    try:
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        log(f"从本地缓存加载了 {len(data)} 条摘要")
+        return data
+    except Exception as e:
+        log(f"[WARN] 加载摘要缓存失败: {e}")
+        return {}
+
+
 # ==================== 摘要增强相关 ====================
 
 SUMMARY_SYSTEM_PROMPT = """你是知识库内容摘要专家。给定一个来自学术论文或技术文档的文本段落，生成一个简洁准确的摘要。
@@ -611,7 +643,7 @@ def call_vllm_for_summary(parent_content: str, doc_title: str, header_path: str,
 
 def generate_parent_summaries(parent_chunks_data: list, cfg: dict) -> dict:
     """
-    并发为父块生成摘要
+    并发为父块生成摘要，支持本地文件缓存断点续做。
 
     Args:
         parent_chunks_data: 父块数据列表，每项为 dict 包含 parent_id, parent_content, doc_title, header_path, source
@@ -631,20 +663,32 @@ def generate_parent_summaries(parent_chunks_data: list, cfg: dict) -> dict:
         return {}
 
     max_workers = cfg.get("SUMMARY_MAX_WORKERS", 3)
-    summary_map = {}
 
-    # 初始化缓存
-    cache = None
+    # === 从本地缓存文件加载已生成的摘要（支持断点续做） ===
+    cached_summaries = load_summary_cache(SUMMARY_CACHE_FILE)
+    summary_map = dict(cached_summaries)  # 以缓存为基础
+
+    # 同时兼容旧的目录缓存（SummaryCache），逐步迁移
+    old_cache = None
     if cfg.get("ENABLE_SUMMARY_CACHE", True):
-        cache = SummaryCache(cfg.get("SUMMARY_CACHE_DIR", "./data/summary_cache"))
+        old_cache = SummaryCache(cfg.get("SUMMARY_CACHE_DIR", "./data/summary_cache"))
+
+    # 过滤出需要生成摘要的父块（跳过已缓存的）
+    needed_parents = [item for item in parent_chunks_data if item["parent_id"] not in summary_map]
+    log(f"需要生成摘要: {len(needed_parents)} 个（已从本地缓存加载: {len(summary_map)} 个）")
+
+    # 如果所有摘要都已缓存，直接返回
+    if not needed_parents:
+        log("所有父块摘要均已缓存，跳过 vLLM 调用")
+        return summary_map
 
     def generate_one(item):
         parent_id = item["parent_id"]
         source = item.get("source", "")
 
-        # 优先从缓存获取
-        if cache:
-            cached = cache.get(source, parent_id)
+        # 再次检查（防止并发重复），同时兼容旧目录缓存
+        if old_cache:
+            cached = old_cache.get(source, parent_id)
             if cached:
                 return (parent_id, cached)
 
@@ -656,16 +700,16 @@ def generate_parent_summaries(parent_chunks_data: list, cfg: dict) -> dict:
             cfg=cfg
         )
 
-        # 写入缓存
-        if summary and cache:
-            cache.set(source, parent_id, summary)
+        # 写入旧缓存目录（兼容）
+        if summary and old_cache:
+            old_cache.set(source, parent_id, summary)
 
         return (parent_id, summary)
 
-    log(f"开始为 {len(parent_chunks_data)} 个父块生成摘要（并发数={max_workers}）...")
+    log(f"开始为 {len(needed_parents)} 个父块生成摘要（并发数={max_workers}）...")
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(generate_one, item): item for item in parent_chunks_data}
+        futures = {executor.submit(generate_one, item): item for item in needed_parents}
         completed = 0
         for future in as_completed(futures):
             try:
@@ -674,13 +718,19 @@ def generate_parent_summaries(parent_chunks_data: list, cfg: dict) -> dict:
                     summary_map[parent_id] = summary
                 completed += 1
                 # 每10%输出进度
-                if completed % max(1, len(parent_chunks_data) // 10) == 0:
-                    log(f"摘要生成进度: {completed}/{len(parent_chunks_data)}")
+                if completed % max(1, len(needed_parents) // 10) == 0:
+                    log(f"摘要生成进度: {completed}/{len(needed_parents)}")
             except Exception as e:
                 log(f"摘要生成异常: {e}")
 
     success_count = len(summary_map)
-    log(f"摘要生成完成: {success_count}/{len(parent_chunks_data)} 成功 ({100 * success_count // max(1, len(parent_chunks_data))}%)")
+    total_count = len(parent_chunks_data)
+    log(f"摘要生成完成: {success_count}/{total_count} 成功 ({100 * success_count // max(1, total_count)}%)")
+
+    # === 摘要生成完成后立即持久化到本地，防止后续步骤（Embedding/Qdrant）失败导致结果丢失 ===
+    save_summary_cache(summary_map, SUMMARY_CACHE_FILE)
+    log("摘要已持久化到本地缓存文件，即使后续步骤失败也可复用")
+
     return summary_map
 
 
