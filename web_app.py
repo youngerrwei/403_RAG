@@ -137,8 +137,9 @@ def _set_security_headers(response):
     nonce = getattr(g, 'csp_nonce', '')
     response.headers["Content-Security-Policy"] = (
         f"default-src 'self'; "
-        f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+        f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net https://unpkg.com; "
         f"style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        f"img-src 'self' data:; "
         f"font-src 'self' https://cdn.jsdelivr.net; "
         f"connect-src 'self' https://cdn.jsdelivr.net; "
         f"frame-ancestors 'self'"
