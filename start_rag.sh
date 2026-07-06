@@ -8,10 +8,12 @@
 #   - web_app.py 运行在当前环境（rag）中
 #
 # 用法：
-#   bash start_rag.sh start    - 启动全部服务
-#   bash start_rag.sh stop     - 停止全部服务
-#   bash start_rag.sh restart  - 重启全部服务
-#   bash start_rag.sh status   - 查看服务状态
+#   bash start_rag.sh start          - 启动全部服务
+#   bash start_rag.sh stop           - 只停止 web_app（vLLM 保持运行）
+#   bash start_rag.sh stop --all     - 停止 web_app + vLLM
+#   bash start_rag.sh restart        - 只重启 web_app（vLLM 保持运行）
+#   bash start_rag.sh restart --all  - 重启 web_app + vLLM
+#   bash start_rag.sh status         - 查看服务状态
 # ==============================================================================
 set -e
 
@@ -386,10 +388,23 @@ except:
 }
 
 # ----------------------------- stop 子命令 -------------------------------------
+# vLLM 由 `start_vllm.sh stop` 独立管理，默认 stop 只关闭 web_app
+# 如需同时停止 vLLM，请使用 `bash start_rag.sh stop --all`
 do_stop() {
+    local stop_all=false
+    # 检查是否传入 --all 参数
+    if [ "${1:-}" = "--all" ]; then
+        stop_all=true
+    fi
+
     set +e  # stop 时不因 kill 失败而退出
     echo "============================================="
     echo "  RAG 系统停止流程"
+    if [ "$stop_all" = "true" ]; then
+        echo "  模式: 停止 web_app + vLLM"
+    else
+        echo "  模式: 仅停止 web_app（vLLM 保持运行）"
+    fi
     echo "============================================="
     echo ""
 
@@ -411,32 +426,41 @@ do_stop() {
 
     echo ""
 
-    # 停止 vLLM
-    echo ">>> 停止 vLLM..."
-    if [ -f "$PID_VLLM" ]; then
-        local pid=$(cat "$PID_VLLM")
-        kill_process "$pid" "vLLM"
-        rm -f "$PID_VLLM"
-    else
-        # 通过端口查找
-        local pid=$(get_pid_by_port "$VLLM_PORT")
-        if [ -n "$pid" ]; then
+    # 仅在 --all 模式下停止 vLLM
+    if [ "$stop_all" = "true" ]; then
+        echo ">>> 停止 vLLM..."
+        if [ -f "$PID_VLLM" ]; then
+            local pid=$(cat "$PID_VLLM")
             kill_process "$pid" "vLLM"
+            rm -f "$PID_VLLM"
         else
-            echo "[信息] vLLM 未运行"
+            # 通过端口查找
+            local pid=$(get_pid_by_port "$VLLM_PORT")
+            if [ -n "$pid" ]; then
+                kill_process "$pid" "vLLM"
+            else
+                echo "[信息] vLLM 未运行"
+            fi
         fi
+        echo ""
+        echo "[信息] ✓ web_app + vLLM 已停止"
+    else
+        echo "[信息] ✓ web_app 已停止（vLLM 保持运行，如需停止请使用 stop --all）"
     fi
-
-    echo ""
-    echo "[信息] ✓ 所有服务已停止"
     set -e
 }
 
 # ----------------------------- restart 子命令 ----------------------------------
 do_restart() {
-    echo "[信息] 正在重启 RAG 系统..."
+    local restart_all=""
+    if [ "${1:-}" = "--all" ]; then
+        restart_all="--all"
+        echo "[信息] 正在重启 RAG 系统（包括 vLLM）..."
+    else
+        echo "[信息] 正在重启 web_app（vLLM 保持运行）..."
+    fi
     echo ""
-    do_stop
+    do_stop $restart_all
     echo ""
     sleep 2
     do_start
@@ -498,22 +522,24 @@ case "${1:-}" in
         do_start
         ;;
     stop)
-        do_stop
+        do_stop "${2:-}"
         ;;
     restart)
-        do_restart
+        do_restart "${2:-}"
         ;;
     status)
         do_status
         ;;
     *)
-        echo "用法: bash $0 {start|stop|restart|status}"
+        echo "用法: bash $0 {start|stop|restart|status} [--all]"
         echo ""
         echo "子命令说明："
-        echo "  start    - 启动全部服务 (vLLM + web_app)"
-        echo "  stop     - 停止全部服务"
-        echo "  restart  - 重启全部服务"
-        echo "  status   - 查看服务状态"
+        echo "  start          - 启动全部服务 (vLLM + web_app)"
+        echo "  stop           - 只停止 web_app（vLLM 由 start_vllm.sh stop 独立管理）"
+        echo "  stop --all     - 停止 web_app + vLLM"
+        echo "  restart        - 只重启 web_app（vLLM 保持运行）"
+        echo "  restart --all  - 重启 web_app + vLLM"
+        echo "  status         - 查看服务状态"
         exit 1
         ;;
 esac
