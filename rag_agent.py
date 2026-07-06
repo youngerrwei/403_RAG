@@ -1300,7 +1300,7 @@ def assess_coverage(reranked_docs: list, config: dict) -> dict:
     if not reranked_docs:
         return {
             "level": "none",
-            "hint": "⚠️ 知识库中未找到相关内容，以下回答基于模型通用知识，仅供参考。"
+            "hint": "⚠️ 知识库中未找到相关内容，本次回答基于模型通用知识，仅供参考。"
         }
 
     # 综合评估指标
@@ -1321,7 +1321,7 @@ def assess_coverage(reranked_docs: list, config: dict) -> dict:
     else:
         return {
             "level": "very_low",
-            "hint": "⚠️ 该问题可能不在知识库范围内，以下回答仅供参考。"
+            "hint": "⚠️ 该问题可能不在知识库范围内，本次回答仅供参考。"
         }
 
 
