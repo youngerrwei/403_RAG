@@ -1,13 +1,13 @@
 #!/bin/bash
 # ==============================================================================
-# RAG 知识库系统 - 多环境安装脚本
+# RAG 知识库系统 - 可重复执行的多环境安装脚本
 # 背景：vLLM 和 MinerU 无法共存于同一 conda 环境（PyTorch/flashinfer/paddlepaddle 冲突）
 # 方案：创建独立的 conda 环境
 #
 # 环境规划：
 #   rag-vllm   — vLLM 推理服务 (Python 3.10 + PyTorch 2.5.1+cu124 + vLLM 0.8.5.post1)
 #   rag-mineru — MinerU 文档转换 (Python 3.10 + PyTorch 2.5.1+cu124 + MinerU)
-#   rag        — RAG 主应用 (用户已有环境，仅安装核心依赖)
+#   rag        — RAG 主应用 (不存在时创建，并安装核心依赖)
 #
 # 用法:
 #   bash setup_env.sh              # 安装所有环境
@@ -25,10 +25,15 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/setup_env.log"
+ENV_FILE="${SCRIPT_DIR}/.env"
+ENV_EXAMPLE="${SCRIPT_DIR}/.env.example"
+source "${SCRIPT_DIR}/scripts/runtime_common.sh"
 
 # conda 环境名称
-ENV_VLLM="rag-vllm"
-ENV_MINERU="rag-mineru"
+load_env_keys "$ENV_FILE" RAG_CONDA_ENV VLLM_CONDA_ENV MINERU_CONDA_ENV || true
+ENV_RAG="${RAG_CONDA_ENV:-rag}"
+ENV_VLLM="${VLLM_CONDA_ENV:-rag-vllm}"
+ENV_MINERU="${MINERU_CONDA_ENV:-rag-mineru}"
 
 # PyTorch 版本（统一使用 cu124）
 PYTORCH_PACKAGES="torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1"
@@ -93,7 +98,7 @@ RAG 知识库系统 - 多环境安装脚本
 选项:
   --vllm          仅安装 vLLM 环境 (rag-vllm)
   --mineru        仅安装 MinerU 环境 (rag-mineru)
-  --rag           仅安装 RAG 主环境依赖（在当前环境中）
+  --rag           仅创建/更新 RAG 主环境
   --skip-vllm     跳过 vLLM 环境安装
   --skip-mineru   跳过 MinerU 环境安装
   --force         强制重建已存在的 conda 环境（先删除再创建）
@@ -104,7 +109,7 @@ RAG 知识库系统 - 多环境安装脚本
                Python 3.10 + PyTorch 2.5.1+cu124 + vLLM 0.8.5.post1
   rag-mineru — MinerU 文档转换
                Python 3.10 + PyTorch 2.5.1+cu124 + MinerU (via uv)
-  rag        — RAG 主应用（用户已有环境）
+  rag        — RAG 主应用（不存在时自动创建）
                Flask + LangChain + Qdrant + sentence-transformers 等
 
 示例:
@@ -173,6 +178,40 @@ done
 # ========== 初始化 ==========
 mkdir -p "${LOG_DIR}" 2>/dev/null || true
 
+ensure_private_env() {
+    if [[ ! -f "$ENV_FILE" ]]; then
+        [[ -f "$ENV_EXAMPLE" ]] || { log_error "缺少配置模板: $ENV_EXAMPLE"; return 1; }
+        cp "$ENV_EXAMPLE" "$ENV_FILE"
+        log_info "已从 .env.example 创建本机 .env"
+    fi
+
+    local current_secret secret tmp_file openssl_bin
+    current_secret="$(awk -F= '$1 == "FLASK_SECRET_KEY" {sub(/^[^=]*=/, ""); print; exit}' "$ENV_FILE")"
+    if is_weak_flask_secret "$current_secret"; then
+        openssl_bin="$(find_executable openssl /usr/bin/openssl /usr/local/bin/openssl || true)"
+        if [[ -n "$openssl_bin" ]]; then
+            secret="$($openssl_bin rand -hex 32)"
+        elif [[ -r /dev/urandom ]] && command -v od >/dev/null 2>&1; then
+            secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+        else
+            log_error "无法生成安全的 FLASK_SECRET_KEY（缺少 openssl 和 /dev/urandom）"
+            return 1
+        fi
+        tmp_file="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+        awk -v secret="$secret" '
+            BEGIN { replaced = 0 }
+            /^FLASK_SECRET_KEY=/ { print "FLASK_SECRET_KEY=" secret; replaced = 1; next }
+            { print }
+            END { if (!replaced) print "FLASK_SECRET_KEY=" secret }
+        ' "$ENV_FILE" > "$tmp_file"
+        mv -f "$tmp_file" "$ENV_FILE"
+        chmod 600 "$ENV_FILE" 2>/dev/null || true
+        log_info "已生成本机随机 FLASK_SECRET_KEY（现有登录 Session 将失效）"
+    fi
+}
+
+ensure_private_env || exit 1
+
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║       RAG 知识库系统 - 多环境安装脚本                     ║${NC}"
@@ -187,14 +226,7 @@ log_info "安装计划: vLLM=${INSTALL_VLLM}, MinerU=${INSTALL_MINERU}, RAG=${IN
 echo -e "${BLUE}━━━ 前置检查: conda 可用性 ━━━${NC}"
 echo ""
 
-CONDA_CMD=""
-if command -v conda &>/dev/null; then
-    CONDA_CMD="conda"
-elif [[ -f "$HOME/miniconda3/bin/conda" ]]; then
-    CONDA_CMD="$HOME/miniconda3/bin/conda"
-elif [[ -f "$HOME/anaconda3/bin/conda" ]]; then
-    CONDA_CMD="$HOME/anaconda3/bin/conda"
-fi
+CONDA_CMD="$(find_conda || true)"
 
 if [[ -z "$CONDA_CMD" ]]; then
     log_error "未找到 conda 命令！请先安装 Miniconda 或 Anaconda"
@@ -227,8 +259,14 @@ install_vllm_env() {
             log_warn "环境 ${ENV_VLLM} 已存在，--force 模式下将删除并重建"
             $CONDA_CMD env remove -n "$ENV_VLLM" -y 2>&1 | tee -a "${LOG_FILE}" | tail -3
         else
-            log_info "环境 ${ENV_VLLM} 已存在，跳过创建（使用 --force 可强制重建）"
-            report_add "vLLM 环境 (${ENV_VLLM})" "SKIP" "环境已存在"
+            log_info "环境 ${ENV_VLLM} 已存在，执行依赖验证"
+            if "$CONDA_CMD" run -n "$ENV_VLLM" python -c "import vllm, torch" >>"${LOG_FILE}" 2>&1; then
+                report_add "vLLM 环境 (${ENV_VLLM})" "SKIP" "环境已存在且验证通过"
+            else
+                log_error "现有 ${ENV_VLLM} 环境依赖验证失败，请使用 --force 重建"
+                report_add "vLLM 环境 (${ENV_VLLM})" "FAIL" "现有环境 import 验证失败"
+                return 1
+            fi
             echo ""
             return 0
         fi
@@ -289,8 +327,15 @@ install_mineru_env() {
             log_warn "环境 ${ENV_MINERU} 已存在，--force 模式下将删除并重建"
             $CONDA_CMD env remove -n "$ENV_MINERU" -y 2>&1 | tee -a "${LOG_FILE}" | tail -3
         else
-            log_info "环境 ${ENV_MINERU} 已存在，跳过创建（使用 --force 可强制重建）"
-            report_add "MinerU 环境 (${ENV_MINERU})" "SKIP" "环境已存在"
+            log_info "环境 ${ENV_MINERU} 已存在，执行 CLI 验证"
+            if "$CONDA_CMD" run -n "$ENV_MINERU" bash -c \
+                "command -v mineru >/dev/null || command -v magic-pdf >/dev/null" >>"${LOG_FILE}" 2>&1; then
+                report_add "MinerU 环境 (${ENV_MINERU})" "SKIP" "环境已存在且验证通过"
+            else
+                log_error "现有 ${ENV_MINERU} 环境验证失败，请使用 --force 重建"
+                report_add "MinerU 环境 (${ENV_MINERU})" "FAIL" "现有环境 CLI 验证失败"
+                return 1
+            fi
             echo ""
             return 0
         fi
@@ -351,8 +396,9 @@ except ImportError:
             log_info "MinerU 环境安装完成 ✓（magic-pdf CLI 可用）"
             report_add "MinerU 环境 (${ENV_MINERU})" "OK" "MinerU CLI + PyTorch 2.5.1+cu124"
         else
-            log_warn "MinerU import 验证未通过，但安装过程无报错，可能需要手动验证"
-            report_add "MinerU 环境 (${ENV_MINERU})" "OK" "安装完成（建议手动验证）"
+            log_error "MinerU import 与 CLI 验证均失败"
+            report_add "MinerU 环境 (${ENV_MINERU})" "FAIL" "安装后验证失败"
+            return 1
         fi
     fi
 
@@ -365,67 +411,45 @@ install_rag_deps() {
     echo -e "${BLUE}━━━ 安装 RAG 主环境依赖 ━━━${NC}"
     echo ""
 
-    # RAG 核心依赖列表
-    local RAG_DEPS="flask python-dotenv langchain langchain-openai langchain-huggingface langchain-qdrant qdrant-client sentence-transformers tiktoken"
-
-    # 确定安装目标环境
-    local PIP_CMD=""
-    local PYTHON_CMD=""
-    local TARGET_ENV=""
-
-    if [[ -n "${CONDA_DEFAULT_ENV:-}" ]] && [[ "${CONDA_DEFAULT_ENV}" != "base" ]]; then
-        # 当前已在非 base 的 conda 环境中，直接使用
-        TARGET_ENV="${CONDA_DEFAULT_ENV}"
-        PIP_CMD="pip"
-        PYTHON_CMD="python"
-        log_info "在当前环境 (${TARGET_ENV}) 中安装 RAG 核心依赖..."
-    elif $CONDA_CMD env list 2>/dev/null | grep -qE "^rag\s"; then
-        # 当前在 base 或无环境，但存在名为 'rag' 的 conda 环境
-        TARGET_ENV="rag"
-        PIP_CMD="$CONDA_CMD run -n rag pip"
-        PYTHON_CMD="$CONDA_CMD run -n rag python"
-        log_info "检测到 rag 环境，将在其中安装 RAG 核心依赖..."
-    else
-        # 既不在有效环境中，也找不到 rag 环境
-        log_error "当前处于 base 环境或未激活任何 conda 环境"
-        log_error "且未找到名为 'rag' 的 conda 环境"
-        echo ""
-        echo -e "${YELLOW}请先激活或创建 RAG 环境：${NC}"
-        echo "  方式 1: conda activate rag   # 激活已有环境后重新运行"
-        echo "  方式 2: conda create -n rag python=3.10 && conda activate rag"
-        echo ""
-        report_add "RAG 主环境依赖" "FAIL" "未在有效 conda 环境中（当前: ${CONDA_DEFAULT_ENV:-未激活}）"
-        return 1
+    local RAG_DEPS="flask python-dotenv langchain langchain-openai langchain-huggingface langchain-qdrant qdrant-client sentence-transformers tiktoken modelscope huggingface-hub"
+    if check_env_exists "$ENV_RAG"; then
+        if [[ "$FORCE" == "true" ]]; then
+            log_warn "环境 ${ENV_RAG} 已存在，--force 模式下将删除并重建"
+            if ! "$CONDA_CMD" env remove -n "$ENV_RAG" -y >>"${LOG_FILE}" 2>&1; then
+                report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "删除旧环境失败"
+                return 1
+            fi
+        else
+            log_info "环境 ${ENV_RAG} 已存在，将在该环境中验证并更新依赖"
+        fi
+    fi
+    if ! check_env_exists "$ENV_RAG"; then
+        log_info "创建 conda 环境: ${ENV_RAG} (Python 3.10)..."
+        if ! "$CONDA_CMD" create -n "$ENV_RAG" python=3.10 -y >>"${LOG_FILE}" 2>&1; then
+            report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "conda create 失败"
+            return 1
+        fi
     fi
 
-    log_info "目标环境: ${TARGET_ENV}"
+    log_info "目标环境: ${ENV_RAG}"
 
     # 安装依赖
-    if $PIP_CMD install $RAG_DEPS 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+    if "$CONDA_CMD" run -n "$ENV_RAG" pip install $RAG_DEPS 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
         log_info "RAG 核心依赖安装完成 ✓"
-        report_add "RAG 主环境依赖" "OK" "flask, langchain, qdrant-client 等核心包 (env: ${TARGET_ENV})"
     else
         log_error "RAG 核心依赖安装失败"
-        report_add "RAG 主环境依赖" "FAIL" "pip install 返回错误"
+        report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "pip install 返回错误"
         return 1
     fi
 
-    # 验证关键 import
     log_info "验证关键依赖..."
-    local verify_ok=true
-    for pkg in flask dotenv langchain qdrant_client sentence_transformers; do
-        if ! $PYTHON_CMD -c "import $pkg" 2>/dev/null; then
-            log_warn "  ✗ import $pkg 失败"
-            verify_ok=false
-        fi
-    done
-
-    if [[ "$verify_ok" == "true" ]]; then
-        log_info "所有关键依赖验证通过 ✓"
-    else
-        log_warn "部分依赖 import 验证未通过，请检查安装日志"
+    if ! "$CONDA_CMD" run -n "$ENV_RAG" python -c \
+        "import flask,dotenv,langchain,qdrant_client,sentence_transformers" >>"${LOG_FILE}" 2>&1; then
+        log_error "RAG 关键依赖 import 验证失败"
+        report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "关键 import 失败"
+        return 1
     fi
-
+    report_add "RAG 主环境 (${ENV_RAG})" "OK" "核心依赖安装并验证通过"
     echo ""
     return 0
 }
@@ -489,6 +513,11 @@ if check_env_exists "$ENV_MINERU"; then
 else
     echo -e "  ${RED}○${NC} ${ENV_MINERU}  — 未创建"
 fi
+if check_env_exists "$ENV_RAG"; then
+    echo -e "  ${GREEN}●${NC} ${ENV_RAG}         — 已创建"
+else
+    echo -e "  ${RED}○${NC} ${ENV_RAG}         — 未创建"
+fi
 echo ""
 
 # 汇总结论
@@ -497,11 +526,13 @@ if [[ $HAS_FAILURE -eq 0 ]]; then
     echo -e "${GREEN}  ✓ 环境安装完成！${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  后续步骤："
-    echo -e "    1. 启动 vLLM:      ${GREEN}bash start_vllm.sh --background${NC}"
-    echo -e "    2. 转换文档:       ${GREEN}bash convert_to_md.sh --full${NC}"
-    echo -e "    3. 知识入库:       ${GREEN}bash auto_ingest.sh --full${NC}"
-    echo -e "    4. 启动 RAG 系统:  ${GREEN}bash start_rag.sh start${NC}"
+    echo -e "  后续步骤（首次部署）："
+    echo -e "    1. 编辑 .env 并准备三个本地模型"
+    echo -e "    2. 创建用户:       ${GREEN}conda run -n ${ENV_RAG} python create_user.py${NC}"
+    echo -e "    3. 转换文档:       ${GREEN}bash convert_to_md.sh --full${NC}"
+    echo -e "    4. 启动 vLLM:      ${GREEN}bash start_vllm.sh --background${NC}"
+    echo -e "    5. 知识入库:       ${GREEN}bash auto_ingest.sh --full${NC}"
+    echo -e "    6. 启动 RAG 系统:  ${GREEN}bash start_rag.sh start${NC}"
     echo ""
 else
     echo -e "${RED}══════════════════════════════════════════════════════════${NC}"

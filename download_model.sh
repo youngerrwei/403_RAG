@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 模型下载脚本 - 下载 Qwen3-8B-Instruct 到本地
+# 模型下载脚本 - 使用明确的 RAG 环境下载 Qwen3-8B-Instruct 到本地
 # =============================================================================
 # 用法:
 #   bash download_model.sh [选项] [目标路径]
@@ -20,7 +20,16 @@
 #   HF_TOKEN=hf_xxx bash download_model.sh --source huggingface  # HF + Token
 # =============================================================================
 
-set -e
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/scripts/runtime_common.sh"
+ENV_FILE="${RAG_ENV_FILE:-$SCRIPT_DIR/.env}"
+load_env_keys "$ENV_FILE" RAG_CONDA_ENV VLLM_MODEL_NAME || true
+RAG_CONDA_ENV="${RAG_CONDA_ENV:-rag}"
+CONDA_CMD="$(find_conda || true)"
+DOWNLOAD_PYTHON=""
+[[ -n "$CONDA_CMD" ]] && DOWNLOAD_PYTHON="$(conda_env_python "$CONDA_CMD" "$RAG_CONDA_ENV" || true)"
 
 # ----------------------------- 配置 ------------------------------------
 MODEL_ID="Qwen/Qwen3-8B-Instruct"
@@ -74,7 +83,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 # 设置默认目标路径
-TARGET_DIR="${TARGET_DIR:-./models/Qwen3-8B-Instruct}"
+TARGET_DIR="${TARGET_DIR:-${VLLM_MODEL_NAME:-./models/Qwen3-8B-Instruct}}"
+TARGET_DIR="$(resolve_project_path "$TARGET_DIR")"
 
 # 验证 source 参数
 if [[ "$SOURCE" != "modelscope" && "$SOURCE" != "huggingface" ]]; then
@@ -169,12 +179,9 @@ download_from_modelscope() {
     if command -v modelscope &>/dev/null; then
         ms_method="cli"
         log_info "检测到 modelscope CLI"
-    elif python3 -c "import modelscope" 2>/dev/null; then
-        ms_method="python3"
-        log_info "检测到 Python modelscope 库"
-    elif python -c "import modelscope" 2>/dev/null; then
+    elif [[ -n "$DOWNLOAD_PYTHON" ]] && "$DOWNLOAD_PYTHON" -c "import modelscope" 2>/dev/null; then
         ms_method="python"
-        log_info "检测到 Python modelscope 库"
+        log_info "检测到 ${RAG_CONDA_ENV} 环境中的 modelscope 库"
     else
         log_error "未找到 modelscope 工具！请先安装："
         echo ""
@@ -195,11 +202,8 @@ download_from_modelscope() {
                 return 0
             fi
             ;;
-        python3|python)
-            local py_cmd="python3"
-            [ "$ms_method" = "python" ] && py_cmd="python"
-
-            if $py_cmd -c "
+        python)
+            if "$DOWNLOAD_PYTHON" -c "
 from modelscope import snapshot_download
 snapshot_download(
     model_id='${MODELSCOPE_MODEL_ID}',
@@ -243,12 +247,9 @@ download_from_huggingface() {
     elif command -v huggingface-cli &>/dev/null; then
         hf_method="huggingface_cli"
         log_info "检测到 huggingface-cli"
-    elif python3 -c "import huggingface_hub" 2>/dev/null; then
-        hf_method="python3"
-        log_info "使用 Python huggingface_hub 库下载"
-    elif python -c "import huggingface_hub" 2>/dev/null; then
+    elif [[ -n "$DOWNLOAD_PYTHON" ]] && "$DOWNLOAD_PYTHON" -c "import huggingface_hub" 2>/dev/null; then
         hf_method="python"
-        log_info "使用 Python huggingface_hub 库下载"
+        log_info "使用 ${RAG_CONDA_ENV} 环境中的 huggingface_hub 库下载"
     else
         log_error "未找到 HuggingFace 下载工具！请安装："
         echo ""
@@ -277,11 +278,8 @@ download_from_huggingface() {
                 return 0
             fi
             ;;
-        python3|python)
-            local py_cmd="python3"
-            [ "$hf_method" = "python" ] && py_cmd="python"
-
-            if $py_cmd -c "
+        python)
+            if "$DOWNLOAD_PYTHON" -c "
 from huggingface_hub import snapshot_download
 import os
 
