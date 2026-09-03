@@ -1,0 +1,15 @@
+# RAG 主环境的直接依赖清单。升级后必须执行 test_reliability.py 与真实健康检查。
+flask
+python-dotenv
+langchain
+langchain-core
+langchain-openai
+langchain-huggingface
+langchain-qdrant
+langchain-text-splitters
+qdrant-client
+sentence-transformers
+tiktoken
+modelscope
+huggingface-hub
+requests

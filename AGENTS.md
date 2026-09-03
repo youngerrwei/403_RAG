@@ -14,7 +14,8 @@
 | `ingest.py` | 知识入库：文档加载、文本清洗、分块切分、向量化、写入 Qdrant |
 | `web_app.py` | Flask 服务：用户认证、SSE 流式接口、对话历史管理 |
 | `logger.py` | 统一日志模块：提供 `get_logger()` 接口，支持控制台+文件双输出、按日期自动轮转 |
-| `create_user.py` | 用户创建脚本：交互式创建/更新用户凭据（PBKDF2 加密） |
+| `create_user.py` | 用户创建脚本：交互式创建/原子更新用户凭据（PBKDF2 加密） |
+| `requirements-rag.txt` | RAG 主环境直接依赖清单，由 `setup_env.sh --rag` 安装与校验 |
 | `auto_ingest.sh` | 入库管理脚本：支持增量入库、全量入库、集合销毁 |
 | `start_rag.sh` | 服务启动管理脚本：启动前预检（.env、模型路径、Qdrant、目录验证）、环境变量全量加载、vLLM/web_app 启动管理、通过 /api/health 验证就绪性 |
 | `templates/index.html` | 对话前端页面 |
@@ -70,7 +71,7 @@ web_app.py ──导入并调用──▶ rag_agent.py
 ### 3.2 依赖管理
 
 - **尽量不引入新的 pip 依赖**
-- 如必须引入，需同步更新 README 中的安装说明
+- 如必须引入，需同步更新 `requirements-rag.txt` 与 README 中的安装说明
 
 ### 3.3 配置管理
 

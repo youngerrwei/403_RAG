@@ -2,6 +2,7 @@ import ast
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 class ScriptContractTests(unittest.TestCase):
+    """无需真实模型即可执行的部署契约回归。"""
     def test_python_entrypoints_parse(self):
         files = (
             "agent_entry.py",
@@ -98,6 +100,93 @@ class ScriptContractTests(unittest.TestCase):
         self.assertEqual(values["FLASK_SECRET_KEY"], "")
         self.assertEqual(values["MCP_INTERNAL_TOKEN"], "")
         self.assertEqual(values["QDRANT_RECREATE_COLLECTION"], "false")
+
+    def test_rag_direct_dependencies_are_declared_and_verified(self):
+        requirements = {
+            line.strip().lower()
+            for line in (PROJECT_ROOT / "requirements-rag.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        }
+        required_packages = {
+            "flask",
+            "python-dotenv",
+            "langchain",
+            "langchain-core",
+            "langchain-openai",
+            "langchain-huggingface",
+            "langchain-qdrant",
+            "langchain-text-splitters",
+            "qdrant-client",
+            "sentence-transformers",
+            "tiktoken",
+            "modelscope",
+            "huggingface-hub",
+            "requests",
+        }
+        self.assertFalse(required_packages - requirements)
+
+        setup_source = (PROJECT_ROOT / "setup_env.sh").read_text(encoding="utf-8")
+        self.assertIn("requirements-rag.txt", setup_source)
+        for module_name in ("requests", "langchain_text_splitters", "qdrant_client"):
+            with self.subTest(module=module_name):
+                self.assertIn(module_name, setup_source)
+
+    def test_operational_scripts_expose_hardened_contracts(self):
+        converter = (PROJECT_ROOT / "convert_to_md.sh").read_text(encoding="utf-8")
+        ingest = (PROJECT_ROOT / "auto_ingest.sh").read_text(encoding="utf-8")
+        starter = (PROJECT_ROOT / "start_rag.sh").read_text(encoding="utf-8")
+        self.assertIn('RAG_ENV_FILE:-${SCRIPT_DIR}/.env', converter)
+        self.assertIn("require_option_value", converter)
+        self.assertIn("manifest_paths", ingest)
+        self.assertIn("服务进程启动成功（degraded）", starter)
+
+    def test_converter_help_and_missing_value_are_runtime_independent(self):
+        converter = str(PROJECT_ROOT / "convert_to_md.sh")
+        help_result = subprocess.run(
+            ["bash", converter, "--help"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("--source", help_result.stdout)
+
+        missing_value = subprocess.run(
+            ["bash", converter, "--source"],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(missing_value.returncode, 0)
+        self.assertIn("缺少取值", missing_value.stdout + missing_value.stderr)
+
+
+class UserFileContractTests(unittest.TestCase):
+    def test_malformed_user_file_is_not_silently_reset(self):
+        import create_user
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            users_file = Path(temp_dir) / "users.json"
+            users_file.write_text("{broken", encoding="utf-8")
+            with patch.object(create_user, "USERS_FILE", users_file):
+                with self.assertRaises(ValueError):
+                    create_user.load_users()
+            self.assertEqual(users_file.read_text(encoding="utf-8"), "{broken")
+
+    def test_user_file_save_is_atomic_and_round_trips(self):
+        import create_user
+
+        users = [{"username": "tester", "password_hash": "redacted"}]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            users_file = Path(temp_dir) / "config" / "users.json"
+            with patch.object(create_user, "USERS_FILE", users_file):
+                create_user.save_users(users)
+                self.assertEqual(create_user.load_users(), users)
+            self.assertEqual(list(users_file.parent.glob("*.tmp")), [])
 
 
 class WebContractTests(unittest.TestCase):

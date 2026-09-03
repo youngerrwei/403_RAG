@@ -1,7 +1,7 @@
 # LAB 403 RAG 知识库系统
 
 > Author：youngerrwei（韦子扬）<br>
-> 当前版本：v2.1.0
+> 当前版本：v2.1.1
 
 ## 项目概述
 
@@ -32,6 +32,16 @@
 
 > 所有管理脚本会自行定位 conda 并使用 `.env` 指定的环境，不依赖调用者当前激活的环境。
 
+### 运行前提
+
+- Linux 服务器与 Bash 4+；需要 `flock`，端口检测至少安装 `lsof` 或 `ss`
+- NVIDIA 驱动、CUDA 可用，且 GPU 2/3 的分配与 `.env` 一致；用 `nvidia-smi` 先确认
+- Miniconda/Anaconda 可用；管理脚本会自动定位 `conda`
+- Qdrant 6333 端口可达，并使用持久化存储或可恢复快照
+- `DOCS_PATH` 指向已挂载、可读的文档目录，而不只是一个同名空目录
+
+以下命令应在项目根目录执行。若使用其他配置文件，可统一设置 `RAG_ENV_FILE=/绝对路径/自定义.env`；`convert_to_md.sh`、入库与启动脚本都会使用它。
+
 ## 快速开始
 
 ### 环境准备
@@ -43,6 +53,8 @@
 > ```
 >
 > 该脚本会创建或验证三个 conda 环境、安装对应依赖、从 `.env.example` 初始化本机 `.env`、自动生成随机 Flask 密钥，并输出环境检查报告。支持 `--vllm`、`--mineru`、`--rag`、`--skip-vllm`、`--skip-mineru` 和 `--force`，详见 `bash setup_env.sh --help`。
+>
+> `--force` 会重建选中的 conda 环境，属于破坏性维护操作；执行前先确认环境名和选择范围。
 
 #### 手动环境准备
 
@@ -52,8 +64,7 @@
 # ─── 环境 1：rag（RAG 主服务）───
 conda create -n rag python=3.10 -y
 conda activate rag
-pip install flask python-dotenv langchain langchain-openai langchain-huggingface \
-    langchain-qdrant qdrant-client sentence-transformers tiktoken modelscope
+python -m pip install -r requirements-rag.txt
 
 # ─── 环境 2：rag-vllm（推理服务）───
 conda create -n rag-vllm python=3.10 -y
@@ -81,6 +92,8 @@ bash setup_env.sh
 
 # Step 2: 编辑 .env，确认 Qdrant、文档目录、GPU 与本地模型路径
 # .env 已被 Git 忽略；FLASK_SECRET_KEY 由 setup_env.sh 自动随机生成
+# 对共享盘部署，还要确认 DOCS_PATH 已实际挂载且包含预期文件
+find /mnt/cpu_share -type f -print -quit
 
 # Step 3: 下载 LLM，并确认另外两个模型也位于配置指定目录
 bash download_model.sh
@@ -89,6 +102,7 @@ bash download_model.sh
 
 # Step 4: 在明确的 RAG 环境中创建登录用户
 conda run -n rag python create_user.py
+# 若 .env 修改了 RAG_CONDA_ENV，请将上面的 rag 替换为对应环境名
 
 # Step 5: 转换文档为 Markdown（内部使用 rag-mineru 环境）
 bash convert_to_md.sh --full
@@ -107,7 +121,7 @@ bash start_rag.sh status
 curl http://127.0.0.1:5000/api/health
 ```
 
-正常完整就绪时健康接口返回 `status=ok`。Qdrant 暂时不可达、必要的子块/父块集合缺失，或 RAG 模型仍在后台预热时返回 HTTP 200 / `degraded`；vLLM 不可用时返回 HTTP 503 / `error`。入库摘要失败会按原有降级策略继续使用无摘要内容。
+正常完整就绪时健康接口返回 `status=ok`。Qdrant 暂时不可达、必要的子块/父块集合缺失，或 RAG 模型仍在后台预热时返回 HTTP 200 / `degraded`；此时仅表示 Web/API 进程可访问，依赖 RAG 检索的请求仍可能失败，不能视为完整就绪。vLLM 不可用时返回 HTTP 503 / `error`。入库摘要失败会按原有降级策略继续使用无摘要内容。
 
 完成首次部署后，日常启动只有一条命令：
 
@@ -190,7 +204,7 @@ bash convert_to_md.sh --dry-run
 
 | 参数 | 说明 |
 |------|------|
-| （无参数） | 增量入库：检测新增/修改的 `.md` 文件并入库 |
+| （无参数） | 变更触发式覆盖：检测新增/修改的 `.md` 后执行幂等覆盖 |
 | `--full` | 全量入库：重建集合 + 入库所有文件 |
 | `--destroy` | 销毁知识库（交互式确认） |
 | `--destroy --force` | 强制销毁知识库（跳过确认） |
@@ -215,7 +229,7 @@ bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
 
 - **状态文件**：`data/.ingest_state`（记录上次入库时间戳）
 - **清单文件**：`data/.ingest_manifest`（记录已入库文件列表）
-- 使用 `find -newer` 检测新增/修改文件
+- 同时使用修改时间和 manifest 路径差异检测新增/修改文件，保留旧 mtime 的新文件也不会漏掉
 - 文件删除检测：对比 manifest 发现缺失文件后自动触发全量重建
 
 #### 注意事项
@@ -223,11 +237,12 @@ bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
 - **文件锁**：`data/.auto_ingest.lock`，防止并发执行
 - **日志文件**：`logs/auto_ingest.log`
 - 失败时不更新状态文件，下次运行自动重试
-- 增量模式自动设置 `QDRANT_RECREATE_COLLECTION=false`
+- 日常模式只用变更检测决定是否启动任务；一旦触发，`ingest.py` 仍会扫描全部 Markdown，并以确定性 ID 幂等覆盖，集合不会重建
+- 日常模式自动设置 `QDRANT_RECREATE_COLLECTION=false`
 - 子块或父块任一批失败都会令任务失败；成功覆盖后会清理同源旧 point
-- 配合 cron 实现定时入库：
+- 配合 cron 时必须先转换再入库，否则新 PDF/DOCX 不会进入知识库：
   ```bash
-  0 3 * * * bash /path/to/403_RAG/auto_ingest.sh >> /path/to/403_RAG/logs/auto_ingest_cron.log 2>&1
+  0 3 * * * cd /path/to/403_RAG && { bash convert_to_md.sh && bash auto_ingest.sh; } >> logs/knowledge_cron.log 2>&1
   ```
 
 ---
@@ -432,7 +447,7 @@ conda run -n rag-mcp mcp dev mcp_server.py
 | 增量 | `bash auto_ingest.sh` | 日常新增/修改少量文档 |
 | 全量 | `bash auto_ingest.sh --full` | 首次部署、修改切块参数后 |
 
-增量入库使用确定性 UUID（基于 source + parent_id + chunk_index 的 UUID5）。新子块和父块全部写入成功后，系统清理同源但不再出现的旧 ID，避免文档修改后残留陈旧向量。
+日常命令是“变更触发式幂等覆盖”：脚本根据 mtime 与 manifest 判断是否需要运行；触发后 `ingest.py` 会重新扫描全部 Markdown，但不重建集合。入库使用确定性 UUID（基于 source + parent_id + chunk_index 的 UUID5）。新子块和父块全部写入成功后，系统清理同源但不再出现的旧 ID，避免文档修改后残留陈旧向量。
 
 ### 重建知识库
 
@@ -445,6 +460,51 @@ conda run -n rag-mcp mcp dev mcp_server.py
 ```bash
 bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
 ```
+
+## 维护与恢复检查表
+
+### 启动前快速检查
+
+以下检查命令只读取现场状态，不会销毁集合或改写文档。
+
+```bash
+# 1. 文档目录必须存在且有内容；默认部署还应确认它确实是挂载点
+find /mnt/cpu_share -type f -print -quit
+mountpoint /mnt/cpu_share
+
+# 2. Qdrant 必须可达；完整链路需要两个集合
+curl -fsS http://172.18.216.71:6333/collections
+
+# 3. 启动并检查；只有 status=ok 才是完整就绪
+bash start_rag.sh start
+bash start_rag.sh status
+curl -fsS http://127.0.0.1:5000/api/health
+```
+
+如 `.env` 使用了其他 `DOCS_PATH`、Qdrant 地址或端口，请替换以上示例值。Qdrant 返回成功但列表中缺少 `lab_knowledge_base` 或 `lab_knowledge_base_parents`，说明服务可达但数据集合未恢复；如果两个集合存在，还应通过 Qdrant 管理接口确认 point 数量符合预期，而不是仅看集合名称。
+
+### Qdrant 或共享盘恢复
+
+1. 先恢复 Qdrant 持久化卷/快照与文档共享盘，不要对空目录直接执行销毁操作。
+2. 若 Qdrant 数据已恢复，执行 `bash start_rag.sh restart` 并确认健康状态转为 `ok`。
+3. 若无法恢复 Qdrant 数据，但文档盘完整，依次执行 `bash convert_to_md.sh --full`、启动 vLLM、再执行 `bash auto_ingest.sh --full` 重建两个集合。
+4. 若文档盘和 Qdrant 都为空，先恢复源文档；否则无法重建知识库。
+
+### 日志、回归测试与升级
+
+```bash
+# 常用日志
+tail -n 200 logs/vllm_server.log
+tail -n 200 logs/web_app.log
+tail -n 200 logs/convert_to_md.log
+tail -n 200 logs/auto_ingest.log
+
+# 在 RAG 主环境执行回归；自定义环境名时替换 rag
+conda run -n rag python test_reliability.py
+conda run -n rag python test_html.py
+```
+
+依赖升级时，以 `requirements-rag.txt` 为 RAG 主环境直接依赖清单，修改后执行 `bash setup_env.sh --rag`、运行上述回归、再重启服务。升级或迁移前备份私有 `.env`、`config/users.json`、文档源目录和 Qdrant 持久化卷/快照；不要把密钥或密码哈希提交到版本库。
 
 ## API 端点
 
@@ -473,7 +533,7 @@ curl http://127.0.0.1:5000/api/health
 | status 值 | HTTP 状态码 | 含义 |
 |-----------|------------|------|
 | `"ok"` | 200 | 全部组件正常 |
-| `"degraded"` | 200 | 部分组件不可用，系统仍可接受请求 |
+| `"degraded"` | 200 | Web/API 可访问，但检索链路未完整就绪，相关请求可能失败 |
 | `"error"` | 503 | 关键服务不可用 |
 
 ### POST /ask_stream（需认证）
@@ -518,9 +578,9 @@ SSE 流式问答接口，需先登录获取 Session。
 
 ### 入库类问题
 
-**现象**：增量入库未检测到新文件
-- **原因**：文件修改时间早于 `data/.ingest_state` 记录的时间戳
-- **解决**：使用 `bash auto_ingest.sh --full` 执行全量入库
+**现象**：日常入库未检测到预期文件
+- **原因**：`DOCS_PATH` 指错、共享盘未挂载、文件并非 `.md`，或状态/manifest 文件与实际目录不一致
+- **解决**：先确认挂载与路径；非 Markdown 文件先运行 `bash convert_to_md.sh`。状态确实不一致时执行 `bash auto_ingest.sh --full`
 
 **现象**：入库后查询无结果
 - **原因**：检索缓存 TTL 为 300 秒，新入库内容最多 5 分钟延迟
@@ -529,6 +589,10 @@ SSE 流式问答接口，需先登录获取 Session。
 **现象**：入库时报 Qdrant 连接失败
 - **原因**：Qdrant 服务未启动或网络不通
 - **解决**：`curl http://172.18.216.71:6333/collections` 验证连通性
+
+**现象**：Qdrant 可达但 `/api/health` 仍为 `degraded`
+- **原因**：服务重启后持久化卷未挂载、两个必要集合缺失，或集合尚未完成恢复
+- **解决**：按“Qdrant 或共享盘恢复”检查持久化数据；无法恢复时在文档盘完整的前提下执行全量入库
 
 ### 检索类问题
 
@@ -580,6 +644,7 @@ SSE 流式问答接口，需先登录获取 Session。
 | 速率限制 | 登录接口 5 次/分钟/IP |
 | 并发控制 | Semaphore 限制最大并发请求数（默认 20） |
 | 信息泄露防护 | 异常响应统一通用错误提示，不暴露内部信息 |
+| 凭据文件保护 | 用户文件拒绝静默重置，使用同目录临时文件原子替换，不在终端输出密码哈希 |
 | SSE 连接保护 | 超时 5 分钟断开，每 15 秒心跳保活 |
 | 安全响应头 | CSP 限制资源加载来源（`script-src` 含 `https://unpkg.com` Lucide CDN；`img-src` 含 `data:` base64 校徽） |
 | 请求限制 | 请求体大小 1MB |
@@ -592,6 +657,7 @@ SSE 流式问答接口，需先登录获取 Session。
 | 文件 | 用途 |
 |------|------|
 | `.env.example` | 可提交的完整配置模板；本机 `.env` 私有且被 Git 忽略 |
+| `requirements-rag.txt` | RAG 主环境直接依赖的唯一安装清单，由 `setup_env.sh --rag` 使用 |
 | `rag_agent.py` | 核心 RAG 流程：两级查询路由（规则+LLM）、问题改写、多路并行检索（Dense+Sparse）、RRF 融合、重排序、父块展开（独立 Collection 查询）、TTL 缓存、流式回答生成、文件系统工具 |
 | `web_app.py` | Flask 后端：登录认证（PBKDF2）、SSE 流式问答接口、历史管理 |
 | `mcp_server.py` | 轻量 stdio MCP Bridge：暴露纯检索与目录工具，通过本机私有 API 复用唯一 RAG 运行时 |
@@ -603,7 +669,7 @@ SSE 流式问答接口，需先登录获取 Session。
 | `start_mcp.sh` | 供 MCP Host 按需启动的 stdio Bridge 入口 |
 | `start_vllm.sh` | vLLM 推理服务管理脚本（支持启动/停止/状态查看、前台/后台/多卡/健康检查） |
 | `start_rag.sh` | RAG 系统一键启动/停止/重启/状态查看脚本（管理 vLLM + web_app），支持启动前预检与 /api/health 就绪验证 |
-| `auto_ingest.sh` | 知识库自动增量入库脚本（检测新增/修改文件，支持 cron 定时执行） |
+| `auto_ingest.sh` | 知识库变更触发式幂等覆盖脚本（mtime + manifest 检测，支持 cron 定时执行） |
 | `convert_to_md.sh` | 文档格式转换脚本（PDF/DOCX/PPTX → Markdown，支持 MinerU/Marker/Docling） |
 | `rag_tool.py` | ReAct 工具兼容适配器；复用 `rag_agent.py` 的唯一 RAG 运行时 |
 | `tools.py` | `use_agent=true` 时使用的请求级 ReAct 工具定义 |

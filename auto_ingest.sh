@@ -1,5 +1,5 @@
 #!/bin/bash
-# 知识库自动增量/全量入库与安全销毁，失败时不推进本地状态。
+# 知识库变更触发式覆盖、全量入库与安全销毁；失败时不推进本地状态。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -131,6 +131,25 @@ if ! check_deleted_files; then
 fi
 
 mapfile -d '' changed_files < <(find "$DOCS_PATH" -name '*.md' -type f -newer "$STATE_FILE" -print0)
+
+# 仅依赖 mtime 会漏掉“保留旧时间戳后复制进来”的新文件；必须同时与上次清单比对路径。
+declare -A changed_seen=()
+declare -A manifest_paths=()
+for file in "${changed_files[@]}"; do
+    changed_seen["$file"]=1
+done
+if [[ -f "$MANIFEST_FILE" ]]; then
+    while IFS= read -r file; do
+        [[ -n "$file" ]] && manifest_paths["$file"]=1
+    done < "$MANIFEST_FILE"
+fi
+while IFS= read -r -d '' file; do
+    if [[ -z "${manifest_paths[$file]+x}" && -z "${changed_seen[$file]+x}" ]]; then
+        changed_files+=("$file")
+        changed_seen["$file"]=1
+    fi
+done < <(find "$DOCS_PATH" -name '*.md' -type f -print0)
+
 if (( ${#changed_files[@]} == 0 )); then
     log "INFO: 无新增或修改文件，跳过入库"
     exit 0
@@ -141,7 +160,7 @@ for file in "${changed_files[@]}"; do log "  - $file"; done
 if run_ingest false; then
     touch "$STATE_FILE"
     save_manifest
-    log "SUCCESS: 增量入库完成"
+    log "SUCCESS: 变更触发式幂等覆盖完成"
     exit 0
 fi
 log "ERROR: 增量入库失败，本地状态未更新，下次将重试"

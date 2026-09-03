@@ -14,13 +14,13 @@ set -euo pipefail
 
 # ========== 基础配置 ==========
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
+ENV_FILE="${RAG_ENV_FILE:-${SCRIPT_DIR}/.env}"
 STATE_FILE="${SCRIPT_DIR}/data/.convert_state"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/convert_to_md.log"
 LOCK_FILE="/tmp/convert_to_md.lock"
 source "${SCRIPT_DIR}/scripts/runtime_common.sh"
-load_env_keys "${ENV_FILE}" MINERU_CONDA_ENV CONVERT_TIMEOUT CONVERT_MAX_RETRIES MAX_FILE_SIZE_MB MIN_OUTPUT_SIZE || true
+load_env_keys "${ENV_FILE}" DOCS_PATH MINERU_CONDA_ENV CONVERT_TIMEOUT CONVERT_MAX_RETRIES MAX_FILE_SIZE_MB MIN_OUTPUT_SIZE || true
 
 # ========== 兜底机制配置 ==========
 CONVERT_TIMEOUT="${CONVERT_TIMEOUT:-300}"          # 单文件转换超时（秒）
@@ -78,28 +78,6 @@ log_debug() {
 # ========== 初始化目录 ==========
 mkdir -p "${LOG_DIR}"
 mkdir -p "${SCRIPT_DIR}/data"
-
-# ========== 检查 rag-mineru conda 环境 ==========
-# MinerU 运行在独立的 conda 环境中，避免与 vLLM/RAG 主环境的 PyTorch 版本冲突
-CONDA_ENV_NAME="${MINERU_CONDA_ENV:-rag-mineru}"
-
-# 查找 conda 命令
-CONDA_CMD="$(find_conda || true)"
-
-if [[ -z "$CONDA_CMD" ]]; then
-    log_error "未找到 conda 命令，请先安装 Miniconda/Anaconda"
-    exit 1
-fi
-
-# 检查 rag-mineru 环境是否存在
-if ! $CONDA_CMD env list 2>/dev/null | grep -qE "^${CONDA_ENV_NAME}\s"; then
-    log_error "conda 环境 '${CONDA_ENV_NAME}' 不存在"
-    echo -e "${YELLOW}[提示] 请先运行安装脚本创建环境:${NC}"
-    echo "        bash setup_env.sh --mineru"
-    exit 1
-fi
-
-log_info "使用 conda 环境: ${CONDA_ENV_NAME}"
 
 # ========== 帮助信息 ==========
 show_help() {
@@ -163,25 +141,39 @@ DEVICE="cuda:0"
 FULL_MODE=false
 DRY_RUN=false
 
+require_option_value() {
+    local option="$1"
+    if (( $# < 2 )) || [[ -z "${2:-}" || "${2:-}" == --* ]]; then
+        log_error "参数 ${option} 缺少取值"
+        echo "使用 --help 查看帮助信息"
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source)
+            require_option_value "$@"
             SOURCE_DIR="$2"
             shift 2
             ;;
         --output)
+            require_option_value "$@"
             OUTPUT_DIR="$2"
             shift 2
             ;;
         --engine)
+            require_option_value "$@"
             ENGINE="$2"
             shift 2
             ;;
         --backend)
+            require_option_value "$@"
             BACKEND="$2"
             shift 2
             ;;
         --device)
+            require_option_value "$@"
             DEVICE="$2"
             shift 2
             ;;
@@ -205,23 +197,28 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ========== 从 .env 读取配置 ==========
-if [[ -z "${SOURCE_DIR}" ]]; then
-    if [[ -f "${ENV_FILE}" ]]; then
-        while IFS='=' read -r key value; do
-            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
-            key="$(echo "$key" | xargs)"
-            value="$(echo "$value" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
-            case "$key" in
-                DOCS_PATH) SOURCE_DIR="$value" ;;
-            esac
-        done < "${ENV_FILE}"
-    fi
-    SOURCE_DIR="${SOURCE_DIR:-/mnt/cpu_share}"
-fi
+# ========== 统一运行环境与路径 ==========
+[[ -f "${ENV_FILE}" ]] || { log_error ".env 不存在: ${ENV_FILE}"; exit 1; }
+SOURCE_DIR="${SOURCE_DIR:-${DOCS_PATH:-/mnt/cpu_share}}"
+[[ "$SOURCE_DIR" = /* ]] || SOURCE_DIR="$(resolve_project_path "$SOURCE_DIR")"
 
 # 输出目录默认与源目录相同
 OUTPUT_DIR="${OUTPUT_DIR:-${SOURCE_DIR}}"
+[[ "$OUTPUT_DIR" = /* ]] || OUTPUT_DIR="$(resolve_project_path "$OUTPUT_DIR")"
+
+# MinerU 运行在独立 conda 环境中，避免与 vLLM/RAG 主环境的依赖冲突。
+CONDA_ENV_NAME="${MINERU_CONDA_ENV:-rag-mineru}"
+CONDA_CMD="$(find_conda || true)"
+if [[ -z "$CONDA_CMD" ]]; then
+    log_error "未找到 conda 命令，请先安装 Miniconda/Anaconda"
+    exit 1
+fi
+if [[ -z "$(conda_env_prefix "$CONDA_CMD" "$CONDA_ENV_NAME")" ]]; then
+    log_error "conda 环境 '${CONDA_ENV_NAME}' 不存在"
+    echo -e "${YELLOW}[提示] 请先运行: bash setup_env.sh --mineru${NC}"
+    exit 1
+fi
+log_info "使用 conda 环境: ${CONDA_ENV_NAME}"
 
 # ========== GPU 环境设置 ==========
 setup_gpu_env() {

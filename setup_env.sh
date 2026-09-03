@@ -245,7 +245,7 @@ echo ""
 # ========== 检查 conda 环境是否存在 ==========
 check_env_exists() {
     local env_name="$1"
-    $CONDA_CMD env list 2>/dev/null | grep -qE "^${env_name}\s"
+    [[ -n "$(conda_env_prefix "$CONDA_CMD" "$env_name" || true)" ]]
 }
 
 # ========== 安装 vLLM 环境 ==========
@@ -406,12 +406,17 @@ except ImportError:
     return 0
 }
 
-# ========== 安装 RAG 主环境依赖 ==========
+# ========== 按唯一清单安装 RAG 主环境依赖 ==========
 install_rag_deps() {
     echo -e "${BLUE}━━━ 安装 RAG 主环境依赖 ━━━${NC}"
     echo ""
 
-    local RAG_DEPS="flask python-dotenv langchain langchain-openai langchain-huggingface langchain-qdrant qdrant-client sentence-transformers tiktoken modelscope huggingface-hub"
+    local requirements_file="${SCRIPT_DIR}/requirements-rag.txt"
+    if [[ ! -f "$requirements_file" ]]; then
+        log_error "缺少 RAG 依赖清单: $requirements_file"
+        report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "缺少 requirements-rag.txt"
+        return 1
+    fi
     if check_env_exists "$ENV_RAG"; then
         if [[ "$FORCE" == "true" ]]; then
             log_warn "环境 ${ENV_RAG} 已存在，--force 模式下将删除并重建"
@@ -434,7 +439,8 @@ install_rag_deps() {
     log_info "目标环境: ${ENV_RAG}"
 
     # 安装依赖
-    if "$CONDA_CMD" run -n "$ENV_RAG" pip install $RAG_DEPS 2>&1 | tee -a "${LOG_FILE}" | tail -5; then
+    if "$CONDA_CMD" run -n "$ENV_RAG" python -m pip install -r "$requirements_file" \
+        2>&1 | tee -a "${LOG_FILE}" | tail -5; then
         log_info "RAG 核心依赖安装完成 ✓"
     else
         log_error "RAG 核心依赖安装失败"
@@ -444,7 +450,8 @@ install_rag_deps() {
 
     log_info "验证关键依赖..."
     if ! "$CONDA_CMD" run -n "$ENV_RAG" python -c \
-        "import flask,dotenv,langchain,qdrant_client,sentence_transformers" >>"${LOG_FILE}" 2>&1; then
+        "import flask, dotenv, langchain, langchain_core, langchain_openai, langchain_huggingface, langchain_qdrant, langchain_text_splitters, qdrant_client, sentence_transformers, tiktoken, modelscope, huggingface_hub, requests" \
+        >>"${LOG_FILE}" 2>&1; then
         log_error "RAG 关键依赖 import 验证失败"
         report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "关键 import 失败"
         return 1

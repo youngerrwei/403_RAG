@@ -28,6 +28,7 @@ QDRANT_PARENT_COLLECTION="${QDRANT_PARENT_COLLECTION:-lab_knowledge_base_parents
 EMBEDDING_MODEL_NAME="${EMBEDDING_MODEL_NAME:-./models/bge-m3}"
 RERANKER_MODEL_NAME="${RERANKER_MODEL_NAME:-./models/bge-reranker-v2-m3}"
 DOCS_PATH="${DOCS_PATH:-/mnt/cpu_share}"
+[[ "$DOCS_PATH" = /* ]] || DOCS_PATH="$(resolve_project_path "$DOCS_PATH")"
 FLASK_SECRET_KEY="${FLASK_SECRET_KEY:-}"
 RAG_CONDA_ENV="${RAG_CONDA_ENV:-rag}"
 WEBAPP_PORT="${WEBAPP_PORT:-5000}"
@@ -148,11 +149,17 @@ stop_web() {
 }
 
 do_start() {
+    # 进程已启动不等于检索链路完整就绪，最终提示必须区分 ok/degraded。
     preflight_check || return 1
     bash "$SCRIPT_DIR/start_vllm.sh" --background || return 1
     start_web || return 1
     echo "============================================="
-    echo "  RAG 系统启动成功"
+    if [[ "$WEB_HEALTH_STATUS" == "ok" ]]; then
+        echo "  RAG 系统启动成功（完整就绪）"
+    else
+        echo "  服务进程启动成功（degraded）"
+        echo "  检索链路尚未完整就绪，请按 /api/health 组件状态排查"
+    fi
     echo "  vLLM: http://127.0.0.1:${VLLM_PORT}/v1"
     echo "  Web:  http://127.0.0.1:${WEBAPP_PORT}"
     echo "============================================="
@@ -172,7 +179,11 @@ do_status() {
     pid="$(web_pid || true)"
     listener="$(port_pid "$WEBAPP_PORT")"
     if [[ -n "$pid" && "$pid" == "$listener" ]] && web_health_status; then
-        echo "Web 状态: 健康（$WEB_HEALTH_STATUS），PID=$pid，端口=$WEBAPP_PORT"
+        if [[ "$WEB_HEALTH_STATUS" == "ok" ]]; then
+            echo "Web 状态: 健康（ok），PID=$pid，端口=$WEBAPP_PORT"
+        else
+            echo "Web 状态: 可访问（degraded，检索链路未完整就绪），PID=$pid，端口=$WEBAPP_PORT"
+        fi
     elif [[ -n "$listener" ]]; then
         echo "Web 状态: 端口占用但身份或健康检查失败，PID=$listener"
         failed=1
