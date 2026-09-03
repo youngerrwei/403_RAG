@@ -10,12 +10,13 @@ from typing import Dict, Any, List, Optional
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from logger import get_logger
-from rag_agent import get_runtime, append_user_chat_history
-from tools import rag_qa, list_group_files, agent_tool_context
+from .logger import get_logger
+from .paths import PROJECT_ROOT
+from .rag_agent import get_runtime, append_user_chat_history
+from .tools import rag_qa, list_group_files, agent_tool_context
 
 
-load_dotenv()
+load_dotenv(PROJECT_ROOT / ".env")
 _logger = get_logger("agent")
 
 

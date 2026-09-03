@@ -3,11 +3,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/scripts/runtime_common.sh"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/runtime_common.sh"
 
-ENV_FILE="${RAG_ENV_FILE:-$SCRIPT_DIR/.env}"
-DATA_DIR="$SCRIPT_DIR/data"
-LOG_DIR="$SCRIPT_DIR/logs"
+ENV_FILE="${RAG_ENV_FILE:-$PROJECT_ROOT/.env}"
+DATA_DIR="$PROJECT_ROOT/data"
+LOG_DIR="$PROJECT_ROOT/logs"
 PID_FILE="$DATA_DIR/.vllm.pid"
 LOCK_FILE="$DATA_DIR/.vllm.lock"
 mkdir -p "$DATA_DIR" "$LOG_DIR"

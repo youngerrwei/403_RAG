@@ -5,8 +5,8 @@ from contextvars import ContextVar
 
 from langchain_core.tools import tool
 
-from rag_agent import build_file_context, list_catalog_entries
-from rag_tool import rag_qa_tool
+from .rag_agent import build_file_context, list_catalog_entries
+from .rag_tool import rag_qa_tool
 
 _agent_username: ContextVar[str] = ContextVar("agent_username", default="legacy-agent")
 

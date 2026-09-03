@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_html.py — 验证 templates/index.html 前端页面的完整性和正确性
+test_html.py — 验证 src/lab_rag/templates/index.html 前端页面的完整性和正确性
 仅使用 Python 标准库（html.parser, re, os），无需启动服务器即可运行。
 """
 
@@ -96,7 +96,8 @@ class TestResult:
 # 主测试
 # ═══════════════════════════════════════════════════
 def main():
-    html_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "index.html")
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    html_path = os.path.join(project_root, "src", "lab_rag", "templates", "index.html")
     if not os.path.isfile(html_path):
         print(f"❌ 文件不存在: {html_path}")
         return

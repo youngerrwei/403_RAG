@@ -27,10 +27,10 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    A["用户浏览器 (前端)<br>templates/index.html"] -->|"SSE 流式连接"| B["Flask Web 服务 (web_app.py)<br>用户认证 · SSE 流式接口 · 对话历史管理 · 并发控制"]
-    G["MCP Host / DeepSeek Harness"] -->|"stdio"| H["MCP Bridge (mcp_server.py)<br>独立轻量环境 · 不加载模型"]
+    A["用户浏览器 (前端)<br>src/lab_rag/templates/index.html"] -->|"SSE 流式连接"| B["Flask Web 服务 (src/lab_rag/web_app.py)<br>用户认证 · SSE 流式接口 · 对话历史管理 · 并发控制"]
+    G["MCP Host / DeepSeek Harness"] -->|"stdio"| H["MCP Bridge (src/lab_rag/mcp_server.py)<br>独立轻量环境 · 不加载模型"]
     H -->|"loopback JSON + Bearer Token"| B
-    B -->|"调用核心 RAG 流程"| C["RAG 核心引擎 (rag_agent.py)<br>查询路由 · 查询改写 · 混合检索 · 重排序 · 父块展开 · 流式生成"]
+    B -->|"调用核心 RAG 流程"| C["RAG 核心引擎 (src/lab_rag/rag_agent.py)<br>查询路由 · 查询改写 · 混合检索 · 重排序 · 父块展开 · 流式生成"]
     C --> D["vLLM<br>Qwen3-8B-Instruct<br>(GPU 3)"]
     C --> E["Qdrant<br>向量数据库<br>(远程部署)"]
     C --> F["Embedding/Reranker<br>bge-m3 / bge-reranker-v2-m3<br>(GPU 2)"]
@@ -117,8 +117,8 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    A["MCP Host"] -->|"stdio tools/call"| B["mcp_server.py"]
-    B -->|"127.0.0.1 + Bearer Token"| C["web_app.py 私有 API"]
+    A["MCP Host"] -->|"stdio tools/call"| B["src/lab_rag/mcp_server.py"]
+    B -->|"127.0.0.1 + Bearer Token"| C["src/lab_rag/web_app.py 私有 API"]
     C --> D["ask_stream<br>persist_history=false"]
     D --> E["路由 → 改写 → 混合检索 → 重排 → 父块展开"]
     E --> F["retrieval 元数据"]
@@ -126,7 +126,7 @@ flowchart LR
     F -.->|"关闭生成器，不执行"| H["最终答案生成"]
 ```
 
-该旁路复用 Web 进程中的模型、Qdrant 客户端、缓存和并发信号量。内部 API 不对非 loopback 对端开放，Token 为空时保持禁用；MCP 子进程由 Host 按需启动和关闭，不属于 `start_rag.sh` 的生命周期。
+该旁路复用 Web 进程中的模型、Qdrant 客户端、缓存和并发信号量。内部 API 不对非 loopback 对端开放，Token 为空时保持禁用；MCP 子进程由 Host 按需启动和关闭，不属于 `scripts/start_rag.sh` 的生命周期。
 
 ---
 
@@ -308,7 +308,7 @@ context ≈ 2000 tokens + history 1500 tokens + prompt 250 tokens + question 100
 
 ### 当前限制
 
-- **文档格式受限**：仅支持 Markdown 格式文档入库，PDF/Word/PPT 需先通过 `convert_to_md.sh` 转换
+- **文档格式受限**：仅支持 Markdown 格式文档入库，PDF/Word/PPT 需先通过 `scripts/convert_to_md.sh` 转换
 - **稀疏检索实现**：基于 Qdrant MatchText（需确保字段有文本索引），非标准 BM25 实现，对长文档的词频统计不够精确
 - **单机部署**：未做高可用，vLLM / Qdrant / Flask 均为单实例部署
 - **查询路由准确性**：依赖规则 + LLM 两级判断，复杂意图（如混合知识检索+文件浏览）可能误判
@@ -316,7 +316,7 @@ context ≈ 2000 tokens + history 1500 tokens + prompt 250 tokens + question 100
 
 ### 后续优化方向
 
-- **更多文档格式支持**：优化 `convert_to_md.sh` 转换质量，或支持 PDF/Word 直接入库（结合 layout 解析）
+- **更多文档格式支持**：优化 `scripts/convert_to_md.sh` 转换质量，或支持 PDF/Word 直接入库（结合 layout 解析）
 - **真正的稀疏向量**：引入 BM25 或 SPLADE 稀疏向量替代 MatchText，提升关键词检索精度
 - **多轮对话感知改写**：将历史对话引入查询改写阶段，解决代词指代和上下文依赖问题
 - **用户反馈机制**：引入点赞/点踩反馈，收集用户评价数据持续优化检索和生成质量

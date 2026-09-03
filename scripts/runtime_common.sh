@@ -1,5 +1,5 @@
 #!/bin/bash
-# 运行脚本共享工具。调用方必须先定义 SCRIPT_DIR；所有服务脚本共用本文件。
+# 运行脚本共享工具。调用方必须先定义 SCRIPT_DIR 与 PROJECT_ROOT。
 
 trim_value() {
     local value="${1-}"
@@ -38,7 +38,7 @@ resolve_project_path() {
     if [[ "$path" = /* ]]; then
         printf '%s' "$path"
     else
-        printf '%s/%s' "$SCRIPT_DIR" "${path#./}"
+        printf '%s/%s' "$PROJECT_ROOT" "${path#./}"
     fi
 }
 
@@ -185,7 +185,7 @@ pid_is_vllm() {
 pid_is_webapp() {
     local pid="$1" cmd
     cmd="$(pid_cmdline "$pid" 2>/dev/null || true)"
-    [[ "$cmd" == *"web_app.py"* ]]
+    [[ "$cmd" == *"lab_rag.web_app"* || "$cmd" == *"web_app.py"* ]]
 }
 
 stop_pid_gracefully() {

@@ -3,15 +3,16 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/scripts/runtime_common.sh"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/runtime_common.sh"
 
-ENV_FILE="${RAG_ENV_FILE:-$SCRIPT_DIR/.env}"
-STATE_FILE="$SCRIPT_DIR/data/.ingest_state"
-MANIFEST_FILE="$SCRIPT_DIR/data/.ingest_manifest"
-LOG_DIR="$SCRIPT_DIR/logs"
+ENV_FILE="${RAG_ENV_FILE:-$PROJECT_ROOT/.env}"
+STATE_FILE="$PROJECT_ROOT/data/.ingest_state"
+MANIFEST_FILE="$PROJECT_ROOT/data/.ingest_manifest"
+LOG_DIR="$PROJECT_ROOT/logs"
 LOG_FILE="$LOG_DIR/auto_ingest.log"
-LOCK_FILE="$SCRIPT_DIR/data/.auto_ingest.lock"
-mkdir -p "$LOG_DIR" "$SCRIPT_DIR/data"
+LOCK_FILE="$PROJECT_ROOT/data/.auto_ingest.lock"
+mkdir -p "$LOG_DIR" "$PROJECT_ROOT/data"
 
 log() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
@@ -61,8 +62,9 @@ run_ingest() {
     [[ -n "$RAG_PYTHON" ]] || { log "ERROR: conda 环境不存在或无 Python: $RAG_CONDA_ENV"; return 1; }
     log "INFO: 使用解释器 $RAG_PYTHON 执行入库 (recreate=$recreate)"
     (
-        cd "$SCRIPT_DIR"
-        QDRANT_RECREATE_COLLECTION="$recreate" "$RAG_PYTHON" ingest.py
+        cd "$PROJECT_ROOT"
+        export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+        QDRANT_RECREATE_COLLECTION="$recreate" "$RAG_PYTHON" -m lab_rag.ingest
     ) >> "$LOG_FILE" 2>&1
 }
 
@@ -109,12 +111,12 @@ case "${1:-}" in
         exit 1
         ;;
     "") ;;
-    *) echo "用法: bash auto_ingest.sh [--full|--destroy [--force]]"; exit 1 ;;
+    *) echo "用法: bash scripts/auto_ingest.sh [--full|--destroy [--force]]"; exit 1 ;;
 esac
 
 [[ -d "$DOCS_PATH" ]] || { log "ERROR: DOCS_PATH 不存在: $DOCS_PATH"; exit 1; }
 if [[ ! -f "$STATE_FILE" ]]; then
-    log "ERROR: 首次运行必须执行: bash auto_ingest.sh --full"
+    log "ERROR: 首次运行必须执行: bash scripts/auto_ingest.sh --full"
     exit 1
 fi
 

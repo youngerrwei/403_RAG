@@ -26,7 +26,8 @@ from qdrant_client.http.models import PointStruct
 
 from langchain_qdrant import QdrantVectorStore
 
-from logger import get_logger
+from .logger import get_logger
+from .paths import PROJECT_ROOT
 
 
 # ================= LOG =================
@@ -59,7 +60,7 @@ def load_config():
     - QDRANT_COLLECTION_NAME：目标集合名称
     - QDRANT_RECREATE_COLLECTION：是否重建集合（true 会先删后建）
     """
-    load_dotenv(override=False)
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
 
     cfg = {
         "DOCS_PATH": os.getenv("DOCS_PATH", "/mnt/cpu_share"),
@@ -455,7 +456,7 @@ def build_contextual_prefix(metadata: dict, parent_summary: str = "", injection_
 # ==================== 摘要缓存文件路径 ====================
 
 # 统一摘要缓存文件，key 为 parent_id（包含 content_hash，内容变化时自动失效）
-SUMMARY_CACHE_FILE = os.path.join(os.path.dirname(__file__), "data", ".summary_cache.json")
+SUMMARY_CACHE_FILE = str(PROJECT_ROOT / "data" / ".summary_cache.json")
 
 
 def save_summary_cache(summary_map: dict, cache_file: str):

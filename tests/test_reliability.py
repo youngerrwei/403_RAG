@@ -7,22 +7,49 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+sys.path.insert(0, str(SRC_ROOT))
 
 
 class ScriptContractTests(unittest.TestCase):
     """无需真实模型即可执行的部署契约回归。"""
+
+    def test_repository_layout_is_classified(self):
+        for directory in (
+            "src/lab_rag",
+            "scripts",
+            "tests",
+            "dev",
+            "legacy",
+            "docs",
+            "requirements",
+            "data/samples",
+        ):
+            with self.subTest(directory=directory):
+                self.assertTrue((PROJECT_ROOT / directory).is_dir())
+
+        retired_root_files = (
+            "rag_agent.py",
+            "web_app.py",
+            "ingest.py",
+            "test_reliability.py",
+            "start_rag.sh",
+        )
+        self.assertFalse([name for name in retired_root_files if (PROJECT_ROOT / name).exists()])
+
     def test_python_entrypoints_parse(self):
         files = (
-            "agent_entry.py",
-            "create_user.py",
-            "ingest.py",
-            "logger.py",
-            "mcp_server.py",
-            "rag_agent.py",
-            "rag_tool.py",
-            "tools.py",
-            "web_app.py",
+            "src/lab_rag/agent_entry.py",
+            "src/lab_rag/create_user.py",
+            "src/lab_rag/ingest.py",
+            "src/lab_rag/logger.py",
+            "src/lab_rag/mcp_server.py",
+            "src/lab_rag/paths.py",
+            "src/lab_rag/rag_agent.py",
+            "src/lab_rag/rag_tool.py",
+            "src/lab_rag/tools.py",
+            "src/lab_rag/web_app.py",
         )
         for file_name in files:
             with self.subTest(file=file_name):
@@ -32,14 +59,14 @@ class ScriptContractTests(unittest.TestCase):
     def test_shell_scripts_have_valid_bash_syntax(self):
         scripts = [
             "scripts/runtime_common.sh",
-            "setup_env.sh",
-            "download_model.sh",
-            "convert_to_md.sh",
-            "auto_ingest.sh",
-            "start_vllm.sh",
-            "start_rag.sh",
-            "setup_mcp.sh",
-            "start_mcp.sh",
+            "scripts/setup_env.sh",
+            "scripts/download_model.sh",
+            "scripts/convert_to_md.sh",
+            "scripts/auto_ingest.sh",
+            "scripts/start_vllm.sh",
+            "scripts/start_rag.sh",
+            "scripts/setup_mcp.sh",
+            "scripts/start_mcp.sh",
         ]
         for script in scripts:
             with self.subTest(script=script):
@@ -104,7 +131,7 @@ class ScriptContractTests(unittest.TestCase):
     def test_rag_direct_dependencies_are_declared_and_verified(self):
         requirements = {
             line.strip().lower()
-            for line in (PROJECT_ROOT / "requirements-rag.txt")
+            for line in (PROJECT_ROOT / "requirements" / "rag.txt")
             .read_text(encoding="utf-8")
             .splitlines()
             if line.strip() and not line.lstrip().startswith("#")
@@ -127,23 +154,23 @@ class ScriptContractTests(unittest.TestCase):
         }
         self.assertFalse(required_packages - requirements)
 
-        setup_source = (PROJECT_ROOT / "setup_env.sh").read_text(encoding="utf-8")
-        self.assertIn("requirements-rag.txt", setup_source)
+        setup_source = (PROJECT_ROOT / "scripts" / "setup_env.sh").read_text(encoding="utf-8")
+        self.assertIn("requirements/rag.txt", setup_source)
         for module_name in ("requests", "langchain_text_splitters", "qdrant_client"):
             with self.subTest(module=module_name):
                 self.assertIn(module_name, setup_source)
 
     def test_operational_scripts_expose_hardened_contracts(self):
-        converter = (PROJECT_ROOT / "convert_to_md.sh").read_text(encoding="utf-8")
-        ingest = (PROJECT_ROOT / "auto_ingest.sh").read_text(encoding="utf-8")
-        starter = (PROJECT_ROOT / "start_rag.sh").read_text(encoding="utf-8")
-        self.assertIn('RAG_ENV_FILE:-${SCRIPT_DIR}/.env', converter)
+        converter = (PROJECT_ROOT / "scripts" / "convert_to_md.sh").read_text(encoding="utf-8")
+        ingest = (PROJECT_ROOT / "scripts" / "auto_ingest.sh").read_text(encoding="utf-8")
+        starter = (PROJECT_ROOT / "scripts" / "start_rag.sh").read_text(encoding="utf-8")
+        self.assertIn('RAG_ENV_FILE:-${PROJECT_ROOT}/.env', converter)
         self.assertIn("require_option_value", converter)
         self.assertIn("manifest_paths", ingest)
         self.assertIn("服务进程启动成功（degraded）", starter)
 
     def test_converter_help_and_missing_value_are_runtime_independent(self):
-        converter = str(PROJECT_ROOT / "convert_to_md.sh")
+        converter = str(PROJECT_ROOT / "scripts" / "convert_to_md.sh")
         help_result = subprocess.run(
             ["bash", converter, "--help"],
             cwd=PROJECT_ROOT,
@@ -167,7 +194,7 @@ class ScriptContractTests(unittest.TestCase):
 
 class UserFileContractTests(unittest.TestCase):
     def test_malformed_user_file_is_not_silently_reset(self):
-        import create_user
+        from lab_rag import create_user
 
         with tempfile.TemporaryDirectory() as temp_dir:
             users_file = Path(temp_dir) / "users.json"
@@ -178,7 +205,7 @@ class UserFileContractTests(unittest.TestCase):
             self.assertEqual(users_file.read_text(encoding="utf-8"), "{broken")
 
     def test_user_file_save_is_atomic_and_round_trips(self):
-        import create_user
+        from lab_rag import create_user
 
         users = [{"username": "tester", "password_hash": "redacted"}]
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -192,8 +219,7 @@ class UserFileContractTests(unittest.TestCase):
 class WebContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import rag_agent
-        import web_app
+        from lab_rag import rag_agent, web_app
 
         cls.rag_agent = rag_agent
         cls.web_app = web_app
@@ -208,7 +234,7 @@ class WebContractTests(unittest.TestCase):
     def test_health_requires_llm_but_allows_qdrant_degraded(self):
         with self._client() as client:
             with patch(
-                    "web_app.get_runtime_status",
+                    "lab_rag.web_app.get_runtime_status",
                     return_value={"embedding": False, "reranker": False, "qdrant": False, "llm": True},
             ):
                 response = client.get("/api/health")
@@ -216,7 +242,7 @@ class WebContractTests(unittest.TestCase):
                 self.assertEqual(response.get_json()["status"], "degraded")
 
             with patch(
-                    "web_app.get_runtime_status",
+                    "lab_rag.web_app.get_runtime_status",
                     return_value={"embedding": True, "reranker": True, "qdrant": True, "llm": False},
             ):
                 response = client.get("/api/health")
@@ -255,7 +281,7 @@ class WebContractTests(unittest.TestCase):
             yield {"type": "chunk", "content": "ok"}
             yield {"type": "final", "content": "ok"}
 
-        with self._client() as client, patch("web_app.ask_rag_stream", fake_stream):
+        with self._client() as client, patch("lab_rag.web_app.ask_rag_stream", fake_stream):
             response = client.post("/ask_stream", json={"question": "test"}, buffered=True)
 
         body = response.get_data(as_text=True)
@@ -269,7 +295,7 @@ class WebContractTests(unittest.TestCase):
         def fake_stream(question, username):
             yield {"type": "chunk", "content": "ok"}
 
-        with self._client() as client, patch("web_app.ask_rag_stream", fake_stream):
+        with self._client() as client, patch("lab_rag.web_app.ask_rag_stream", fake_stream):
             response = client.post("/ask_stream", json={"question": "test"}, buffered=False)
             next(response.response)
             response.close()
@@ -279,13 +305,13 @@ class WebContractTests(unittest.TestCase):
 
 class IngestContractTests(unittest.TestCase):
     def test_parent_ids_are_deterministic(self):
-        from ingest import generate_parent_point_id
+        from lab_rag.ingest import generate_parent_point_id
 
         item = {"source": "/docs/a.md", "parent_id": "abc"}
         self.assertEqual(generate_parent_point_id(item), generate_parent_point_id(dict(item)))
 
     def test_stale_delete_happens_only_for_removed_ids(self):
-        from ingest import delete_stale_ids
+        from lab_rag.ingest import delete_stale_ids
 
         class FakeClient:
             def __init__(self):
@@ -309,7 +335,7 @@ class IngestContractTests(unittest.TestCase):
 class InternalMcpContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import web_app
+        from lab_rag import web_app
 
         cls.web_app = web_app
 
@@ -322,12 +348,12 @@ class InternalMcpContractTests(unittest.TestCase):
         )
 
     def test_internal_api_is_disabled_without_token(self):
-        with patch("web_app._MCP_INTERNAL_TOKEN", ""):
+        with patch("lab_rag.web_app._MCP_INTERNAL_TOKEN", ""):
             response = self._post("/api/internal/mcp/search", {"query": "test"})
         self.assertEqual(response.status_code, 503)
 
     def test_internal_api_rejects_wrong_token_and_non_loopback_peer(self):
-        with patch("web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"):
+        with patch("lab_rag.web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"):
             wrong_token = self._post(
                 "/api/internal/mcp/search", {"query": "test"}, token="wrong"
             )
@@ -386,9 +412,9 @@ class InternalMcpContractTests(unittest.TestCase):
             raise AssertionError("MCP 不应进入最终答案生成阶段")
 
         with (
-            patch("web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"),
-            patch("web_app._MCP_RESULT_MAX_CHARS", 12),
-            patch("web_app.ask_rag_stream", fake_stream),
+            patch("lab_rag.web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"),
+            patch("lab_rag.web_app._MCP_RESULT_MAX_CHARS", 12),
+            patch("lab_rag.web_app.ask_rag_stream", fake_stream),
         ):
             response = self._post(
                 "/api/internal/mcp/search", {"query": "original", "limit": 1}
@@ -412,8 +438,8 @@ class InternalMcpContractTests(unittest.TestCase):
             "entries": [{"name": "a"}, {"name": "b"}],
         }
         with (
-            patch("web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"),
-            patch("web_app.list_catalog_entries", return_value=fake_result),
+            patch("lab_rag.web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"),
+            patch("lab_rag.web_app.list_catalog_entries", return_value=fake_result),
         ):
             response = self._post(
                 "/api/internal/mcp/catalog", {"keyword": "paper", "limit": 1}
@@ -431,7 +457,7 @@ class McpBridgeContractTests(unittest.IsolatedAsyncioTestCase):
         except ImportError:
             self.skipTest("MCP SDK v2 仅安装在可选的 rag-mcp 环境")
 
-        import mcp_server
+        from lab_rag import mcp_server
 
         bridge_result = {"success": True, "route": "rag_search", "results": []}
         with patch.object(mcp_server, "_post_json", return_value=bridge_result):

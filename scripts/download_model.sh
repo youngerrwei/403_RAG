@@ -3,7 +3,7 @@
 # 模型下载脚本 - 使用明确的 RAG 环境下载 Qwen3-8B-Instruct 到本地
 # =============================================================================
 # 用法:
-#   bash download_model.sh [选项] [目标路径]
+#   bash scripts/download_model.sh [选项] [目标路径]
 #
 # 选项:
 #   --source modelscope   从 ModelScope（魔搭）下载（默认，国内推荐，无需认证）
@@ -14,17 +14,18 @@
 #   HF_TOKEN   - HuggingFace 访问令牌（仅 huggingface 源需要）
 #
 # 示例:
-#   bash download_model.sh                              # ModelScope 下载（推荐）
-#   bash download_model.sh --source huggingface         # 从 HuggingFace 下载
-#   bash download_model.sh ./models/my-model            # 下载到自定义路径
-#   HF_TOKEN=hf_xxx bash download_model.sh --source huggingface  # HF + Token
+#   bash scripts/download_model.sh                              # ModelScope 下载（推荐）
+#   bash scripts/download_model.sh --source huggingface         # 从 HuggingFace 下载
+#   bash scripts/download_model.sh ./models/my-model            # 下载到自定义路径
+#   HF_TOKEN=hf_xxx bash scripts/download_model.sh --source huggingface  # HF + Token
 # =============================================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/scripts/runtime_common.sh"
-ENV_FILE="${RAG_ENV_FILE:-$SCRIPT_DIR/.env}"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/runtime_common.sh"
+ENV_FILE="${RAG_ENV_FILE:-$PROJECT_ROOT/.env}"
 load_env_keys "$ENV_FILE" RAG_CONDA_ENV VLLM_MODEL_NAME || true
 RAG_CONDA_ENV="${RAG_CONDA_ENV:-rag}"
 CONDA_CMD="$(find_conda || true)"
@@ -63,7 +64,7 @@ while [[ $# -gt 0 ]]; do
             fi
             ;;
         --help|-h)
-            echo "用法: bash download_model.sh [--source modelscope|huggingface] [目标路径]"
+            echo "用法: bash scripts/download_model.sh [--source modelscope|huggingface] [目标路径]"
             echo ""
             echo "选项:"
             echo "  --source modelscope    从 ModelScope 下载（默认，国内推荐）"
@@ -188,7 +189,7 @@ download_from_modelscope() {
         echo "  pip install modelscope"
         echo ""
         echo "或切换到 HuggingFace 源（需要翻墙或配置 Token）："
-        echo "  bash download_model.sh --source huggingface"
+        echo "  bash scripts/download_model.sh --source huggingface"
         echo ""
         return 1
     fi
@@ -231,10 +232,10 @@ download_from_huggingface() {
         echo "    1. 在 https://huggingface.co/${MODEL_ID} 接受模型许可协议"
         echo "    2. 在 https://huggingface.co/settings/tokens 创建 Access Token"
         echo "    3. 设置环境变量后重新运行："
-        echo "       HF_TOKEN=hf_xxx bash download_model.sh --source huggingface"
+        echo "       HF_TOKEN=hf_xxx bash scripts/download_model.sh --source huggingface"
         echo ""
         echo "  或改用 ModelScope 源（国内推荐，无需认证）："
-        echo "       bash download_model.sh --source modelscope"
+        echo "       bash scripts/download_model.sh --source modelscope"
         echo ""
     fi
 
@@ -256,7 +257,7 @@ download_from_huggingface() {
         echo "  pip install 'huggingface_hub[cli]'"
         echo ""
         echo "或改用 ModelScope 源（国内推荐）："
-        echo "  bash download_model.sh --source modelscope"
+        echo "  bash scripts/download_model.sh --source modelscope"
         echo ""
         return 1
     fi
@@ -329,17 +330,17 @@ if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
         echo "    2. 网络不通 → 国内推荐使用 ModelScope 源"
         echo ""
         echo "  推荐解决方案（国内用户）："
-        echo "    bash download_model.sh --source modelscope"
+        echo "    bash scripts/download_model.sh --source modelscope"
         echo ""
         echo "  或设置 Token 后重试："
-        echo "    HF_TOKEN=hf_xxx HF_MIRROR=https://hf-mirror.com bash download_model.sh --source huggingface"
+        echo "    HF_TOKEN=hf_xxx HF_MIRROR=https://hf-mirror.com bash scripts/download_model.sh --source huggingface"
     else
         echo "  可能原因："
         echo "    1. modelscope 库未安装 → pip install modelscope"
         echo "    2. 网络连接失败 → 检查网络后重试"
         echo ""
         echo "  备选方案（需要翻墙或 Token）："
-        echo "    HF_TOKEN=hf_xxx bash download_model.sh --source huggingface"
+        echo "    HF_TOKEN=hf_xxx bash scripts/download_model.sh --source huggingface"
     fi
     echo ""
     exit 1
@@ -356,11 +357,11 @@ if verify_model "$TARGET_DIR"; then
     echo "============================================="
     echo ""
     echo "现在可以启动 vLLM 服务："
-    echo "  bash start_vllm.sh"
+    echo "  bash scripts/start_vllm.sh"
 else
     echo ""
     log_error "模型文件验证失败，部分关键文件缺失"
     echo "建议重新运行下载脚本（将自动断点续传）："
-    echo "  bash download_model.sh"
+    echo "  bash scripts/download_model.sh"
     exit 1
 fi

@@ -27,7 +27,7 @@ from flask import (
     g,
 )
 
-from rag_agent import (
+from .rag_agent import (
     ask_stream as ask_rag_stream,
     load_history,
     clear_user_history,
@@ -38,7 +38,8 @@ from rag_agent import (
     start_runtime_prewarm,
 )
 
-from logger import get_logger
+from .logger import get_logger
+from .paths import resolve_project_path
 
 _logger = get_logger("web")
 
@@ -115,7 +116,7 @@ app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=8)
 app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1MB
 
-USERS_FILE = os.getenv("USERS_FILE", "config/users.json")
+USERS_FILE = str(resolve_project_path(os.getenv("USERS_FILE", "config/users.json")))
 
 # MCP 旁路只允许本机桥接进程访问；Token 为空时保持禁用。
 _MCP_INTERNAL_TOKEN = os.getenv("MCP_INTERNAL_TOKEN", "").strip()

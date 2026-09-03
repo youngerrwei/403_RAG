@@ -10,37 +10,37 @@
 
 | 文件 | 职责 |
 |------|------|
-| `rag_agent.py` | 核心 RAG 流程：路由判断、查询改写、向量检索、重排序、LLM 生成 |
-| `ingest.py` | 知识入库：文档加载、文本清洗、分块切分、向量化、写入 Qdrant |
-| `web_app.py` | Flask 服务：用户认证、SSE 流式接口、对话历史管理 |
-| `logger.py` | 统一日志模块：提供 `get_logger()` 接口，支持控制台+文件双输出、按日期自动轮转 |
-| `create_user.py` | 用户创建脚本：交互式创建/原子更新用户凭据（PBKDF2 加密） |
-| `requirements-rag.txt` | RAG 主环境直接依赖清单，由 `setup_env.sh --rag` 安装与校验 |
-| `auto_ingest.sh` | 入库管理脚本：支持增量入库、全量入库、集合销毁 |
-| `start_rag.sh` | 服务启动管理脚本：启动前预检（.env、模型路径、Qdrant、目录验证）、环境变量全量加载、vLLM/web_app 启动管理、通过 /api/health 验证就绪性 |
-| `templates/index.html` | 对话前端页面 |
-| `templates/login.html` | 登录页面 |
+| `src/lab_rag/rag_agent.py` | 核心 RAG 流程：路由判断、查询改写、向量检索、重排序、LLM 生成 |
+| `src/lab_rag/ingest.py` | 知识入库：文档加载、文本清洗、分块切分、向量化、写入 Qdrant |
+| `src/lab_rag/web_app.py` | Flask 服务：用户认证、SSE 流式接口、对话历史管理 |
+| `src/lab_rag/logger.py` | 统一日志模块：提供 `get_logger()` 接口，支持控制台+文件双输出、按日期自动轮转 |
+| `src/lab_rag/create_user.py` | 用户创建脚本：交互式创建/原子更新用户凭据（PBKDF2 加密） |
+| `requirements/rag.txt` | RAG 主环境直接依赖清单，由 `scripts/setup_env.sh --rag` 安装与校验 |
+| `scripts/auto_ingest.sh` | 入库管理脚本：支持增量入库、全量入库、集合销毁 |
+| `scripts/start_rag.sh` | 服务启动管理脚本：启动前预检（.env、模型路径、Qdrant、目录验证）、环境变量全量加载、vLLM/web_app 启动管理、通过 /api/health 验证就绪性 |
+| `src/lab_rag/templates/index.html` | 对话前端页面 |
+| `src/lab_rag/templates/login.html` | 登录页面 |
 | `.env` | 所有配置项（模型路径、Qdrant 连接、检索参数等） |
 
 ### 文件间依赖关系
 
 ```
-web_app.py ──导入并调用──▶ rag_agent.py
+src/lab_rag/web_app.py ──导入并调用──▶ src/lab_rag/rag_agent.py
      │                        │
      │                        ▼
-     │                   Qdrant 集合 ◀── ingest.py（独立运行，共享集合）
+     │                   Qdrant 集合 ◀── src/lab_rag/ingest.py（独立运行，共享集合）
      │                                        ▲
      │                                        │
-     │          auto_ingest.sh ────调用────────┘
+     │          scripts/auto_ingest.sh ────调用────────┘
      │                │
      ▼                ▼
-  logger.py ◀──── 被所有 Python 主模块导入（共享日志基础设施）
+  src/lab_rag/logger.py ◀──── 被所有 Python 主模块导入（共享日志基础设施）
 ```
 
-- `web_app.py` 导入并调用 `rag_agent.py` 中的核心函数
-- `ingest.py` 独立运行，与 `rag_agent.py` 共享 Qdrant 集合
-- `auto_ingest.sh` 调用 `ingest.py` 执行入库操作
-- `logger.py` 被 `web_app.py`、`rag_agent.py`、`ingest.py` 共同导入，提供统一日志能力
+- `src/lab_rag/web_app.py` 导入并调用 `src/lab_rag/rag_agent.py` 中的核心函数
+- `src/lab_rag/ingest.py` 独立运行，与 `src/lab_rag/rag_agent.py` 共享 Qdrant 集合
+- `scripts/auto_ingest.sh` 调用 `src/lab_rag/ingest.py` 执行入库操作
+- `src/lab_rag/logger.py` 被 `src/lab_rag/web_app.py`、`src/lab_rag/rag_agent.py`、`src/lab_rag/ingest.py` 共同导入，提供统一日志能力
 
 ---
 
@@ -71,7 +71,7 @@ web_app.py ──导入并调用──▶ rag_agent.py
 ### 3.2 依赖管理
 
 - **尽量不引入新的 pip 依赖**
-- 如必须引入，需同步更新 `requirements-rag.txt` 与 README 中的安装说明
+- 如必须引入，需同步更新 `requirements/rag.txt` 与 README 中的安装说明
 
 ### 3.3 配置管理
 
@@ -169,7 +169,7 @@ python -c "import ast; ast.parse(open('文件名.py').read())"
 ### 全量重建命令
 
 ```bash
-bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
+bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --full
 ```
 
 ---
@@ -179,10 +179,10 @@ bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
 ### 当前事件类型
 
 ```jsonc
-// 流开始（web_app.py 注入）
+// 流开始（src/lab_rag/web_app.py 注入）
 data: {"type": "start", "question": "..."}
 
-// 元数据：路由决策结果（rag_agent.py 发出）
+// 元数据：路由决策结果（src/lab_rag/rag_agent.py 发出）
 data: {"type": "metadata", "stage": "route", "route": "rag_search|file_list|hybrid", "route_target": "...", "route_reason": "..."}
 
 // 状态变更通知（检索中、生成中）
@@ -204,12 +204,12 @@ data: {"type": "metadata", "stage": "coverage", "coverage": {...}, "citations": 
 // 结束标记（携带最终元数据）
 data: {"type": "final", "content": "...", "route": "...", "coverage": {...}, "citations": [...]}
 
-// 心跳包（web_app.py 注入，保持连接活跃）
+// 心跳包（src/lab_rag/web_app.py 注入，保持连接活跃）
 data: {"type": "heartbeat"}
 
-// 错误通知（web_app.py 使用 "message" 字段，rag_agent.py 使用 "content" 字段）
-data: {"type": "error", "message": "..."}  // web_app.py 超时/异常
-data: {"type": "error", "content": "..."}  // rag_agent.py 内部异常
+// 错误通知（src/lab_rag/web_app.py 使用 "message" 字段，src/lab_rag/rag_agent.py 使用 "content" 字段）
+data: {"type": "error", "message": "..."}  // src/lab_rag/web_app.py 超时/异常
+data: {"type": "error", "content": "..."}  // src/lab_rag/rag_agent.py 内部异常
 
 // 流结束信号（固定格式，不是 JSON）
 data: [DONE]
@@ -217,7 +217,7 @@ data: [DONE]
 
 ### 修改规则
 
-- 修改 SSE 协议时**必须同步更新**前端 `templates/index.html` 的解析逻辑
+- 修改 SSE 协议时**必须同步更新**前端 `src/lab_rag/templates/index.html` 的解析逻辑
 - 新增事件类型时确保前端 `onmessage` 处理中有对未知类型的兜底逻辑
 - 保持 `[DONE]` 作为流终止的最后一条消息
 
@@ -234,7 +234,7 @@ data: [DONE]
 | `fcntl.flock` 跨平台 | 文件锁在 Windows/macOS 上行为可能与 Linux 不同，需注意兼容性 |
 | `teardown_request` | Flask 的 `teardown_request` 无论请求成功或失败**都会执行**，不要在其中做条件性清理 |
 | `preflight_check()` 行为 | 启动前预检中 Qdrant 不可达、必要集合缺失或文档目录为空仅发出警告（不阻止启动）；模型路径不存在则中止启动 |
-| `/api/health` 状态含义 | `"degraded"` 表示部分组件不可用但系统仍可接受请求；`"error"` 表示关键服务不可用；修改状态判断逻辑时需同步更新 `start_rag.sh` 中的 JSON 解析逻辑 |
+| `/api/health` 状态含义 | `"degraded"` 表示部分组件不可用但系统仍可接受请求；`"error"` 表示关键服务不可用；修改状态判断逻辑时需同步更新 `scripts/start_rag.sh` 中的 JSON 解析逻辑 |
 
 ---
 
@@ -275,4 +275,4 @@ data: [DONE]
 - 该端点为系统稳定 API，路由和响应格式不可随意变更
 - 扩展检查项时向 `components` 对象中添加新键值对，不删除已有键
 - 不要改变 `status` 的三个可能值定义
-- 修改此端点的响应格式时，**必须同步更新** `start_rag.sh` 中的 JSON 解析逻辑
+- 修改此端点的响应格式时，**必须同步更新** `scripts/start_rag.sh` 中的 JSON 解析逻辑

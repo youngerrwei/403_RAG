@@ -10,12 +10,12 @@
 #   rag        — RAG 主应用 (不存在时创建，并安装核心依赖)
 #
 # 用法:
-#   bash setup_env.sh              # 安装所有环境
-#   bash setup_env.sh --vllm       # 仅安装 vLLM 环境
-#   bash setup_env.sh --mineru     # 仅安装 MinerU 环境
-#   bash setup_env.sh --rag        # 仅安装 RAG 主环境依赖
-#   bash setup_env.sh --force      # 强制重建已存在的环境
-#   bash setup_env.sh --help       # 显示帮助
+#   bash scripts/setup_env.sh              # 安装所有环境
+#   bash scripts/setup_env.sh --vllm       # 仅安装 vLLM 环境
+#   bash scripts/setup_env.sh --mineru     # 仅安装 MinerU 环境
+#   bash scripts/setup_env.sh --rag        # 仅安装 RAG 主环境依赖
+#   bash scripts/setup_env.sh --force      # 强制重建已存在的环境
+#   bash scripts/setup_env.sh --help       # 显示帮助
 # ==============================================================================
 
 # 注意：不使用 set -e，因为 conda 激活/run 命令失败不应中断整体流程
@@ -23,11 +23,12 @@ set -uo pipefail
 
 # ========== 基础配置 ==========
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_DIR="${PROJECT_ROOT}/logs"
 LOG_FILE="${LOG_DIR}/setup_env.log"
-ENV_FILE="${SCRIPT_DIR}/.env"
-ENV_EXAMPLE="${SCRIPT_DIR}/.env.example"
-source "${SCRIPT_DIR}/scripts/runtime_common.sh"
+ENV_FILE="${PROJECT_ROOT}/.env"
+ENV_EXAMPLE="${PROJECT_ROOT}/.env.example"
+source "${SCRIPT_DIR}/runtime_common.sh"
 
 # conda 环境名称
 load_env_keys "$ENV_FILE" RAG_CONDA_ENV VLLM_CONDA_ENV MINERU_CONDA_ENV || true
@@ -93,7 +94,7 @@ show_help() {
 RAG 知识库系统 - 多环境安装脚本
 
 用法:
-  bash setup_env.sh [选项]
+  bash scripts/setup_env.sh [选项]
 
 选项:
   --vllm          仅安装 vLLM 环境 (rag-vllm)
@@ -113,11 +114,11 @@ RAG 知识库系统 - 多环境安装脚本
                Flask + LangChain + Qdrant + sentence-transformers 等
 
 示例:
-  bash setup_env.sh                    # 安装所有环境
-  bash setup_env.sh --vllm             # 仅安装 vLLM 环境
-  bash setup_env.sh --mineru --force   # 强制重建 MinerU 环境
-  bash setup_env.sh --rag              # 仅安装 RAG 核心依赖
-  bash setup_env.sh --skip-vllm        # 跳过 vLLM，安装其余环境
+  bash scripts/setup_env.sh                    # 安装所有环境
+  bash scripts/setup_env.sh --vllm             # 仅安装 vLLM 环境
+  bash scripts/setup_env.sh --mineru --force   # 强制重建 MinerU 环境
+  bash scripts/setup_env.sh --rag              # 仅安装 RAG 核心依赖
+  bash scripts/setup_env.sh --skip-vllm        # 跳过 vLLM，安装其余环境
 EOF
 }
 
@@ -219,7 +220,7 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 log_info "========== 开始环境安装 =========="
-log_info "工作目录: ${SCRIPT_DIR}"
+log_info "工作目录: ${PROJECT_ROOT}"
 log_info "安装计划: vLLM=${INSTALL_VLLM}, MinerU=${INSTALL_MINERU}, RAG=${INSTALL_RAG}, Force=${FORCE}"
 
 # ========== 检查 conda 是否可用 ==========
@@ -411,10 +412,10 @@ install_rag_deps() {
     echo -e "${BLUE}━━━ 安装 RAG 主环境依赖 ━━━${NC}"
     echo ""
 
-    local requirements_file="${SCRIPT_DIR}/requirements-rag.txt"
+    local requirements_file="${PROJECT_ROOT}/requirements/rag.txt"
     if [[ ! -f "$requirements_file" ]]; then
         log_error "缺少 RAG 依赖清单: $requirements_file"
-        report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "缺少 requirements-rag.txt"
+        report_add "RAG 主环境 (${ENV_RAG})" "FAIL" "缺少 requirements/rag.txt"
         return 1
     fi
     if check_env_exists "$ENV_RAG"; then
@@ -535,11 +536,11 @@ if [[ $HAS_FAILURE -eq 0 ]]; then
     echo ""
     echo -e "  后续步骤（首次部署）："
     echo -e "    1. 编辑 .env 并准备三个本地模型"
-    echo -e "    2. 创建用户:       ${GREEN}conda run -n ${ENV_RAG} python create_user.py${NC}"
-    echo -e "    3. 转换文档:       ${GREEN}bash convert_to_md.sh --full${NC}"
-    echo -e "    4. 启动 vLLM:      ${GREEN}bash start_vllm.sh --background${NC}"
-    echo -e "    5. 知识入库:       ${GREEN}bash auto_ingest.sh --full${NC}"
-    echo -e "    6. 启动 RAG 系统:  ${GREEN}bash start_rag.sh start${NC}"
+    echo -e "    2. 创建用户:       ${GREEN}PYTHONPATH=src conda run -n ${ENV_RAG} python -m lab_rag.create_user${NC}"
+    echo -e "    3. 转换文档:       ${GREEN}bash scripts/convert_to_md.sh --full${NC}"
+    echo -e "    4. 启动 vLLM:      ${GREEN}bash scripts/start_vllm.sh --background${NC}"
+    echo -e "    5. 知识入库:       ${GREEN}bash scripts/auto_ingest.sh --full${NC}"
+    echo -e "    6. 启动 RAG 系统:  ${GREEN}bash scripts/start_rag.sh start${NC}"
     echo ""
 else
     echo -e "${RED}══════════════════════════════════════════════════════════${NC}"

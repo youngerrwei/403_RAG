@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 _logger = logging.getLogger("lab-rag-mcp")
