@@ -1,7 +1,7 @@
 # LAB 403 RAG 知识库系统
 
 > Author：youngerrwei（韦子扬）<br>
-> 当前版本：v2.0.2
+> 当前版本：v2.1.0
 
 ## 项目概述
 
@@ -15,18 +15,20 @@
 - **Flask Web 应用**：用户认证 + SSE 流式问答（端口 5000）
 - **Qdrant**：向量数据库，存储子块集合 + 父块集合
 - **bge-m3 / bge-reranker-v2-m3**：Embedding 与重排序模型
+- **可选 MCP Bridge**：通过 stdio 暴露纯检索与目录工具，复用 Web 进程中的唯一 RAG 运行时
 
 > 详细架构设计、数据流和技术决策请参阅 [ARCHITECTURE.md](ARCHITECTURE.md)
 
 ### 环境架构
 
-项目采用三个独立的 conda 环境，避免 vLLM 和 MinerU 的 PyTorch/paddlepaddle 版本冲突：
+项目的三个核心服务使用独立 conda 环境，避免 vLLM 和 MinerU 的 PyTorch/paddlepaddle 版本冲突；启用 MCP 时再增加一个轻量可选环境：
 
 | 环境名 | 用途 | 核心组件 | 使用的 GPU |
 |--------|------|----------|------------|
 | `rag-vllm` | vLLM 推理服务 | Python 3.10 + PyTorch 2.5.1+cu124 + vLLM 0.8.5.post1 | GPU 3 |
 | `rag-mineru` | 文档格式转换 | Python 3.10 + PyTorch 2.5.1+cu124 + MinerU | GPU 0 |
 | `rag` | RAG 主应用 | Flask + LangChain + bge-m3 + bge-reranker | GPU 2 |
+| `rag-mcp`（可选） | stdio MCP 协议桥接 | MCP Python SDK；不加载模型 | 无 |
 
 > 所有管理脚本会自行定位 conda 并使用 `.env` 指定的环境，不依赖调用者当前激活的环境。
 
@@ -325,6 +327,52 @@ bash start_vllm.sh status
 - **模型路径**：本地路径不存在时提示运行 `download_model.sh`
 - **端口**：默认 8000（由 .env 中 `VLLM_PORT` 控制）
 
+## 可选 MCP 旁路
+
+MCP 旁路提供两个纯工具，不生成最终答案，也不写入用户对话历史：
+
+- `search_lab_knowledge`：完整复用现有路由、问题改写、Dense + Sparse、RRF、重排序和父块展开，在开始最终 LLM 回答前停止并返回有界原文证据。
+- `list_lab_catalog`：复用现有目录/文件浏览能力。
+
+桥接进程不导入 `rag_agent.py`，而是使用随机 Bearer Token 调用 Web 进程内仅接受真实 loopback 对端的私有 JSON API。因此 Embedding、Reranker、Qdrant 客户端仍只在原 Web 进程加载一份，原 `/ask_stream`、前端和 `start_rag.sh` 行为不变。
+
+### 准备与验证
+
+先确保 RAG Web 已部署，然后执行：
+
+```bash
+# 创建独立 rag-mcp 环境、安装 MCP SDK，并向私有 .env 写入随机 Token
+bash setup_mcp.sh
+
+# 如果 setup_mcp.sh 刚生成或更新了 Token，重启 Web 使其读取新值
+bash start_rag.sh restart
+
+# 可选：用 MCP Inspector 进行交互验证（Web 必须已运行）
+conda run -n rag-mcp mcp dev mcp_server.py
+```
+
+`start_mcp.sh` 不需要常驻管理：MCP Host 会按需启动这个 stdio 子进程，并在会话结束时关闭它。脚本的 stdout 专用于 MCP 协议，诊断日志写入 stderr。
+
+### DeepSeek Harness 配置示例
+
+在目标 profile 的 Cordis patch 中加入以下配置，将两个工具注册为 `mcp__lab-rag__search_lab_knowledge` 和 `mcp__lab-rag__list_lab_catalog`。请把示例路径替换为部署机上的绝对路径：
+
+```yaml
+- insert:
+    - id: mcp-lab-rag
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: lab-rag
+        transport: stdio
+        command: bash
+        args: ['/absolute/path/lab_rag/start_mcp.sh']
+        cwd: '/absolute/path/lab_rag'
+        toolCallTimeoutMs: 120000
+        failOnStartupError: false
+```
+
+本阶段只交付 MCP 可调用能力，不修改 vLLM 工具调用参数，也不把 Qwen 或 DeepSeek Harness 接入现有问答链路。这样可以先独立验证检索工具质量，再决定后续由 Harness 模型编排工具，还是保留当前 RAG 的回答生成。
+
 ## 环境配置（.env）
 
 仓库只提交 `.env.example`；`setup_env.sh` 会创建被 Git 忽略的本机 `.env` 并生成随机 Flask 密钥。关键配置如下：
@@ -335,6 +383,7 @@ bash start_vllm.sh status
 | `RAG_CONDA_ENV` | `rag` | Web、入库与下载工具环境 |
 | `VLLM_CONDA_ENV` | `rag-vllm` | vLLM 环境 |
 | `MINERU_CONDA_ENV` | `rag-mineru` | 文档转换环境 |
+| `MCP_CONDA_ENV` | `rag-mcp` | 可选 MCP Bridge 独立环境 |
 | `VLLM_MODEL_NAME` | `./models/Qwen3-8B-Instruct` | 推理模型本地路径 |
 | `VLLM_API_KEY` | `lab-secret-key` | vLLM 服务密钥 |
 | `VLLM_PORT` | `8000` | vLLM 端口 |
@@ -353,6 +402,12 @@ bash start_vllm.sh status
 | `VLLM_STARTUP_TIMEOUT` | `300` | vLLM 就绪等待秒数 |
 | `WEBAPP_STARTUP_TIMEOUT` | `60` | Web 就绪等待秒数 |
 | `FLASK_SECRET_KEY` | 首次安装随机生成 | Session 签名密钥，至少 32 字符且不得提交 |
+| `MCP_INTERNAL_TOKEN` | `setup_mcp.sh` 随机生成 | 本机私有 MCP API 的 Bearer Token；留空时接口禁用 |
+| `MCP_INTERNAL_BASE_URL` | `http://127.0.0.1:5000` | MCP Bridge 访问现有 Web 进程的地址 |
+| `MCP_HTTP_TIMEOUT` | `120` | MCP Bridge 调用内部 API 的超时秒数 |
+| `MCP_QUERY_MAX_CHARS` | `4000` | MCP 查询最大字符数 |
+| `MCP_RESULT_LIMIT` | `6` | MCP 检索默认返回条数 |
+| `MCP_RESULT_MAX_CHARS` | `1500` | 每条 MCP 证据各文本字段最大字符数 |
 
 > **重要**：所有模型统一使用本地路径（`models/`），不要使用 HuggingFace 在线路径。
 
@@ -539,10 +594,13 @@ SSE 流式问答接口，需先登录获取 Session。
 | `.env.example` | 可提交的完整配置模板；本机 `.env` 私有且被 Git 忽略 |
 | `rag_agent.py` | 核心 RAG 流程：两级查询路由（规则+LLM）、问题改写、多路并行检索（Dense+Sparse）、RRF 融合、重排序、父块展开（独立 Collection 查询）、TTL 缓存、流式回答生成、文件系统工具 |
 | `web_app.py` | Flask 后端：登录认证（PBKDF2）、SSE 流式问答接口、历史管理 |
+| `mcp_server.py` | 轻量 stdio MCP Bridge：暴露纯检索与目录工具，通过本机私有 API 复用唯一 RAG 运行时 |
 | `ingest.py` | 知识库入库：Markdown 加载、标题结构切分、父子块切分（Small-to-Big）、质量过滤、批量写入 Qdrant |
 | `create_user.py` | 用户账号创建脚本 |
 | `scripts/runtime_common.sh` | Shell 公共运行库：安全加载 `.env`、解析项目相对路径、定位 Conda、检查端口/PID/HTTP 与 vLLM 模型身份 |
 | `setup_env.sh` | 环境准备一键脚本（依赖安装、模型检查、配置初始化） |
+| `setup_mcp.sh` | 可选 MCP 环境准备脚本：创建独立环境、安装 SDK、生成内部 Token |
+| `start_mcp.sh` | 供 MCP Host 按需启动的 stdio Bridge 入口 |
 | `start_vllm.sh` | vLLM 推理服务管理脚本（支持启动/停止/状态查看、前台/后台/多卡/健康检查） |
 | `start_rag.sh` | RAG 系统一键启动/停止/重启/状态查看脚本（管理 vLLM + web_app），支持启动前预检与 /api/health 就绪验证 |
 | `auto_ingest.sh` | 知识库自动增量入库脚本（检测新增/修改文件，支持 cron 定时执行） |
@@ -550,7 +608,7 @@ SSE 流式问答接口，需先登录获取 Session。
 | `rag_tool.py` | ReAct 工具兼容适配器；复用 `rag_agent.py` 的唯一 RAG 运行时 |
 | `tools.py` | `use_agent=true` 时使用的请求级 ReAct 工具定义 |
 | `agent_entry.py` | `use_agent=true` 时由 Web 接口调用的 ReAct Agent 入口 |
-| `test_reliability.py` | 启动、健康检查、SSE、并发释放、入库一致性与脚本语法的可靠性回归测试 |
+| `test_reliability.py` | 启动、健康检查、SSE、MCP 契约、并发释放、入库一致性与脚本语法的可靠性回归测试 |
 | `templates/index.html` | 对话前端页面（iOS 毛玻璃风格、暗色模式、中山大学校徽内联、Lucide 图标） |
 | `templates/login.html` | 登录页面（绿白渐变、校徽内联、制作者署名） |
 

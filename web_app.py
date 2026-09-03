@@ -4,6 +4,7 @@ import json
 import traceback
 import hashlib
 import hmac
+import ipaddress
 import queue
 import threading
 import time
@@ -33,6 +34,7 @@ from rag_agent import (
     save_history,
     cleanup_expired_history,
     get_runtime_status,
+    list_catalog_entries,
     start_runtime_prewarm,
 )
 
@@ -114,6 +116,12 @@ app.config["SESSION_REFRESH_EACH_REQUEST"] = True
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1MB
 
 USERS_FILE = os.getenv("USERS_FILE", "config/users.json")
+
+# MCP 旁路只允许本机桥接进程访问；Token 为空时保持禁用。
+_MCP_INTERNAL_TOKEN = os.getenv("MCP_INTERNAL_TOKEN", "").strip()
+_MCP_QUERY_MAX_CHARS = int(os.getenv("MCP_QUERY_MAX_CHARS", "4000"))
+_MCP_RESULT_LIMIT = int(os.getenv("MCP_RESULT_LIMIT", "6"))
+_MCP_RESULT_MAX_CHARS = int(os.getenv("MCP_RESULT_MAX_CHARS", "1500"))
 
 @app.before_request
 def _generate_csp_nonce():
@@ -246,6 +254,191 @@ def health_check():
 
     http_code = 503 if status == "error" else 200
     return jsonify({"status": status, "components": components}), http_code
+
+
+def _is_loopback_address(address: str) -> bool:
+    """只信任实际 TCP 对端地址，不使用可伪造的代理请求头。"""
+    try:
+        parsed = ipaddress.ip_address(address or "")
+    except ValueError:
+        return False
+    if parsed.is_loopback:
+        return True
+    mapped = getattr(parsed, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
+def _authorize_mcp_internal():
+    """校验本机 MCP Bridge；返回 None 表示通过，否则返回 Flask 响应。"""
+    if not _MCP_INTERNAL_TOKEN:
+        return jsonify({"success": False, "error": "MCP 内部接口未启用"}), 503
+    if not _is_loopback_address(request.remote_addr or ""):
+        return jsonify({"success": False, "error": "禁止访问"}), 403
+
+    auth_header = request.headers.get("Authorization", "")
+    scheme, separator, token = auth_header.partition(" ")
+    if (
+        separator != " "
+        or scheme.lower() != "bearer"
+        or not hmac.compare_digest(token.strip(), _MCP_INTERNAL_TOKEN)
+    ):
+        return jsonify({"success": False, "error": "认证失败"}), 401
+    return None
+
+
+def _validated_mcp_limit(value, default: int, maximum: int):
+    """解析 MCP 返回数量，避免 bool 被当作整数接受。"""
+    if value is None:
+        return default, None
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+        return None, f"limit 必须是 1 到 {maximum} 的整数"
+    return value, None
+
+
+def _project_catalog_result(file_result: dict, limit: int) -> dict:
+    """限制目录结果数量，保持原始字段结构不变。"""
+    projected = dict(file_result or {})
+    if projected.get("mode") == "filesystem_directory":
+        directories = list(projected.get("directories") or [])[:limit]
+        remaining = max(0, limit - len(directories))
+        projected["directories"] = directories
+        projected["files"] = list(projected.get("files") or [])[:remaining]
+    else:
+        projected["entries"] = list(projected.get("entries") or [])[:limit]
+    return projected
+
+
+def _project_mcp_retrievals(retrievals: list, limit: int) -> list:
+    """将现有检索事件投影为有界、可 JSON 序列化的 MCP 结果。"""
+    projected = []
+    for item in list(retrievals or [])[:limit]:
+        score = item.get("rerank_score")
+        if score is not None:
+            try:
+                score = float(score)
+            except (TypeError, ValueError):
+                score = None
+        projected.append({
+            "index": item.get("index"),
+            "doc_title": str(item.get("doc_title", "")),
+            "file_name": str(item.get("file_name", "")),
+            "rel_path": str(item.get("rel_path", "")),
+            "rerank_score": score,
+            "summary": str(item.get("summary", ""))[:_MCP_RESULT_MAX_CHARS],
+            "preview": str(item.get("preview", ""))[:_MCP_RESULT_MAX_CHARS],
+            "content": str(item.get("content", ""))[:_MCP_RESULT_MAX_CHARS],
+        })
+    return projected
+
+
+def _collect_mcp_search(query: str, limit: int) -> dict:
+    """复用标准 RAG 直到检索完成，并在答案生成前关闭生成器。"""
+    stream_iter = ask_rag_stream(query, username="mcp-bridge", persist_history=False)
+    result = {
+        "route": "rag_search",
+        "route_target": query,
+        "route_reason": "",
+        "rewritten_question": query,
+        "keywords": [],
+        "queries": [],
+        "results": [],
+        "source_map": {},
+        "catalog": None,
+    }
+    try:
+        for item in stream_iter:
+            item_type = item.get("type")
+            if item_type == "error":
+                raise RuntimeError("RAG 检索暂时不可用")
+            if item_type == "metadata" and item.get("stage") == "route":
+                result["route"] = item.get("route", result["route"])
+                result["route_target"] = item.get("route_target", query)
+                result["route_reason"] = item.get("route_reason", "")
+                continue
+            if item_type == "tool" and item.get("tool_name") == "list_catalog_entries":
+                result["catalog"] = _project_catalog_result(item.get("content") or {}, limit)
+                if result["route"] == "file_list":
+                    break
+                continue
+            if item_type == "metadata" and item.get("stage") == "retrieval":
+                result["rewritten_question"] = item.get("rewritten_question", query)
+                result["keywords"] = list(item.get("keywords") or [])
+                result["queries"] = list(item.get("queries") or [])
+                result["results"] = _project_mcp_retrievals(item.get("retrievals") or [], limit)
+                result["source_map"] = dict(item.get("source_map") or {})
+                break
+        return result
+    finally:
+        close_stream = getattr(stream_iter, "close", None)
+        if callable(close_stream):
+            close_stream()
+
+
+@app.route("/api/internal/mcp/search", methods=["POST"])
+def mcp_internal_search():
+    denied = _authorize_mcp_internal()
+    if denied is not None:
+        return denied
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "请求体必须是 JSON 对象"}), 400
+    query = data.get("query", "")
+    if not isinstance(query, str) or not query.strip():
+        return jsonify({"success": False, "error": "query 不能为空"}), 400
+    query = query.strip()
+    if len(query) > _MCP_QUERY_MAX_CHARS:
+        return jsonify({"success": False, "error": "query 过长"}), 400
+    limit, limit_error = _validated_mcp_limit(data.get("limit"), _MCP_RESULT_LIMIT, 10)
+    if limit_error:
+        return jsonify({"success": False, "error": limit_error}), 400
+    if not _request_semaphore.acquire(blocking=False):
+        return jsonify({"success": False, "error": "服务繁忙，请稍后重试"}), 503
+
+    try:
+        result = _collect_mcp_search(query, limit)
+        return jsonify({"success": True, **result})
+    except Exception as exc:
+        _logger.error(f"MCP 内部检索失败: {exc!r}")
+        _logger.debug(traceback.format_exc())
+        return jsonify({"success": False, "error": "知识库服务暂时不可用"}), 503
+    finally:
+        _request_semaphore.release()
+
+
+@app.route("/api/internal/mcp/catalog", methods=["POST"])
+def mcp_internal_catalog():
+    denied = _authorize_mcp_internal()
+    if denied is not None:
+        return denied
+
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data, dict):
+        return jsonify({"success": False, "error": "请求体必须是 JSON 对象"}), 400
+    keyword = data.get("keyword", "")
+    if not isinstance(keyword, str) or not keyword.strip():
+        return jsonify({"success": False, "error": "keyword 不能为空"}), 400
+    keyword = keyword.strip()
+    if len(keyword) > _MCP_QUERY_MAX_CHARS:
+        return jsonify({"success": False, "error": "keyword 过长"}), 400
+    limit, limit_error = _validated_mcp_limit(data.get("limit"), 50, 200)
+    if limit_error:
+        return jsonify({"success": False, "error": limit_error}), 400
+    if not _request_semaphore.acquire(blocking=False):
+        return jsonify({"success": False, "error": "服务繁忙，请稍后重试"}), 503
+
+    try:
+        file_result = list_catalog_entries(keyword)
+        return jsonify({
+            "success": True,
+            "catalog": _project_catalog_result(file_result, limit),
+        })
+    except Exception as exc:
+        _logger.error(f"MCP 内部目录查询失败: {exc!r}")
+        _logger.debug(traceback.format_exc())
+        return jsonify({"success": False, "error": "知识库服务暂时不可用"}), 503
+    finally:
+        _request_semaphore.release()
 
 
 @app.route("/login", methods=["GET", "POST"])

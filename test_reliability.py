@@ -16,6 +16,7 @@ class ScriptContractTests(unittest.TestCase):
             "create_user.py",
             "ingest.py",
             "logger.py",
+            "mcp_server.py",
             "rag_agent.py",
             "rag_tool.py",
             "tools.py",
@@ -35,6 +36,8 @@ class ScriptContractTests(unittest.TestCase):
             "auto_ingest.sh",
             "start_vllm.sh",
             "start_rag.sh",
+            "setup_mcp.sh",
+            "start_mcp.sh",
         ]
         for script in scripts:
             with self.subTest(script=script):
@@ -78,6 +81,13 @@ class ScriptContractTests(unittest.TestCase):
             "RAG_CONDA_ENV",
             "VLLM_CONDA_ENV",
             "MINERU_CONDA_ENV",
+            "MCP_CONDA_ENV",
+            "MCP_INTERNAL_TOKEN",
+            "MCP_INTERNAL_BASE_URL",
+            "MCP_HTTP_TIMEOUT",
+            "MCP_QUERY_MAX_CHARS",
+            "MCP_RESULT_LIMIT",
+            "MCP_RESULT_MAX_CHARS",
             "VLLM_STARTUP_TIMEOUT",
             "WEBAPP_STARTUP_TIMEOUT",
             "HEALTHCHECK_TIMEOUT",
@@ -86,6 +96,7 @@ class ScriptContractTests(unittest.TestCase):
         }
         self.assertFalse(required - values.keys())
         self.assertEqual(values["FLASK_SECRET_KEY"], "")
+        self.assertEqual(values["MCP_INTERNAL_TOKEN"], "")
         self.assertEqual(values["QDRANT_RECREATE_COLLECTION"], "false")
 
 
@@ -204,6 +215,147 @@ class IngestContractTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         selector = client.calls[0]["points_selector"]
         self.assertEqual(set(selector.points), {"remove", "old"})
+
+
+class InternalMcpContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import web_app
+
+        cls.web_app = web_app
+
+    def _post(self, path, payload, token="test-mcp-token", remote_addr="127.0.0.1"):
+        return self.web_app.app.test_client().post(
+            path,
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+            environ_overrides={"REMOTE_ADDR": remote_addr},
+        )
+
+    def test_internal_api_is_disabled_without_token(self):
+        with patch("web_app._MCP_INTERNAL_TOKEN", ""):
+            response = self._post("/api/internal/mcp/search", {"query": "test"})
+        self.assertEqual(response.status_code, 503)
+
+    def test_internal_api_rejects_wrong_token_and_non_loopback_peer(self):
+        with patch("web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"):
+            wrong_token = self._post(
+                "/api/internal/mcp/search", {"query": "test"}, token="wrong"
+            )
+            remote_peer = self.web_app.app.test_client().post(
+                "/api/internal/mcp/search",
+                json={"query": "test"},
+                headers={
+                    "Authorization": "Bearer test-mcp-token",
+                    "X-Forwarded-For": "127.0.0.1",
+                },
+                environ_overrides={"REMOTE_ADDR": "192.0.2.10"},
+            )
+        self.assertEqual(wrong_token.status_code, 401)
+        self.assertEqual(remote_peer.status_code, 403)
+
+    def test_search_reuses_standard_stream_without_answer_or_history(self):
+        before = self.web_app._request_semaphore._value
+        state = {"after_retrieval": False}
+        observed = {}
+
+        def fake_stream(question, username, persist_history):
+            observed.update({
+                "question": question,
+                "username": username,
+                "persist_history": persist_history,
+            })
+            yield {
+                "type": "metadata",
+                "stage": "route",
+                "route": "rag_search",
+                "route_target": question,
+                "route_reason": "test",
+            }
+            yield {
+                "type": "metadata",
+                "stage": "retrieval",
+                "rewritten_question": "rewritten",
+                "keywords": ["alpha"],
+                "queries": ["rewritten"],
+                "retrievals": [
+                    {
+                        "index": 1,
+                        "doc_title": "A",
+                        "file_name": "a.md",
+                        "rel_path": "docs/a.md",
+                        "rerank_score": "0.9",
+                        "summary": "s" * 2000,
+                        "preview": "p" * 2000,
+                        "content": "c" * 2000,
+                    },
+                    {"index": 2, "doc_title": "B", "content": "unused"},
+                ],
+                "source_map": {"1": {"rel_path": "docs/a.md"}},
+            }
+            state["after_retrieval"] = True
+            raise AssertionError("MCP 不应进入最终答案生成阶段")
+
+        with (
+            patch("web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"),
+            patch("web_app._MCP_RESULT_MAX_CHARS", 12),
+            patch("web_app.ask_rag_stream", fake_stream),
+        ):
+            response = self._post(
+                "/api/internal/mcp/search", {"query": "original", "limit": 1}
+            )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(observed["question"], "original")
+        self.assertEqual(observed["username"], "mcp-bridge")
+        self.assertFalse(observed["persist_history"])
+        self.assertFalse(state["after_retrieval"])
+        self.assertEqual(len(payload["results"]), 1)
+        self.assertEqual(len(payload["results"][0]["content"]), 12)
+        self.assertEqual(self.web_app._request_semaphore._value, before)
+
+    def test_catalog_is_capped_and_releases_concurrency_slot(self):
+        before = self.web_app._request_semaphore._value
+        fake_result = {
+            "mode": "search",
+            "entries": [{"name": "a"}, {"name": "b"}],
+        }
+        with (
+            patch("web_app._MCP_INTERNAL_TOKEN", "test-mcp-token"),
+            patch("web_app.list_catalog_entries", return_value=fake_result),
+        ):
+            response = self._post(
+                "/api/internal/mcp/catalog", {"keyword": "paper", "limit": 1}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["catalog"]["entries"], [{"name": "a"}])
+        self.assertEqual(self.web_app._request_semaphore._value, before)
+
+
+class McpBridgeContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_tools_are_discoverable_and_callable_in_memory(self):
+        try:
+            from mcp import Client
+            from mcp.server import MCPServer  # noqa: F401 - 同时确认使用的是 SDK v2
+        except ImportError:
+            self.skipTest("MCP SDK v2 仅安装在可选的 rag-mcp 环境")
+
+        import mcp_server
+
+        bridge_result = {"success": True, "route": "rag_search", "results": []}
+        with patch.object(mcp_server, "_post_json", return_value=bridge_result):
+            async with Client(mcp_server.mcp, raise_exceptions=True) as client:
+                tools = await client.list_tools()
+                names = {tool.name for tool in tools.tools}
+                result = await client.call_tool(
+                    "search_lab_knowledge", {"query": "test", "limit": 2}
+                )
+
+        self.assertEqual(names, {"search_lab_knowledge", "list_lab_catalog"})
+        self.assertFalse(result.is_error)
+        self.assertEqual(result.structured_content, bridge_result)
 
 
 if __name__ == "__main__":

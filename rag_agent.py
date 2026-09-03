@@ -508,6 +508,15 @@ def load_config() -> dict:
         "HEALTHCHECK_TIMEOUT": float(os.getenv("HEALTHCHECK_TIMEOUT", "3")),
         "RUNTIME_RETRY_INTERVAL": float(os.getenv("RUNTIME_RETRY_INTERVAL", "30")),
 
+        # 本机 MCP 旁路配置；Token 为空表示内部接口禁用。
+        "MCP_CONDA_ENV": os.getenv("MCP_CONDA_ENV", "rag-mcp"),
+        "MCP_INTERNAL_TOKEN": os.getenv("MCP_INTERNAL_TOKEN", "").strip(),
+        "MCP_INTERNAL_BASE_URL": os.getenv("MCP_INTERNAL_BASE_URL", "http://127.0.0.1:5000").rstrip("/"),
+        "MCP_HTTP_TIMEOUT": float(os.getenv("MCP_HTTP_TIMEOUT", "120")),
+        "MCP_QUERY_MAX_CHARS": int(os.getenv("MCP_QUERY_MAX_CHARS", "4000")),
+        "MCP_RESULT_LIMIT": int(os.getenv("MCP_RESULT_LIMIT", "6")),
+        "MCP_RESULT_MAX_CHARS": int(os.getenv("MCP_RESULT_MAX_CHARS", "1500")),
+
     }
     # 配置验证
     critical_configs = {
@@ -591,7 +600,8 @@ def build_reranker(model_name: str, device: str):
 def build_runtime():
     with Timer("build_runtime"):
         config = load_config()
-        safe_config = {key: value for key, value in config.items() if key != "VLLM_API_KEY"}
+        secret_keys = {"VLLM_API_KEY", "MCP_INTERNAL_TOKEN"}
+        safe_config = {key: value for key, value in config.items() if key not in secret_keys}
         debug_log("config=", json.dumps(safe_config, ensure_ascii=False))
 
         # 先验证远程依赖，避免 Qdrant 不可用时仍占用 GPU 加载模型。

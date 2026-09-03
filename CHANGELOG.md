@@ -6,6 +6,22 @@
 
 ---
 
+## [2.1.0] - 2026-09-03
+
+### Added
+
+- 新增可选 stdio MCP Bridge，暴露 `search_lab_knowledge` 纯检索工具与 `list_lab_catalog` 目录工具
+- 新增仅接受本机 loopback + Bearer Token 的内部 JSON API，MCP 调用与原 Web 问答共用并发限制和唯一 RAG 运行时
+- 新增 `setup_mcp.sh` 与 `start_mcp.sh`，使用独立 `rag-mcp` 环境并自动生成内部 Token
+- 新增 MCP 鉴权、结果上限、停止最终回答生成、目录投影及 SDK 内存客户端契约测试
+
+### Changed
+
+- RAG 流式入口的 `persist_history=False` 能力供 MCP 旁路复用；原 `/ask_stream`、SSE 协议和启动链路保持不变
+- 运行时调试日志同时隐藏 vLLM API Key 与 MCP 内部 Token
+
+---
+
 ## [2.0.2] - 2026-09-02
 
 ### Fixed

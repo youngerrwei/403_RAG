@@ -28,6 +28,8 @@ flowchart LR
 ```mermaid
 flowchart TB
     A["用户浏览器 (前端)<br>templates/index.html"] -->|"SSE 流式连接"| B["Flask Web 服务 (web_app.py)<br>用户认证 · SSE 流式接口 · 对话历史管理 · 并发控制"]
+    G["MCP Host / DeepSeek Harness"] -->|"stdio"| H["MCP Bridge (mcp_server.py)<br>独立轻量环境 · 不加载模型"]
+    H -->|"loopback JSON + Bearer Token"| B
     B -->|"调用核心 RAG 流程"| C["RAG 核心引擎 (rag_agent.py)<br>查询路由 · 查询改写 · 混合检索 · 重排序 · 父块展开 · 流式生成"]
     C --> D["vLLM<br>Qwen3-8B-Instruct<br>(GPU 3)"]
     C --> E["Qdrant<br>向量数据库<br>(远程部署)"]
@@ -41,6 +43,7 @@ flowchart TB
 - **vLLM 推理服务** 提供 OpenAI 兼容 API，负责查询改写和最终回答生成两个 LLM 调用阶段
 - **Qdrant 向量数据库** 存储子块向量索引和父块原文，支持 Dense + Sparse 混合检索
 - **Embedding / Reranker 模型** 在 RAG 引擎内部以本地推理方式运行，分别负责查询/文档向量化和精排打分
+- **MCP Bridge（可选）** 只做 stdio/JSON 协议转换；检索工具在 `retrieval` 元数据产生后关闭标准 RAG 生成器，不进入最终答案生成，也不写入历史
 
 ---
 
@@ -53,6 +56,7 @@ flowchart TB
 | Reranker | BAAI/bge-reranker-v2-m3 (CrossEncoder) |
 | 向量数据库 | Qdrant (远程部署) |
 | Web 框架 | Flask + SSE 流式响应 |
+| MCP（可选） | MCP Python SDK v2 + stdio；本机 Token 认证 JSON 旁路 |
 | 前端 UI | HTML5 + CSS3 (Flexbox/Grid/backdrop-filter) + Vanilla JS，Lucide Icons (CDN)，暗色模式双支持 |
 | 硬件 | 4 卡 GPU 4090 24GB（GPU 2: Embedding + Reranker, GPU 3: vLLM） |
 
@@ -108,6 +112,21 @@ flowchart LR
 8. **父块展开**：从独立 Collection 通过 `scroll` + Filter 批量查询父块原文，累计字符数不超过 `MAX_CONTEXT_CHARS`（3000）
 9. **LLM 流式生成**：调用 vLLM OpenAI 兼容 API 流式生成回答，同时计算覆盖度评估和引用溯源
 10. **SSE 推送**：通过 Server-Sent Events 将流式 token、状态变更、元数据实时推送至前端
+
+### MCP 纯检索旁路
+
+```mermaid
+flowchart LR
+    A["MCP Host"] -->|"stdio tools/call"| B["mcp_server.py"]
+    B -->|"127.0.0.1 + Bearer Token"| C["web_app.py 私有 API"]
+    C --> D["ask_stream<br>persist_history=false"]
+    D --> E["路由 → 改写 → 混合检索 → 重排 → 父块展开"]
+    E --> F["retrieval 元数据"]
+    F --> G["有界 MCP 工具结果"]
+    F -.->|"关闭生成器，不执行"| H["最终答案生成"]
+```
+
+该旁路复用 Web 进程中的模型、Qdrant 客户端、缓存和并发信号量。内部 API 不对非 loopback 对端开放，Token 为空时保持禁用；MCP 子进程由 Host 按需启动和关闭，不属于 `start_rag.sh` 的生命周期。
 
 ---
 
