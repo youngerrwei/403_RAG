@@ -27,9 +27,10 @@ from qdrant_client.http import models as rest
 from langchain_qdrant import QdrantVectorStore
 from sentence_transformers import CrossEncoder
 
-from logger import get_logger
+from .logger import get_logger
+from .paths import PROJECT_ROOT
 
-load_dotenv()
+load_dotenv(PROJECT_ROOT / ".env")
 
 # =========================
 # 全局状态
@@ -76,7 +77,7 @@ def clear_user_chat_history(username: str):
 # =========================
 # 历史记录本地文件管理（按日期分离存储）
 # =========================
-HISTORY_DIR = os.path.join(os.getcwd(), "data", "chat_histories")
+HISTORY_DIR = str(PROJECT_ROOT / "data" / "chat_histories")
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
 

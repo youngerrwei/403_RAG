@@ -1,2 +1,13 @@
 水下可见光通信关键技术.pdf
 .env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+logs/
+config/users.json
+data/.convert_state
+data/.ingest_state
+data/.ingest_manifest
+data/.auto_ingest.lock
+data/chat_histories/
+data/summary_cache/

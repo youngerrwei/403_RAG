@@ -3,11 +3,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/scripts/runtime_common.sh"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/runtime_common.sh"
 
-ENV_FILE="${RAG_ENV_FILE:-$SCRIPT_DIR/.env}"
-DATA_DIR="$SCRIPT_DIR/data"
-RAG_LOG_DIR="$SCRIPT_DIR/logs"
+ENV_FILE="${RAG_ENV_FILE:-$PROJECT_ROOT/.env}"
+DATA_DIR="$PROJECT_ROOT/data"
+RAG_LOG_DIR="$PROJECT_ROOT/logs"
 PID_WEBAPP="$DATA_DIR/.web_app.pid"
 LOCK_FILE="$DATA_DIR/.rag_manager.lock"
 mkdir -p "$DATA_DIR" "$RAG_LOG_DIR"
@@ -84,7 +85,7 @@ preflight_check() {
         echo "[信息] Qdrant 可达，必要集合完整"
     elif [[ -n "$RAG_PYTHON" ]] && http_get_body "$RAG_PYTHON" \
         "http://${QDRANT_HOST}:${QDRANT_PORT}/collections" 3 >/dev/null 2>&1; then
-        echo "[警告] Qdrant 可达但必要集合缺失，请在文档盘挂载后执行: bash auto_ingest.sh --full"
+        echo "[警告] Qdrant 可达但必要集合缺失，请在文档盘挂载后执行: bash scripts/auto_ingest.sh --full"
     else
         echo "[警告] Qdrant 当前不可达，Web 将以 degraded 模式启动"
     fi
@@ -107,8 +108,9 @@ start_web() {
     [[ -n "$RAG_PYTHON" ]] || { echo "[错误] conda 环境不存在或无 Python: $RAG_CONDA_ENV"; return 1; }
     echo "[信息] 使用 $RAG_PYTHON 启动 Web"
     (
-        cd "$SCRIPT_DIR"
-        nohup "$RAG_PYTHON" web_app.py 9>&- >"$RAG_LOG_DIR/web_app.log" 2>&1 &
+        cd "$PROJECT_ROOT"
+        export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+        nohup "$RAG_PYTHON" -m lab_rag.web_app 9>&- >"$RAG_LOG_DIR/web_app.log" 2>&1 &
         printf '%s\n' "$!" > "$PID_WEBAPP"
     )
     pid="$(<"$PID_WEBAPP")"
@@ -211,5 +213,5 @@ case "$command" in
         fi
         do_start ;;
     status) do_status ;;
-    *) echo "用法: bash start_rag.sh {start|stop [--all]|restart [--all]|status}"; exit 1 ;;
+    *) echo "用法: bash scripts/start_rag.sh {start|stop [--all]|restart [--all]|status}"; exit 1 ;;
 esac

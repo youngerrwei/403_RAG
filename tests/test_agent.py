@@ -1,6 +1,11 @@
-# app_test.py
+# test_agent.py
 
-from agent_entry import ask_agent
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from lab_rag.agent_entry import ask_agent
 
 
 def pretty_print_title(title: str):

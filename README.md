@@ -1,7 +1,7 @@
 # LAB 403 RAG 知识库系统
 
 > Author：youngerrwei（韦子扬）<br>
-> 当前版本：v2.1.1
+> 当前版本：v3.0.0
 
 ## 项目概述
 
@@ -17,7 +17,7 @@
 - **bge-m3 / bge-reranker-v2-m3**：Embedding 与重排序模型
 - **可选 MCP Bridge**：通过 stdio 暴露纯检索与目录工具，复用 Web 进程中的唯一 RAG 运行时
 
-> 详细架构设计、数据流和技术决策请参阅 [ARCHITECTURE.md](ARCHITECTURE.md)
+> 详细架构设计、数据流和技术决策请参阅 [ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ### 环境架构
 
@@ -40,7 +40,7 @@
 - Qdrant 6333 端口可达，并使用持久化存储或可恢复快照
 - `DOCS_PATH` 指向已挂载、可读的文档目录，而不只是一个同名空目录
 
-以下命令应在项目根目录执行。若使用其他配置文件，可统一设置 `RAG_ENV_FILE=/绝对路径/自定义.env`；`convert_to_md.sh`、入库与启动脚本都会使用它。
+以下命令应在项目根目录执行。若使用其他配置文件，可统一设置 `RAG_ENV_FILE=/绝对路径/自定义.env`；`scripts/convert_to_md.sh`、入库与启动脚本都会使用它。
 
 ## 快速开始
 
@@ -49,10 +49,10 @@
 > **推荐**：可使用一键环境准备脚本完成以下所有步骤：
 >
 > ```bash
-> bash setup_env.sh
+> bash scripts/setup_env.sh
 > ```
 >
-> 该脚本会创建或验证三个 conda 环境、安装对应依赖、从 `.env.example` 初始化本机 `.env`、自动生成随机 Flask 密钥，并输出环境检查报告。支持 `--vllm`、`--mineru`、`--rag`、`--skip-vllm`、`--skip-mineru` 和 `--force`，详见 `bash setup_env.sh --help`。
+> 该脚本会创建或验证三个 conda 环境、安装对应依赖、从 `.env.example` 初始化本机 `.env`、自动生成随机 Flask 密钥，并输出环境检查报告。支持 `--vllm`、`--mineru`、`--rag`、`--skip-vllm`、`--skip-mineru` 和 `--force`，详见 `bash scripts/setup_env.sh --help`。
 >
 > `--force` 会重建选中的 conda 环境，属于破坏性维护操作；执行前先确认环境名和选择范围。
 
@@ -64,7 +64,7 @@
 # ─── 环境 1：rag（RAG 主服务）───
 conda create -n rag python=3.10 -y
 conda activate rag
-python -m pip install -r requirements-rag.txt
+python -m pip install -r requirements/rag.txt
 
 # ─── 环境 2：rag-vllm（推理服务）───
 conda create -n rag-vllm python=3.10 -y
@@ -78,7 +78,7 @@ pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 pip install uv && uv pip install -U "mineru[all]"
 
 # ─── 下载模型 ───
-bash download_model.sh                    # 下载 Qwen3-8B（默认从 ModelScope）
+bash scripts/download_model.sh                    # 下载 Qwen3-8B（默认从 ModelScope）
 # Embedding 和 Reranker 模型需手动放到 models/ 目录：
 #   models/bge-m3
 #   models/bge-reranker-v2-m3
@@ -88,36 +88,36 @@ bash download_model.sh                    # 下载 Qwen3-8B（默认从 ModelSco
 
 ```bash
 # Step 1: 创建/验证三套环境，并生成私有 .env
-bash setup_env.sh
+bash scripts/setup_env.sh
 
 # Step 2: 编辑 .env，确认 Qdrant、文档目录、GPU 与本地模型路径
-# .env 已被 Git 忽略；FLASK_SECRET_KEY 由 setup_env.sh 自动随机生成
+# .env 已被 Git 忽略；FLASK_SECRET_KEY 由 scripts/setup_env.sh 自动随机生成
 # 对共享盘部署，还要确认 DOCS_PATH 已实际挂载且包含预期文件
 find /mnt/cpu_share -type f -print -quit
 
 # Step 3: 下载 LLM，并确认另外两个模型也位于配置指定目录
-bash download_model.sh
+bash scripts/download_model.sh
 # ./models/bge-m3
 # ./models/bge-reranker-v2-m3
 
 # Step 4: 在明确的 RAG 环境中创建登录用户
-conda run -n rag python create_user.py
+PYTHONPATH=src conda run -n rag python -m lab_rag.create_user
 # 若 .env 修改了 RAG_CONDA_ENV，请将上面的 rag 替换为对应环境名
 
 # Step 5: 转换文档为 Markdown（内部使用 rag-mineru 环境）
-bash convert_to_md.sh --full
+bash scripts/convert_to_md.sh --full
 
 # Step 6: 先启动 vLLM（入库摘要增强需要它）
-bash start_vllm.sh --background
+bash scripts/start_vllm.sh --background
 
 # Step 7: 首次全量入库
-bash auto_ingest.sh --full
+bash scripts/auto_ingest.sh --full
 
 # Step 8: 一键启动系统；已健康的 vLLM 会被复用，只启动 Web
-bash start_rag.sh start
+bash scripts/start_rag.sh start
 
 # Step 9: 两种方式验证状态
-bash start_rag.sh status
+bash scripts/start_rag.sh status
 curl http://127.0.0.1:5000/api/health
 ```
 
@@ -126,30 +126,30 @@ curl http://127.0.0.1:5000/api/health
 完成首次部署后，日常启动只有一条命令：
 
 ```bash
-bash start_rag.sh start
+bash scripts/start_rag.sh start
 ```
 
 ### 日常运维流程
 
 ```bash
 # 新增文档后：转换 + 增量入库
-bash convert_to_md.sh          # 仅转换新增/修改的文档
-bash auto_ingest.sh            # 有变化时执行幂等增量覆盖
+bash scripts/convert_to_md.sh          # 仅转换新增/修改的文档
+bash scripts/auto_ingest.sh            # 有变化时执行幂等增量覆盖
 
 # 服务管理
-bash start_rag.sh status       # 查看服务状态
-bash start_rag.sh restart      # 重启 web_app（vLLM 保持运行）
-bash start_rag.sh stop         # 停止 web_app（vLLM 保持运行）
-bash start_rag.sh stop --all   # 同时停止 web_app + vLLM
+bash scripts/start_rag.sh status       # 查看服务状态
+bash scripts/start_rag.sh restart      # 重启 web_app（vLLM 保持运行）
+bash scripts/start_rag.sh stop         # 停止 web_app（vLLM 保持运行）
+bash scripts/start_rag.sh stop --all   # 同时停止 web_app + vLLM
 
 # 重建知识库（修改了切块参数/Embedding 模型后必须执行）
-bash auto_ingest.sh --destroy --force
-bash auto_ingest.sh --full
+bash scripts/auto_ingest.sh --destroy --force
+bash scripts/auto_ingest.sh --full
 ```
 
 ## 脚本使用详解
 
-### convert_to_md.sh — 文档格式转换
+### scripts/convert_to_md.sh — 文档格式转换
 
 将 PDF/DOCX/DOC/PPTX/PPT 等格式转换为 Markdown，供入库系统使用。
 
@@ -169,19 +169,19 @@ bash auto_ingest.sh --full
 
 ```bash
 # 增量转换（仅处理新增/修改文件）
-bash convert_to_md.sh
+bash scripts/convert_to_md.sh
 
 # 全量转换（首次部署推荐）
-bash convert_to_md.sh --full
+bash scripts/convert_to_md.sh --full
 
 # 指定源目录和引擎
-bash convert_to_md.sh --source /data/papers --engine marker
+bash scripts/convert_to_md.sh --source /data/papers --engine marker
 
 # 使用 MinerU VLM 后端处理复杂 PDF
-bash convert_to_md.sh --engine mineru --backend vlm --device cuda:1
+bash scripts/convert_to_md.sh --engine mineru --backend vlm --device cuda:1
 
 # 预览模式：查看哪些文件会被转换
-bash convert_to_md.sh --dry-run
+bash scripts/convert_to_md.sh --dry-run
 ```
 
 #### 注意事项
@@ -196,7 +196,7 @@ bash convert_to_md.sh --dry-run
 
 ---
 
-### auto_ingest.sh — 知识库入库管理
+### scripts/auto_ingest.sh — 知识库入库管理
 
 管理知识库的增量入库、全量入库和集合销毁。
 
@@ -213,16 +213,16 @@ bash convert_to_md.sh --dry-run
 
 ```bash
 # 增量入库（日常使用）
-bash auto_ingest.sh
+bash scripts/auto_ingest.sh
 
 # 全量入库（首次部署 / 配置变更后）
-bash auto_ingest.sh --full
+bash scripts/auto_ingest.sh --full
 
 # 销毁知识库（交互式确认）
-bash auto_ingest.sh --destroy
+bash scripts/auto_ingest.sh --destroy
 
 # 强制销毁 + 全量重建（脚本/CI 场景）
-bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
+bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --full
 ```
 
 #### 增量检测机制
@@ -237,17 +237,17 @@ bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
 - **文件锁**：`data/.auto_ingest.lock`，防止并发执行
 - **日志文件**：`logs/auto_ingest.log`
 - 失败时不更新状态文件，下次运行自动重试
-- 日常模式只用变更检测决定是否启动任务；一旦触发，`ingest.py` 仍会扫描全部 Markdown，并以确定性 ID 幂等覆盖，集合不会重建
+- 日常模式只用变更检测决定是否启动任务；一旦触发，`src/lab_rag/ingest.py` 仍会扫描全部 Markdown，并以确定性 ID 幂等覆盖，集合不会重建
 - 日常模式自动设置 `QDRANT_RECREATE_COLLECTION=false`
 - 子块或父块任一批失败都会令任务失败；成功覆盖后会清理同源旧 point
 - 配合 cron 时必须先转换再入库，否则新 PDF/DOCX 不会进入知识库：
   ```bash
-  0 3 * * * cd /path/to/403_RAG && { bash convert_to_md.sh && bash auto_ingest.sh; } >> logs/knowledge_cron.log 2>&1
+  0 3 * * * cd /path/to/403_RAG && { bash scripts/convert_to_md.sh && bash scripts/auto_ingest.sh; } >> logs/knowledge_cron.log 2>&1
   ```
 
 ---
 
-### start_rag.sh — 服务启动管理
+### scripts/start_rag.sh — 服务启动管理
 
 一键管理 vLLM 推理服务 + Flask Web 应用的生命周期。
 
@@ -265,12 +265,12 @@ bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
 #### 使用示例
 
 ```bash
-bash start_rag.sh start          # 启动全部服务
-bash start_rag.sh stop           # 仅停止 web_app（vLLM 保持运行）
-bash start_rag.sh stop --all     # 同时停止 web_app + vLLM
-bash start_rag.sh restart        # 仅重启 web_app（vLLM 保持运行）
-bash start_rag.sh restart --all  # 重启 web_app + vLLM
-bash start_rag.sh status         # 查看运行及健康状态
+bash scripts/start_rag.sh start          # 启动全部服务
+bash scripts/start_rag.sh stop           # 仅停止 web_app（vLLM 保持运行）
+bash scripts/start_rag.sh stop --all     # 同时停止 web_app + vLLM
+bash scripts/start_rag.sh restart        # 仅重启 web_app（vLLM 保持运行）
+bash scripts/start_rag.sh restart --all  # 重启 web_app + vLLM
+bash scripts/start_rag.sh status         # 查看运行及健康状态
 ```
 
 #### 启动预检逻辑（preflight_check）
@@ -287,15 +287,15 @@ bash start_rag.sh status         # 查看运行及健康状态
 
 #### 内部行为
 
-- **vLLM 启动**：调用一次 `start_vllm.sh --background`；同时验证 `/health`、带 API Key 的 `/v1/models` 及模型名
+- **vLLM 启动**：调用一次 `scripts/start_vllm.sh --background`；同时验证 `/health`、带 API Key 的 `/v1/models` 及模型名
 - **vLLM 就绪**：最长等待 300 秒；超时会安全停止本次创建的进程并返回非零
-- **web_app 启动**：使用 `RAG_CONDA_ENV` 对应解释器执行 `web_app.py`
+- **web_app 启动**：使用 `RAG_CONDA_ENV` 对应解释器执行 `python -m lab_rag.web_app`
 - **web_app 就绪**：只以 `/api/health` 的 `ok/degraded` 为准，最多等待 60 秒
 - **PID 管理**：`data/.vllm.pid` 和 `data/.web_app.pid`
 
 ---
 
-### start_vllm.sh — vLLM 推理服务
+### scripts/start_vllm.sh — vLLM 推理服务
 
 独立管理 vLLM 推理服务的启动，**在 `rag-vllm` 环境中执行**。
 
@@ -317,29 +317,29 @@ bash start_rag.sh status         # 查看运行及健康状态
 #### 使用示例
 
 ```bash
-# 后台启动（start_rag.sh 内部调用方式）
-bash start_vllm.sh --background
+# 后台启动（scripts/start_rag.sh 内部调用方式）
+bash scripts/start_vllm.sh --background
 
 # 前台启动（调试用）
-bash start_vllm.sh
+bash scripts/start_vllm.sh
 
 # 指定 GPU 后台启动
-bash start_vllm.sh --gpu 0,1 --background
+bash scripts/start_vllm.sh --gpu 0,1 --background
 
 # 停止 vLLM
-bash start_vllm.sh stop
+bash scripts/start_vllm.sh stop
 
 # 查看状态
-bash start_vllm.sh status
+bash scripts/start_vllm.sh status
 ```
 
 #### 注意事项
 
-- **环境依赖**：启动前须确保 `rag-vllm` 环境已由 `setup_env.sh --vllm` 创建
+- **环境依赖**：启动前须确保 `rag-vllm` 环境已由 `scripts/setup_env.sh --vllm` 创建
 - **端口检查**：只复用健康且模型匹配的服务；模型标识兼容配置相对路径与服务返回绝对路径，对身份不明的占用进程拒绝停止或覆盖
 - **健康检查**：轮询 `/health` + 带 API Key 的 `/v1/models`，默认 300 秒；超时严格返回非零
 - **PID 文件**：后台模式保存到 `data/.vllm.pid`
-- **模型路径**：本地路径不存在时提示运行 `download_model.sh`
+- **模型路径**：本地路径不存在时提示运行 `scripts/download_model.sh`
 - **端口**：默认 8000（由 .env 中 `VLLM_PORT` 控制）
 
 ## 可选 MCP 旁路
@@ -349,7 +349,7 @@ MCP 旁路提供两个纯工具，不生成最终答案，也不写入用户对�
 - `search_lab_knowledge`：完整复用现有路由、问题改写、Dense + Sparse、RRF、重排序和父块展开，在开始最终 LLM 回答前停止并返回有界原文证据。
 - `list_lab_catalog`：复用现有目录/文件浏览能力。
 
-桥接进程不导入 `rag_agent.py`，而是使用随机 Bearer Token 调用 Web 进程内仅接受真实 loopback 对端的私有 JSON API。因此 Embedding、Reranker、Qdrant 客户端仍只在原 Web 进程加载一份，原 `/ask_stream`、前端和 `start_rag.sh` 行为不变。
+桥接进程不导入 `src/lab_rag/rag_agent.py`，而是使用随机 Bearer Token 调用 Web 进程内仅接受真实 loopback 对端的私有 JSON API。因此 Embedding、Reranker、Qdrant 客户端仍只在原 Web 进程加载一份，原 `/ask_stream`、前端和 `scripts/start_rag.sh` 行为不变。
 
 ### 准备与验证
 
@@ -357,16 +357,16 @@ MCP 旁路提供两个纯工具，不生成最终答案，也不写入用户对�
 
 ```bash
 # 创建独立 rag-mcp 环境、安装 MCP SDK，并向私有 .env 写入随机 Token
-bash setup_mcp.sh
+bash scripts/setup_mcp.sh
 
-# 如果 setup_mcp.sh 刚生成或更新了 Token，重启 Web 使其读取新值
-bash start_rag.sh restart
+# 如果 scripts/setup_mcp.sh 刚生成或更新了 Token，重启 Web 使其读取新值
+bash scripts/start_rag.sh restart
 
 # 可选：用 MCP Inspector 进行交互验证（Web 必须已运行）
-conda run -n rag-mcp mcp dev mcp_server.py
+PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 ```
 
-`start_mcp.sh` 不需要常驻管理：MCP Host 会按需启动这个 stdio 子进程，并在会话结束时关闭它。脚本的 stdout 专用于 MCP 协议，诊断日志写入 stderr。
+`scripts/start_mcp.sh` 不需要常驻管理：MCP Host 会按需启动这个 stdio 子进程，并在会话结束时关闭它。脚本的 stdout 专用于 MCP 协议，诊断日志写入 stderr。
 
 ### DeepSeek Harness 配置示例
 
@@ -380,7 +380,7 @@ conda run -n rag-mcp mcp dev mcp_server.py
         serverName: lab-rag
         transport: stdio
         command: bash
-        args: ['/absolute/path/lab_rag/start_mcp.sh']
+        args: ['/absolute/path/lab_rag/scripts/start_mcp.sh']
         cwd: '/absolute/path/lab_rag'
         toolCallTimeoutMs: 120000
         failOnStartupError: false
@@ -390,7 +390,7 @@ conda run -n rag-mcp mcp dev mcp_server.py
 
 ## 环境配置（.env）
 
-仓库只提交 `.env.example`；`setup_env.sh` 会创建被 Git 忽略的本机 `.env` 并生成随机 Flask 密钥。关键配置如下：
+仓库只提交 `.env.example`；`scripts/setup_env.sh` 会创建被 Git 忽略的本机 `.env` 并生成随机 Flask 密钥。关键配置如下：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
@@ -417,7 +417,7 @@ conda run -n rag-mcp mcp dev mcp_server.py
 | `VLLM_STARTUP_TIMEOUT` | `300` | vLLM 就绪等待秒数 |
 | `WEBAPP_STARTUP_TIMEOUT` | `60` | Web 就绪等待秒数 |
 | `FLASK_SECRET_KEY` | 首次安装随机生成 | Session 签名密钥，至少 32 字符且不得提交 |
-| `MCP_INTERNAL_TOKEN` | `setup_mcp.sh` 随机生成 | 本机私有 MCP API 的 Bearer Token；留空时接口禁用 |
+| `MCP_INTERNAL_TOKEN` | `scripts/setup_mcp.sh` 随机生成 | 本机私有 MCP API 的 Bearer Token；留空时接口禁用 |
 | `MCP_INTERNAL_BASE_URL` | `http://127.0.0.1:5000` | MCP Bridge 访问现有 Web 进程的地址 |
 | `MCP_HTTP_TIMEOUT` | `120` | MCP Bridge 调用内部 API 的超时秒数 |
 | `MCP_QUERY_MAX_CHARS` | `4000` | MCP 查询最大字符数 |
@@ -444,10 +444,10 @@ conda run -n rag-mcp mcp dev mcp_server.py
 
 | 模式 | 命令 | 适用场景 |
 |------|------|----------|
-| 增量 | `bash auto_ingest.sh` | 日常新增/修改少量文档 |
-| 全量 | `bash auto_ingest.sh --full` | 首次部署、修改切块参数后 |
+| 增量 | `bash scripts/auto_ingest.sh` | 日常新增/修改少量文档 |
+| 全量 | `bash scripts/auto_ingest.sh --full` | 首次部署、修改切块参数后 |
 
-日常命令是“变更触发式幂等覆盖”：脚本根据 mtime 与 manifest 判断是否需要运行；触发后 `ingest.py` 会重新扫描全部 Markdown，但不重建集合。入库使用确定性 UUID（基于 source + parent_id + chunk_index 的 UUID5）。新子块和父块全部写入成功后，系统清理同源但不再出现的旧 ID，避免文档修改后残留陈旧向量。
+日常命令是“变更触发式幂等覆盖”：脚本根据 mtime 与 manifest 判断是否需要运行；触发后 `src/lab_rag/ingest.py` 会重新扫描全部 Markdown，但不重建集合。入库使用确定性 UUID（基于 source + parent_id + chunk_index 的 UUID5）。新子块和父块全部写入成功后，系统清理同源但不再出现的旧 ID，避免文档修改后残留陈旧向量。
 
 ### 重建知识库
 
@@ -458,7 +458,7 @@ conda run -n rag-mcp mcp dev mcp_server.py
 - Embedding 模型
 
 ```bash
-bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full
+bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --full
 ```
 
 ## 维护与恢复检查表
@@ -476,8 +476,8 @@ mountpoint /mnt/cpu_share
 curl -fsS http://172.18.216.71:6333/collections
 
 # 3. 启动并检查；只有 status=ok 才是完整就绪
-bash start_rag.sh start
-bash start_rag.sh status
+bash scripts/start_rag.sh start
+bash scripts/start_rag.sh status
 curl -fsS http://127.0.0.1:5000/api/health
 ```
 
@@ -486,8 +486,8 @@ curl -fsS http://127.0.0.1:5000/api/health
 ### Qdrant 或共享盘恢复
 
 1. 先恢复 Qdrant 持久化卷/快照与文档共享盘，不要对空目录直接执行销毁操作。
-2. 若 Qdrant 数据已恢复，执行 `bash start_rag.sh restart` 并确认健康状态转为 `ok`。
-3. 若无法恢复 Qdrant 数据，但文档盘完整，依次执行 `bash convert_to_md.sh --full`、启动 vLLM、再执行 `bash auto_ingest.sh --full` 重建两个集合。
+2. 若 Qdrant 数据已恢复，执行 `bash scripts/start_rag.sh restart` 并确认健康状态转为 `ok`。
+3. 若无法恢复 Qdrant 数据，但文档盘完整，依次执行 `bash scripts/convert_to_md.sh --full`、启动 vLLM、再执行 `bash scripts/auto_ingest.sh --full` 重建两个集合。
 4. 若文档盘和 Qdrant 都为空，先恢复源文档；否则无法重建知识库。
 
 ### 日志、回归测试与升级
@@ -500,17 +500,17 @@ tail -n 200 logs/convert_to_md.log
 tail -n 200 logs/auto_ingest.log
 
 # 在 RAG 主环境执行回归；自定义环境名时替换 rag
-conda run -n rag python test_reliability.py
-conda run -n rag python test_html.py
+conda run -n rag python tests/test_reliability.py
+conda run -n rag python tests/test_html.py
 ```
 
-依赖升级时，以 `requirements-rag.txt` 为 RAG 主环境直接依赖清单，修改后执行 `bash setup_env.sh --rag`、运行上述回归、再重启服务。升级或迁移前备份私有 `.env`、`config/users.json`、文档源目录和 Qdrant 持久化卷/快照；不要把密钥或密码哈希提交到版本库。
+依赖升级时，以 `requirements/rag.txt` 为 RAG 主环境直接依赖清单，修改后执行 `bash scripts/setup_env.sh --rag`、运行上述回归、再重启服务。升级或迁移前备份私有 `.env`、`config/users.json`、文档源目录和 Qdrant 持久化卷/快照；不要把密钥或密码哈希提交到版本库。
 
 ## API 端点
 
 ### GET /api/health（无需认证）
 
-健康检查端点，被 `start_rag.sh` 用于验证服务就绪。
+健康检查端点，被 `scripts/start_rag.sh` 用于验证服务就绪。
 
 ```bash
 curl http://127.0.0.1:5000/api/health
@@ -564,9 +564,9 @@ SSE 流式问答接口，需先登录获取 Session。
 
 ### 启动类问题
 
-**现象**：`start_rag.sh start` 报错 "模型目录不存在"
+**现象**：`scripts/start_rag.sh start` 报错 "模型目录不存在"
 - **原因**：`models/` 下缺少对应模型文件
-- **解决**：运行 `bash download_model.sh` 下载 LLM 模型；Embedding/Reranker 模型需手动放置
+- **解决**：运行 `bash scripts/download_model.sh` 下载 LLM 模型；Embedding/Reranker 模型需手动放置
 
 **现象**：vLLM 启动超时（默认 300 秒）
 - **原因**：GPU 显存不足或模型文件损坏
@@ -574,13 +574,13 @@ SSE 流式问答接口，需先登录获取 Session。
 
 **现象**：web_app 启动后 `/api/health` 返回 `"error"`
 - **原因**：关键 vLLM 服务不可用或鉴权配置不一致
-- **解决**：执行 `bash start_vllm.sh status`，核对 `VLLM_API_KEY`、模型名和 `logs/vllm_server.log`；Qdrant 单独不可达时应为 `degraded`
+- **解决**：执行 `bash scripts/start_vllm.sh status`，核对 `VLLM_API_KEY`、模型名和 `logs/vllm_server.log`；Qdrant 单独不可达时应为 `degraded`
 
 ### 入库类问题
 
 **现象**：日常入库未检测到预期文件
 - **原因**：`DOCS_PATH` 指错、共享盘未挂载、文件并非 `.md`，或状态/manifest 文件与实际目录不一致
-- **解决**：先确认挂载与路径；非 Markdown 文件先运行 `bash convert_to_md.sh`。状态确实不一致时执行 `bash auto_ingest.sh --full`
+- **解决**：先确认挂载与路径；非 Markdown 文件先运行 `bash scripts/convert_to_md.sh`。状态确实不一致时执行 `bash scripts/auto_ingest.sh --full`
 
 **现象**：入库后查询无结果
 - **原因**：检索缓存 TTL 为 300 秒，新入库内容最多 5 分钟延迟
@@ -624,15 +624,15 @@ SSE 流式问答接口，需先登录获取 Session。
 
 ### 环境类问题
 
-**现象**：`convert_to_md.sh` 报 "conda 环境 'rag-mineru' 不存在"
-- **原因**：未运行 setup_env.sh 创建环境
-- **解决**：运行 `bash setup_env.sh --mineru`
+**现象**：`scripts/convert_to_md.sh` 报 "conda 环境 'rag-mineru' 不存在"
+- **原因**：未运行 scripts/setup_env.sh 创建环境
+- **解决**：运行 `bash scripts/setup_env.sh --mineru`
 
-**现象**：`start_vllm.sh` 报 "conda 环境 'rag-vllm' 不存在"
-- **原因**：未运行 setup_env.sh 创建环境
-- **解决**：运行 `bash setup_env.sh --vllm`
+**现象**：`scripts/start_vllm.sh` 报 "conda 环境 'rag-vllm' 不存在"
+- **原因**：未运行 scripts/setup_env.sh 创建环境
+- **解决**：运行 `bash scripts/setup_env.sh --vllm`
 
-**现象**：setup_env.sh 安装时报 conda 参数不识别
+**现象**：scripts/setup_env.sh 安装时报 conda 参数不识别
 - **原因**：系统 conda 版本过旧
 - **解决**：更新 conda：`conda update -n base conda`
 
@@ -652,41 +652,28 @@ SSE 流式问答接口，需先登录获取 Session。
 
 ## 文件结构
 
-#### 当前在用文件
+```text
+lab_rag/
+├── src/lab_rag/          # 核心 Python 包、Web/MCP 入口和页面模板
+├── scripts/              # 环境准备、启动、入库、转换和诊断脚本
+├── tests/                # 自动化回归与前端完整性测试
+├── dev/                  # 本地开发辅助服务
+├── legacy/               # 不再参与生产链路的历史实验实现
+├── docs/                 # 架构、排障与归档文档
+├── requirements/         # 按运行环境分类的依赖清单
+├── data/samples/         # 仓库自带的样例文档
+├── .env.example          # 可提交的完整配置模板
+├── AGENTS.md             # AI Agent 协作规范
+├── CHANGELOG.md          # 版本变更记录
+└── VERSION               # 当前语义化版本
+```
 
-| 文件 | 用途 |
-|------|------|
-| `.env.example` | 可提交的完整配置模板；本机 `.env` 私有且被 Git 忽略 |
-| `requirements-rag.txt` | RAG 主环境直接依赖的唯一安装清单，由 `setup_env.sh --rag` 使用 |
-| `rag_agent.py` | 核心 RAG 流程：两级查询路由（规则+LLM）、问题改写、多路并行检索（Dense+Sparse）、RRF 融合、重排序、父块展开（独立 Collection 查询）、TTL 缓存、流式回答生成、文件系统工具 |
-| `web_app.py` | Flask 后端：登录认证（PBKDF2）、SSE 流式问答接口、历史管理 |
-| `mcp_server.py` | 轻量 stdio MCP Bridge：暴露纯检索与目录工具，通过本机私有 API 复用唯一 RAG 运行时 |
-| `ingest.py` | 知识库入库：Markdown 加载、标题结构切分、父子块切分（Small-to-Big）、质量过滤、批量写入 Qdrant |
-| `create_user.py` | 用户账号创建脚本 |
-| `scripts/runtime_common.sh` | Shell 公共运行库：安全加载 `.env`、解析项目相对路径、定位 Conda、检查端口/PID/HTTP 与 vLLM 模型身份 |
-| `setup_env.sh` | 环境准备一键脚本（依赖安装、模型检查、配置初始化） |
-| `setup_mcp.sh` | 可选 MCP 环境准备脚本：创建独立环境、安装 SDK、生成内部 Token |
-| `start_mcp.sh` | 供 MCP Host 按需启动的 stdio Bridge 入口 |
-| `start_vllm.sh` | vLLM 推理服务管理脚本（支持启动/停止/状态查看、前台/后台/多卡/健康检查） |
-| `start_rag.sh` | RAG 系统一键启动/停止/重启/状态查看脚本（管理 vLLM + web_app），支持启动前预检与 /api/health 就绪验证 |
-| `auto_ingest.sh` | 知识库变更触发式幂等覆盖脚本（mtime + manifest 检测，支持 cron 定时执行） |
-| `convert_to_md.sh` | 文档格式转换脚本（PDF/DOCX/PPTX → Markdown，支持 MinerU/Marker/Docling） |
-| `rag_tool.py` | ReAct 工具兼容适配器；复用 `rag_agent.py` 的唯一 RAG 运行时 |
-| `tools.py` | `use_agent=true` 时使用的请求级 ReAct 工具定义 |
-| `agent_entry.py` | `use_agent=true` 时由 Web 接口调用的 ReAct Agent 入口 |
-| `test_reliability.py` | 启动、健康检查、SSE、MCP 契约、并发释放、入库一致性与脚本语法的可靠性回归测试 |
-| `templates/index.html` | 对话前端页面（iOS 毛玻璃风格、暗色模式、中山大学校徽内联、Lucide 图标） |
-| `templates/login.html` | 登录页面（绿白渐变、校徽内联、制作者署名） |
+运行时产生的日志、PID、历史记录、缓存和用户凭据分别保存在根目录下的 `logs/`、`data/` 与 `config/`，均由 `.gitignore` 排除。所有管理命令仍从项目根目录执行，脚本会自行定位项目根目录，不依赖调用时的当前目录。
 
-#### 未使用 / 历史遗留文件
+主要入口：
 
-| 文件 | 说明 |
-|------|------|
-| `rag_core.py` | 早期 RAG 核心逻辑（已被 `rag_agent.py` 替代） |
-| `ingest_new.py` | 语义切分入库实验版本 |
-| `ingest_fiass.py` | FAISS 本地向量库入库（已改用 Qdrant） |
-| `test.py` | 环境连通性检查脚本 |
-| `test_qdrant_conn.py` | Qdrant 连接测试 |
-| `app_test.py` | 应用测试 |
-| `test_html.py` | HTML 页面测试脚本 |
-| `mock_server.py` | 前端预览用 Mock SSE 服务器（模拟流式响应，便于前端独立开发调试） |
+- Web 服务：`PYTHONPATH=src python -m lab_rag.web_app`
+- 知识入库：`PYTHONPATH=src python -m lab_rag.ingest`
+- 用户管理：`PYTHONPATH=src python -m lab_rag.create_user`
+- 部署与维护：`scripts/*.sh`
+- 可靠性回归：`tests/test_reliability.py`

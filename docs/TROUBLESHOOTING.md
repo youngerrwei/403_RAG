@@ -47,7 +47,7 @@
 
 ### 问题描述
 
-执行 `bash start_vllm.sh` 或 `bash start_rag.sh start` 后，vLLM 服务未能成功启动，健康检查超时。
+执行 `bash scripts/start_vllm.sh` 或 `bash scripts/start_rag.sh start` 后，vLLM 服务未能成功启动，健康检查超时。
 
 ### 排查命令
 
@@ -106,7 +106,7 @@ RuntimeError: No CUDA GPUs are available
 
 ### 问题描述
 
-执行 `bash auto_ingest.sh` 或 `python ingest.py` 后，文档未能成功写入 Qdrant 集合。
+执行 `bash scripts/auto_ingest.sh` 或 `PYTHONPATH=src python -m lab_rag.ingest` 后，文档未能成功写入 Qdrant 集合。
 
 ### 排查命令
 
@@ -164,7 +164,7 @@ ValueError: Expected vector size 1024, got 768
 | DOCS_PATH 不存在 | 确认 `.env` 中的 `DOCS_PATH=/mnt/cpu_share` 路径存在且有读权限 |
 | Qdrant 连接失败 | 检查远程 Qdrant 服务状态，确认网络连通性：`ping 172.18.216.71` |
 | Embedding 模型加载失败 | 确认 `models/bge-m3` 目录存在且包含完整模型文件 |
-| 集合维度不匹配 | 执行全量重建：`bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full` |
+| 集合维度不匹配 | 执行全量重建：`bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --full` |
 | 文件锁冲突 | 检查 `/tmp/auto_ingest.lock` 是否残留：`rm -f /tmp/auto_ingest.lock` |
 | GPU 设备错误 | 确认 `EMBEDDING_DEVICE=cuda:2` 可用：`python -c "import torch; print(torch.cuda.device_count())"` |
 
@@ -174,7 +174,7 @@ ValueError: Expected vector size 1024, got 768
 
 ### 问题描述
 
-执行 `python web_app.py` 或通过 `start_rag.sh` 启动 Web 服务失败，无法访问 `http://127.0.0.1:5000`。
+执行 `PYTHONPATH=src python -m lab_rag.web_app` 或通过 `scripts/start_rag.sh` 启动 Web 服务失败，无法访问 `http://127.0.0.1:5000`。
 
 ### 排查命令
 
@@ -192,7 +192,7 @@ grep "预热" logs/rag_web.log
 grep "FLASK_SECRET_KEY" .env
 
 # 验证模块导入是否正常
-python -c "import web_app"
+PYTHONPATH=src python -c "import lab_rag.web_app"
 ```
 
 ### 常见错误日志示例
@@ -220,7 +220,7 @@ ModuleNotFoundError: No module named 'flask'
 | 运行时预热失败 | 检查 Embedding/Reranker 模型路径和 GPU 可用性 |
 | SECRET_KEY 未设置 | 确认 `.env` 中 `FLASK_SECRET_KEY` 已设置有效值 |
 | 依赖缺失 | 执行 `pip install flask python-dotenv` 安装必要依赖 |
-| rag_agent 导入失败 | 检查 `rag_agent.py` 语法：`python -c "import ast; ast.parse(open('rag_agent.py').read())"` |
+| rag_agent 导入失败 | 检查 `src/lab_rag/rag_agent.py` 语法：`python -c "import ast; ast.parse(open('src/lab_rag/rag_agent.py').read())"` |
 
 ---
 
@@ -385,9 +385,9 @@ grep "登录" logs/rag_web.log | tail -20
 
 | 问题 | 解决方案 |
 |------|---------|
-| 密码错误 | 使用 `python create_user.py` 重置用户密码 |
+| 密码错误 | 使用 `PYTHONPATH=src python -m lab_rag.create_user` 重置用户密码 |
 | IP 被锁定 | 等待 15 分钟自动解锁，或重启 Web 服务清除内存中的锁定状态 |
-| users.json 不存在 | 执行 `python create_user.py` 创建用户文件 |
+| users.json 不存在 | 执行 `PYTHONPATH=src python -m lab_rag.create_user` 创建用户文件 |
 | SESSION 失效 | 检查 `FLASK_SECRET_KEY` 是否变更（变更后所有 session 失效） |
 
 ---
@@ -463,7 +463,7 @@ grep "Semaphore\|等待" logs/rag_web.log | tail -10
 
 | 问题 | 解决方案 |
 |------|----------|
-| CSP 问题 | 确认 `web_app.py` 中 CSP 头正确设置 |
+| CSP 问题 | 确认 `src/lab_rag/web_app.py` 中 CSP 头正确设置 |
 | CDN 不可达 | 检查服务器网络连通性（`curl https://unpkg.com`） |
 | 暗色模式 | 浏览器需支持 CSS3 媒体特性，推荐 Chrome 76+ / Firefox 67+ / Safari 12.1+ |
 
@@ -535,7 +535,7 @@ echo "========== 诊断完成 =========="
 将以上内容保存为脚本文件使用：
 
 ```bash
-bash start_rag.sh status
+bash scripts/start_rag.sh status
 ```
 
 或直接逐条执行关键检查：
@@ -582,7 +582,7 @@ DEBUG_MODE=true
 
 ```bash
 # 修改 .env 后重启 Web 服务
-bash start_rag.sh restart
+bash scripts/start_rag.sh restart
 ```
 
 ### 临时开启全量调试
@@ -595,7 +595,7 @@ LOG_LEVEL=DEBUG
 DEBUG_MODE=true
 
 # 重启服务使配置生效
-bash start_rag.sh restart
+bash scripts/start_rag.sh restart
 
 # 排查完成后恢复
 LOG_LEVEL=INFO
@@ -651,7 +651,7 @@ find logs/ -name "*.log.*" -delete
 # 4. 调高日志级别减少输出
 # 修改 .env: LOG_LEVEL=WARNING
 # 然后重启服务
-bash start_rag.sh restart
+bash scripts/start_rag.sh restart
 ```
 
 ### 定时清理（Cron）
@@ -667,9 +667,9 @@ bash start_rag.sh restart
 
 | 场景 | 命令 |
 |------|------|
-| 查看服务状态 | `bash start_rag.sh status` |
-| 重启所有服务 | `bash start_rag.sh restart` |
-| 全量重建知识库 | `bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full` |
+| 查看服务状态 | `bash scripts/start_rag.sh status` |
+| 重启所有服务 | `bash scripts/start_rag.sh restart` |
+| 全量重建知识库 | `bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --full` |
 | 检查 Python 语法 | `python -c "import ast; ast.parse(open('文件名.py').read())"` |
 | 实时 GPU 监控 | `nvidia-smi -l 1` |
 | 搜索所有错误日志 | `grep -h "ERROR" logs/rag_*.log` |

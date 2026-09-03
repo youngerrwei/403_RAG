@@ -2,24 +2,25 @@
 # 文件格式转换脚本：使用 MinerU/Marker/Docling 原子转换为 Markdown
 # 运行环境：MinerU 运行在独立的 conda 环境 rag-mineru（避免与 vLLM 的依赖冲突）
 # 用法:
-#   bash convert_to_md.sh                        # 增量转换（仅处理新增/修改文件）
-#   bash convert_to_md.sh --full                 # 全量转换
-#   bash convert_to_md.sh --engine mineru        # 指定转换引擎
-#   bash convert_to_md.sh --backend vlm          # 指定 MinerU 后端
-#   bash convert_to_md.sh --device cpu           # 指定运行设备
-#   bash convert_to_md.sh --dry-run              # 仅预览，不执行
-#   bash convert_to_md.sh --help                 # 显示帮助信息
+#   bash scripts/convert_to_md.sh                        # 增量转换（仅处理新增/修改文件）
+#   bash scripts/convert_to_md.sh --full                 # 全量转换
+#   bash scripts/convert_to_md.sh --engine mineru        # 指定转换引擎
+#   bash scripts/convert_to_md.sh --backend vlm          # 指定 MinerU 后端
+#   bash scripts/convert_to_md.sh --device cpu           # 指定运行设备
+#   bash scripts/convert_to_md.sh --dry-run              # 仅预览，不执行
+#   bash scripts/convert_to_md.sh --help                 # 显示帮助信息
 
 set -euo pipefail
 
 # ========== 基础配置 ==========
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENV_FILE="${RAG_ENV_FILE:-${SCRIPT_DIR}/.env}"
-STATE_FILE="${SCRIPT_DIR}/data/.convert_state"
-LOG_DIR="${SCRIPT_DIR}/logs"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ENV_FILE="${RAG_ENV_FILE:-${PROJECT_ROOT}/.env}"
+STATE_FILE="${PROJECT_ROOT}/data/.convert_state"
+LOG_DIR="${PROJECT_ROOT}/logs"
 LOG_FILE="${LOG_DIR}/convert_to_md.log"
 LOCK_FILE="/tmp/convert_to_md.lock"
-source "${SCRIPT_DIR}/scripts/runtime_common.sh"
+source "${SCRIPT_DIR}/runtime_common.sh"
 load_env_keys "${ENV_FILE}" DOCS_PATH MINERU_CONDA_ENV CONVERT_TIMEOUT CONVERT_MAX_RETRIES MAX_FILE_SIZE_MB MIN_OUTPUT_SIZE || true
 
 # ========== 兜底机制配置 ==========
@@ -77,7 +78,7 @@ log_debug() {
 
 # ========== 初始化目录 ==========
 mkdir -p "${LOG_DIR}"
-mkdir -p "${SCRIPT_DIR}/data"
+mkdir -p "${PROJECT_ROOT}/data"
 
 # ========== 帮助信息 ==========
 show_help() {
@@ -85,7 +86,7 @@ show_help() {
 文件格式转换脚本 - 使用 MinerU/Marker/Docling 将文档转换为 Markdown
 
 用法:
-  bash convert_to_md.sh [选项]
+  bash scripts/convert_to_md.sh [选项]
 
 选项:
   --source DIR       源目录（默认从 .env 读取 DOCS_PATH）
@@ -123,12 +124,12 @@ show_help() {
   - 使用 --full 可强制重新转换所有文件
 
 示例:
-  bash convert_to_md.sh                                    # 增量转换（自动选引擎）
-  bash convert_to_md.sh --full                             # 全量转换
-  bash convert_to_md.sh --engine mineru --backend vlm      # 使用 MinerU VLM 后端
-  bash convert_to_md.sh --source ./data --full             # 指定目录全量转换
-  bash convert_to_md.sh --dry-run                          # 预览将要转换的文件
-  bash convert_to_md.sh --device cpu                       # 使用 CPU 转换
+  bash scripts/convert_to_md.sh                                    # 增量转换（自动选引擎）
+  bash scripts/convert_to_md.sh --full                             # 全量转换
+  bash scripts/convert_to_md.sh --engine mineru --backend vlm      # 使用 MinerU VLM 后端
+  bash scripts/convert_to_md.sh --source ./data --full             # 指定目录全量转换
+  bash scripts/convert_to_md.sh --dry-run                          # 预览将要转换的文件
+  bash scripts/convert_to_md.sh --device cpu                       # 使用 CPU 转换
 EOF
 }
 
@@ -215,7 +216,7 @@ if [[ -z "$CONDA_CMD" ]]; then
 fi
 if [[ -z "$(conda_env_prefix "$CONDA_CMD" "$CONDA_ENV_NAME")" ]]; then
     log_error "conda 环境 '${CONDA_ENV_NAME}' 不存在"
-    echo -e "${YELLOW}[提示] 请先运行: bash setup_env.sh --mineru${NC}"
+    echo -e "${YELLOW}[提示] 请先运行: bash scripts/setup_env.sh --mineru${NC}"
     exit 1
 fi
 log_info "使用 conda 环境: ${CONDA_ENV_NAME}"
@@ -1628,8 +1629,8 @@ log_info "========== 转换结束 =========="
 # ========== 后续操作提示 ==========
 if [[ ${total_success} -gt 0 ]]; then
     echo -e "${GREEN}转换完成！可执行以下命令进行知识入库：${NC}"
-    echo "  bash auto_ingest.sh        # 增量入库（推荐）"
-    echo "  bash auto_ingest.sh --full # 全量入库"
+    echo "  bash scripts/auto_ingest.sh        # 增量入库（推荐）"
+    echo "  bash scripts/auto_ingest.sh --full # 全量入库"
     echo ""
 fi
 

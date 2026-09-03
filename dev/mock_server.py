@@ -1,12 +1,13 @@
 """
 Mock Server - 用于在不依赖 vLLM 和 Qdrant 的情况下预览前端页面效果。
-运行: python mock_server.py
+运行: python dev/mock_server.py
 访问: http://127.0.0.1:5001
 """
 
 import json
 import time
 import secrets
+from pathlib import Path
 
 from flask import (
     Flask,
@@ -20,7 +21,8 @@ from flask import (
     stream_with_context,
 )
 
-app = Flask(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+app = Flask(__name__, template_folder=str(PROJECT_ROOT / "src" / "lab_rag" / "templates"))
 app.secret_key = secrets.token_hex(32)
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Strict"

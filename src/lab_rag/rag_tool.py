@@ -6,8 +6,8 @@
 
 from typing import Dict, Generator
 
-from logger import get_logger
-from rag_agent import ask_stream, clear_user_history
+from .logger import get_logger
+from .rag_agent import ask_stream, clear_user_history
 
 _logger = get_logger("rag_tool")
 

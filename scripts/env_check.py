@@ -8,15 +8,19 @@ env_check.py
 4. 检查远程 Qdrant 是否可连接（如果尚未部署，会提示错误）
 
 运行方式：
-    python env_check.py
+    python scripts/env_check.py
 """
 
 import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 import requests
 from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def print_title(title: str) -> None:
@@ -34,7 +38,7 @@ def load_config() -> dict:
         dict: 包含项目所需核心配置项的字典
     """
     try:
-        load_dotenv()
+        load_dotenv(PROJECT_ROOT / ".env")
 
         config = {
             "VLLM_BASE_URL": os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),

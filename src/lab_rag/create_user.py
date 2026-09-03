@@ -10,16 +10,16 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from logger import get_logger
+from .logger import get_logger
+from .paths import PROJECT_ROOT, resolve_project_path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(PROJECT_ROOT / ".env")
 _configured_users_file = Path(os.getenv("USERS_FILE", "config/users.json"))
 USERS_FILE = (
     _configured_users_file
     if _configured_users_file.is_absolute()
-    else PROJECT_ROOT / _configured_users_file
+    else resolve_project_path(_configured_users_file)
 )
 PBKDF2_ITERATIONS = 200000
 _logger = get_logger("create_user")

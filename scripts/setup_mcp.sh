@@ -3,11 +3,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/scripts/runtime_common.sh"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$SCRIPT_DIR/runtime_common.sh"
 
-ENV_FILE="${RAG_ENV_FILE:-$SCRIPT_DIR/.env}"
+ENV_FILE="${RAG_ENV_FILE:-$PROJECT_ROOT/.env}"
 if [[ ! -f "$ENV_FILE" ]]; then
-    echo "[错误] 缺少本机 .env，请先运行 bash setup_env.sh" >&2
+    echo "[错误] 缺少本机 .env，请先运行 bash scripts/setup_env.sh" >&2
     exit 1
 fi
 
