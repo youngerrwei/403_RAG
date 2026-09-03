@@ -38,7 +38,7 @@ class RagBridgeError(RuntimeError):
 
 def _post_json(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     if not _INTERNAL_TOKEN:
-        raise RagBridgeError("MCP_INTERNAL_TOKEN 未配置，请先运行 setup_mcp.sh")
+        raise RagBridgeError("MCP_INTERNAL_TOKEN 未配置，请先运行 scripts/setup_mcp.sh")
 
     request_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -109,7 +109,7 @@ def create_mcp_server():
     try:
         from mcp.server import MCPServer
     except ImportError as exc:
-        raise RuntimeError("缺少 MCP SDK，请先运行 bash setup_mcp.sh") from exc
+        raise RuntimeError("缺少 MCP SDK，请先运行 bash scripts/setup_mcp.sh") from exc
 
     server = MCPServer(
         "lab-rag",

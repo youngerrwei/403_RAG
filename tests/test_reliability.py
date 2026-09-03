@@ -56,6 +56,35 @@ class ScriptContractTests(unittest.TestCase):
                 source = (PROJECT_ROOT / file_name).read_text(encoding="utf-8")
                 ast.parse(source, filename=file_name)
 
+    def test_package_has_no_legacy_absolute_internal_imports(self):
+        internal_modules = {
+            "agent_entry",
+            "create_user",
+            "ingest",
+            "logger",
+            "mcp_server",
+            "paths",
+            "rag_agent",
+            "rag_tool",
+            "tools",
+            "web_app",
+        }
+        for path in (PROJECT_ROOT / "src" / "lab_rag").glob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    self.assertFalse(
+                        node.level == 0 and node.module in internal_modules,
+                        f"{path.name}:{node.lineno} 仍使用旧式内部导入: {node.module}",
+                    )
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self.assertNotIn(
+                            alias.name,
+                            internal_modules,
+                            f"{path.name}:{node.lineno} 仍使用旧式内部导入: {alias.name}",
+                        )
+
     def test_shell_scripts_have_valid_bash_syntax(self):
         scripts = [
             "scripts/runtime_common.sh",
@@ -168,6 +197,22 @@ class ScriptContractTests(unittest.TestCase):
         self.assertIn("require_option_value", converter)
         self.assertIn("manifest_paths", ingest)
         self.assertIn("服务进程启动成功（degraded）", starter)
+
+    def test_shell_entrypoints_target_the_packaged_modules(self):
+        entrypoints = {
+            "scripts/start_rag.sh": "lab_rag.web_app",
+            "scripts/auto_ingest.sh": "lab_rag.ingest",
+            "scripts/start_mcp.sh": "lab_rag.mcp_server",
+        }
+        for script, module in entrypoints.items():
+            with self.subTest(script=script):
+                source = (PROJECT_ROOT / script).read_text(encoding="utf-8")
+                self.assertIn('PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"', source)
+                self.assertIn('export PYTHONPATH="$PROJECT_ROOT/src', source)
+                self.assertIn(f"-m {module}", source)
+
+        starter = (PROJECT_ROOT / "scripts" / "start_rag.sh").read_text(encoding="utf-8")
+        self.assertIn('bash "$SCRIPT_DIR/start_vllm.sh" --background', starter)
 
     def test_converter_help_and_missing_value_are_runtime_independent(self):
         converter = str(PROJECT_ROOT / "scripts" / "convert_to_md.sh")

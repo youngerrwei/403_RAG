@@ -1,7 +1,7 @@
 # LAB 403 RAG 知识库系统
 
 > Author：youngerrwei（韦子扬）<br>
-> 当前版本：v3.0.0
+> 当前版本：v3.0.1
 
 ## 项目概述
 
@@ -31,6 +31,37 @@
 | `rag-mcp`（可选） | stdio MCP 协议桥接 | MCP Python SDK；不加载模型 | 无 |
 
 > 所有管理脚本会自行定位 conda 并使用 `.env` 指定的环境，不依赖调用者当前激活的环境。
+
+## v3.0 启动方式变化
+
+目录整理改变了命令中的文件路径，但没有改变 Web 地址、API、SSE 协议、Qdrant 集合名称或 `.env` 配置键。所有命令仍应在项目根目录执行。
+
+| 场景 | v2.x 旧命令 | v3.x 当前命令 | 是否变化 |
+|------|-------------|---------------|----------|
+| 一键启动 | `bash start_rag.sh start` | `bash scripts/start_rag.sh start` | 脚本增加 `scripts/` 前缀 |
+| 查看状态 | `bash start_rag.sh status` | `bash scripts/start_rag.sh status` | 脚本增加 `scripts/` 前缀 |
+| 单独启动 vLLM | `bash start_vllm.sh --background` | `bash scripts/start_vllm.sh --background` | 脚本增加 `scripts/` 前缀 |
+| 全量入库 | `bash auto_ingest.sh --full` | `bash scripts/auto_ingest.sh --full` | 脚本增加 `scripts/` 前缀 |
+| 文档转换 | `bash convert_to_md.sh --full` | `bash scripts/convert_to_md.sh --full` | 脚本增加 `scripts/` 前缀 |
+| 创建用户 | `python create_user.py` | `PYTHONPATH=src python -m lab_rag.create_user` | 改为 Python 包入口 |
+| 直接启动 Web | `python web_app.py` | `PYTHONPATH=src python -m lab_rag.web_app` | 改为 Python 包入口 |
+| 直接执行入库 | `python ingest.py` | `PYTHONPATH=src python -m lab_rag.ingest` | 改为 Python 包入口 |
+| MCP Host 启动参数 | `/项目路径/start_mcp.sh` | `/项目路径/scripts/start_mcp.sh` | 路径增加 `scripts/` |
+
+推荐始终使用管理脚本。`scripts/start_rag.sh` 会完成以下调用链：
+
+```text
+scripts/start_rag.sh
+├── scripts/runtime_common.sh        读取配置、定位 Conda、检查进程与 HTTP
+├── scripts/start_vllm.sh            启动/复用 vLLM 并验证模型身份
+└── PYTHONPATH=src python -m lab_rag.web_app
+    ├── lab_rag.rag_agent            RAG 路由、检索、重排与生成
+    ├── lab_rag.agent_entry          use_agent=true 时的 ReAct 编排
+    ├── lab_rag.logger               控制台与文件日志
+    └── lab_rag/templates            登录页与问答页
+```
+
+启动成功后仍访问 `http://127.0.0.1:5000`，健康检查仍为 `GET /api/health`。`status="degraded"` 表示 Web 可用但检索组件未全部就绪；`status="error"` 返回 HTTP 503。
 
 ### 运行前提
 
@@ -677,3 +708,117 @@ lab_rag/
 - 用户管理：`PYTHONPATH=src python -m lab_rag.create_user`
 - 部署与维护：`scripts/*.sh`
 - 可靠性回归：`tests/test_reliability.py`
+
+### 根目录与项目配置文件
+
+| 文件 | 作用 | 主要使用者 / 注意事项 |
+|------|------|-----------------------|
+| `.env` | 本机实际运行配置，包含模型路径、设备、密钥、Qdrant、检索参数和运行目录 | 不提交 Git；由 `scripts/setup_env.sh` 从模板创建，所有生产入口都从项目根目录读取它 |
+| `.env.example` | 可提交的完整配置模板与推荐默认值 | 新部署复制为 `.env`；新增配置键时必须同步更新此文件和对应 `load_config()` |
+| `.gitignore` | 排除密钥、用户凭据、日志、PID、缓存、历史记录和 Python 构建缓存 | 防止运行时数据及敏感信息进入版本库 |
+| `README.md` | 安装、迁移、启动、入库、配置、维护和逐文件说明 | 新部署与日常运维的首要入口 |
+| `AGENTS.md` | AI Agent 和开发者必须遵守的代码、配置、SSE、版本及验证规范 | 修改代码前必须阅读 |
+| `CHANGELOG.md` | 按版本记录功能、修复与不兼容变更 | 发布时与 `VERSION` 同步更新 |
+| `VERSION` | 当前语义化版本号 | 纯文本单行；当前为 `3.0.1` |
+
+### 核心 Python 包 `src/lab_rag/`
+
+| 文件 | 作用 | 调用关系 / 运行时行为 |
+|------|------|-----------------------|
+| `src/lab_rag/__init__.py` | 声明 `lab_rag` Python 包 | 使核心模块可以通过 `python -m lab_rag.<module>` 和包内相对导入运行 |
+| `src/lab_rag/paths.py` | 统一计算 `PROJECT_ROOT` 并解析项目相对路径 | 被日志、Web、入库、用户管理和 Agent 模块使用，避免目录迁移后依赖当前工作目录 |
+| `src/lab_rag/logger.py` | 创建控制台与按日轮转的文件 Logger | 从根目录 `.env` 读取 `LOG_*`，相对 `LOG_DIR` 固定解析到项目根目录 |
+| `src/lab_rag/rag_agent.py` | 主 RAG 引擎：路由、改写、HyDE、多查询、Dense/Sparse 检索、RRF、重排、父块展开、覆盖率、引用与流式生成 | 被 `web_app.py`、`rag_tool.py` 和 `tools.py` 调用；共享唯一 Embedding、Reranker、Qdrant 与 LLM 运行时 |
+| `src/lab_rag/web_app.py` | Flask 服务入口：认证、Session、限流、历史记录、SSE、健康检查与 MCP 内部 API | `scripts/start_rag.sh` 以 `python -m lab_rag.web_app` 启动；`use_agent=true` 时包内导入 `agent_entry.py` |
+| `src/lab_rag/ingest.py` | 知识入库：Markdown 加载、清洗、父子分块、摘要增强、Embedding、Qdrant 建集与幂等写入 | `scripts/auto_ingest.sh` 以 `python -m lab_rag.ingest` 调用；同时维护子块和父块集合 |
+| `src/lab_rag/create_user.py` | 交互式创建或更新 Web 登录用户，使用 PBKDF2 哈希和原子文件替换 | 通过 `PYTHONPATH=src python -m lab_rag.create_user` 执行；默认写入根目录 `config/users.json` |
+| `src/lab_rag/mcp_server.py` | 轻量 stdio MCP Bridge，暴露知识检索与目录工具 | 不加载模型；通过 loopback Bearer Token 调用 Web 内部 API；由 `scripts/start_mcp.sh` 启动 |
+| `src/lab_rag/agent_entry.py` | 可选 ReAct Agent 编排层 | 复用 `rag_agent.py` 的 LLM、历史和工具，不创建第二套模型实例 |
+| `src/lab_rag/tools.py` | ReAct 请求级工具定义与用户名上下文 | 将目录浏览和 RAG 问答包装为 LangChain 工具，供 `agent_entry.py` 使用 |
+| `src/lab_rag/rag_tool.py` | RAG 问答工具兼容适配器 | 将 `rag_agent.ask_stream()` 聚合为 Agent 可调用的工具结果，并复用历史清理能力 |
+| `src/lab_rag/templates/index.html` | 主问答页面 | 解析完整 SSE 协议，展示路由、检索状态、引用、覆盖率、历史记录和流式回答 |
+| `src/lab_rag/templates/login.html` | 登录页面 | 由 Flask `render_template()` 渲染，提交凭据到 Web 登录接口 |
+
+### 运维与诊断脚本 `scripts/`
+
+| 文件 | 作用 | 调用关系 / 产生内容 |
+|------|------|---------------------|
+| `scripts/runtime_common.sh` | Shell 公共函数库 | 安全读取指定 `.env` 键、解析根目录相对路径、定位 Conda/Python、检查端口/PID/HTTP、校验 vLLM 模型名；由其他 Shell 脚本 `source` |
+| `scripts/setup_env.sh` | 创建或校验 `rag`、`rag-vllm`、`rag-mineru` 环境并安装依赖 | 使用 `requirements/rag.txt`；可初始化 `.env` 和检查模型；日志写入 `logs/setup_env.log` |
+| `scripts/download_model.sh` | 下载 Qwen3 模型并校验关键文件 | 支持 ModelScope/HuggingFace；相对目标目录解析到项目根目录 `models/` |
+| `scripts/convert_to_md.sh` | 将 PDF、Office、图片和代码资料转换为 Markdown | 使用独立 `rag-mineru` 环境；维护 `data/.convert_state`，日志写入 `logs/convert_to_md.log` |
+| `scripts/auto_ingest.sh` | 增量触发、全量入库和安全销毁 Qdrant 集合 | 调用 `lab_rag.ingest`；维护 `.ingest_state`、`.ingest_manifest` 和锁文件，失败时不推进状态 |
+| `scripts/start_vllm.sh` | vLLM 启动、停止与状态检查 | 读取 GPU、模型和 API 配置；维护 `data/.vllm.pid`，日志写入 `logs/vllm_server.log` |
+| `scripts/start_rag.sh` | 整个 RAG 系统的推荐入口 | 预检 `.env`、模型、文档目录和 Qdrant，调用 `start_vllm.sh`，再启动 `lab_rag.web_app` 并验证 `/api/health` |
+| `scripts/setup_mcp.sh` | 创建可选 `rag-mcp` 环境并生成内部 Token | 更新本机 `.env` 中的 `MCP_INTERNAL_TOKEN`，完成后需要重启 Web |
+| `scripts/start_mcp.sh` | MCP Host 按需启动的 stdio 入口 | 校验 Token 和 MCP 环境，设置 `PYTHONPATH` 后运行 `python -m lab_rag.mcp_server`；stdout 专用于 MCP 协议 |
+| `scripts/env_check.py` | 环境、依赖、vLLM、Qdrant、模型和文档目录诊断 | 只做检查，不启动服务；从根目录 `.env` 读取配置 |
+| `scripts/check_qdrant.py` | 最小化 Qdrant 连通性探针 | 用于快速确认远端 Qdrant 是否可连接并列出集合 |
+
+### 测试与开发辅助
+
+| 文件 | 作用 | 使用方式 / 边界 |
+|------|------|-----------------|
+| `tests/test_reliability.py` | 可靠性契约回归 | 覆盖目录结构、Python/Shell 入口、包内导入、配置模板、健康检查、SSE 并发释放、入库一致性和 MCP；运行 `conda run -n rag python tests/test_reliability.py` |
+| `tests/test_html.py` | 前端静态完整性检查 | 无需启动服务，检查 `index.html` 的 DOM、样式和脚本约定 |
+| `tests/test_agent.py` | 交互式 ReAct Agent 冒烟测试 | 会调用真实 RAG/LLM 链路，不属于离线单元测试 |
+| `dev/mock_server.py` | 不依赖 Qdrant/vLLM 的前端 Mock 服务 | 运行 `python dev/mock_server.py`，复用生产模板并模拟登录、历史和 SSE 响应 |
+
+### 文档、历史实现与依赖
+
+| 文件 | 作用 | 注意事项 |
+|------|------|----------|
+| `docs/ARCHITECTURE.md` | 当前系统架构、数据流、检索设计与部署拓扑 | 描述 v3.x 当前链路 |
+| `docs/TROUBLESHOOTING.md` | 启动、模型、Qdrant、认证、SSE、入库和日志排障手册 | 命令已更新为 v3.x 路径 |
+| `docs/archive/SYSTEM_REPORT.md` | 历史系统评估报告 | 仅供演进追溯，其中路径和行数可能对应旧版本 |
+| `docs/archive/REFACTORING_DIFF.md` | 早期重构对比记录 | 仅供归档，不应作为当前启动命令依据 |
+| `legacy/rag_core.py` | 已由 `rag_agent.py` 替代的早期 RAG 实现 | 不被生产链路导入 |
+| `legacy/ingest_new.py` | 语义切分入库实验版本 | 不被生产链路调用 |
+| `legacy/ingest_fiass.py` | 早期 FAISS 入库实验版本；文件名保留历史拼写 | 当前生产使用 Qdrant，不应从启动脚本调用 |
+| `requirements/rag.txt` | RAG 主环境唯一直接依赖清单 | 由 `scripts/setup_env.sh --rag` 安装和校验；依赖说明见下一节 |
+
+### 样例资料 `data/samples/`
+
+| 文件 | 作用 |
+|------|------|
+| `data/samples/水下可见光通信关键技术.md` | 可直接用于入库验证的 Markdown 样例 |
+| `data/samples/水下可见光通信关键技术.pdf` | 上述资料的 PDF 源文件；因体积较大由 `.gitignore` 排除 |
+| `data/samples/20309071_韦子扬_江明_基于人工智能网络的水下无线光信号检测技术研究_最终版.pdf` | 水下光信号检测论文样例 |
+| `data/samples/暑期调研.docx` | Word 文档转换链路样例 |
+| `data/samples/论文、报告撰写格式规范Latex版.pdf` | 论文和报告格式规范样例 |
+
+`data/` 根目录同时保存运行时 PID、锁、入库/转换状态、摘要缓存和聊天历史；这些内容不是样例资料，已被 `.gitignore` 排除。
+
+### PyCharm 项目文件 `.idea/`
+
+| 文件 | 作用 |
+|------|------|
+| `.idea/lab_rag.iml` | 声明项目模块，并将 `src/` 标为源码目录、`tests/` 标为测试目录 |
+| `.idea/modules.xml` | 注册 PyCharm 模块文件 |
+| `.idea/misc.xml` | 记录项目 Python SDK 等通用设置 |
+| `.idea/deployment.xml` | 记录远程部署映射；包含机器相关配置，迁移环境时需要复核 |
+| `.idea/vcs.xml` | 将项目关联到 Git |
+| `.idea/inspectionProfiles/Project_Default.xml` | 项目级代码检查规则 |
+| `.idea/inspectionProfiles/profiles_settings.xml` | 代码检查配置启用状态 |
+| `.idea/workspace.xml` | 本机窗口、临时运行配置和工作区状态；不参与生产运行，团队提交时应谨慎处理 |
+
+## `requirements/rag.txt` 依赖说明
+
+| 依赖 | 在项目中的用途 |
+|------|----------------|
+| `flask` | Web 服务、认证、JSON API 与 SSE 响应 |
+| `python-dotenv` | 从项目根目录 `.env` 加载配置 |
+| `langchain` | Agent 与 RAG 编排的上层组件 |
+| `langchain-core` | Document、Prompt、Tool 等核心抽象 |
+| `langchain-openai` | 通过 OpenAI 兼容协议连接本地 vLLM |
+| `langchain-huggingface` | 加载本地 bge-m3 Embedding 模型 |
+| `langchain-qdrant` | LangChain 与 Qdrant 向量存储适配 |
+| `langchain-text-splitters` | 文档递归分块与父子块切分 |
+| `qdrant-client` | 集合管理、过滤、检索和 point 写入 |
+| `sentence-transformers` | 加载 bge-reranker-v2-m3 CrossEncoder 重排模型 |
+| `tiktoken` | 对话历史和上下文 Token 估算 |
+| `modelscope` | 国内网络环境下下载 Qwen 模型 |
+| `huggingface-hub` | 可选 HuggingFace 模型下载与仓库访问 |
+| `requests` | 入库摘要增强等 HTTP 请求 |
+
+这里只列 RAG 主环境的直接依赖；vLLM、MinerU 和 MCP 分别安装到独立 Conda 环境，避免 PyTorch、Paddle 或协议 SDK 的版本冲突。
