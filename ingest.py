@@ -1,3 +1,4 @@
+# 入库任务采用严格退出码，并在成功覆盖后清理同源旧 point。
 import os
 import re
 import sys
@@ -20,6 +21,7 @@ import threading
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, HnswConfigDiff, TextIndexParams, TextIndexType, TokenizerType
+from qdrant_client.http import models as rest
 from qdrant_client.http.models import PointStruct
 
 from langchain_qdrant import QdrantVectorStore
@@ -60,7 +62,7 @@ def load_config():
     load_dotenv(override=False)
 
     cfg = {
-        "DOCS_PATH": os.getenv("DOCS_PATH", "./data"),
+        "DOCS_PATH": os.getenv("DOCS_PATH", "/mnt/cpu_share"),
         "PARENT_CHUNK_SIZE": int(os.getenv("PARENT_CHUNK_SIZE", "1500")),
         "PARENT_CHUNK_OVERLAP": int(os.getenv("PARENT_CHUNK_OVERLAP", "200")),
         "CHILD_CHUNK_SIZE": int(os.getenv("CHILD_CHUNK_SIZE", "300")),
@@ -76,6 +78,7 @@ def load_config():
 
         "MIN_CHUNK_LENGTH": int(os.getenv("MIN_CHUNK_LENGTH", "120")),
         "INGEST_BATCH_SIZE": int(os.getenv("INGEST_BATCH_SIZE", "64")),
+        "EMBEDDING_INIT_TIMEOUT": int(os.getenv("EMBEDDING_INIT_TIMEOUT", "300")),
 
         # vLLM 配置（供摘要调用使用）
         "VLLM_BASE_URL": os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
@@ -93,7 +96,9 @@ def load_config():
         "SUMMARY_CACHE_DIR": os.getenv("SUMMARY_CACHE_DIR", "./data/summary_cache"),
     }
 
-    log(f"配置加载完成: {cfg}")
+    # 密钥只用于请求鉴权，禁止写入日志。
+    safe_cfg = {key: value for key, value in cfg.items() if key != "VLLM_API_KEY"}
+    log(f"配置加载完成: {safe_cfg}")
     return cfg
 
 
@@ -374,13 +379,19 @@ def ensure_parent_collection(client, collection_name: str):
         log(f"[INFO] 创建父块集合: {collection_name}（HNSW: m=32, ef_construct=200）")
 
 
+def generate_parent_point_id(item: dict) -> str:
+    """为父块生成稳定 ID，保证重复执行可幂等覆盖。"""
+    seed = f"parent|{item.get('source', 'unknown')}|{item['parent_id']}"
+    return str(uuid_module.uuid5(uuid_module.NAMESPACE_URL, seed))
+
+
 def store_parent_chunks_batch(client, collection_name: str, parent_chunks_data: list, summary_map: dict = None):
     """批量存储父块到独立集合"""
     if summary_map is None:
         summary_map = {}
     points = []
     for item in parent_chunks_data:
-        point_id = str(uuid_module.uuid5(uuid_module.NAMESPACE_URL, f"parent|{item.get('source', 'unknown')}|{item['parent_id']}"))
+        point_id = generate_parent_point_id(item)
         points.append(PointStruct(
             id=point_id,
             vector=[0.0, 0.0, 0.0, 0.0],
@@ -850,7 +861,7 @@ def split_documents(docs: List[Document], cfg: dict):
 
     except Exception as e:
         log(f"文本切块失败: {e}")
-        return [], [], {}
+        raise
 
 
 # ================= FILTER =================
@@ -879,7 +890,11 @@ def analyze_bad_chunk_reason(text: str, cfg: dict) -> str:
         return "too_many_digits"
 
     # 特殊字符检测：排除中英文标点
-    common_punct = re.sub(r'[\w\s\u4e00-\u9fff。，、；：？！""''（）【】《》\.\,\;\:\?\!\"\'\(\)\[\]\-\—\…]', '', text)
+    common_punct = re.sub(
+        r"[\w\s\u4e00-\u9fff。，、；：？！“”‘’（）【】《》.,;:?!\"'()\[\]\-—…]",
+        "",
+        text,
+    )
     if len(text) > 0 and len(common_punct) / len(text) > 0.25:
         return "too_many_special_chars"
 
@@ -946,7 +961,7 @@ def build_embeddings(cfg):
     初始化 embedding 模型（带超时保护）。
     """
     log("初始化 Embedding 模型")
-    timeout = int(os.getenv("EMBEDDING_INIT_TIMEOUT", "300"))
+    timeout = cfg["EMBEDDING_INIT_TIMEOUT"]
 
     try:
         def _init_embedding():
@@ -1104,6 +1119,47 @@ def generate_deterministic_id(source: str, content_hash: str, chunk_index: int) 
     return str(uuid_module.uuid5(uuid_module.NAMESPACE_URL, seed))
 
 
+def collect_existing_ids_by_source(client, collection_name: str, sources: set, source_key: str) -> dict:
+    """在覆盖写入前记录各源文件已有 point ID，供成功后清理陈旧块。"""
+    existing = {source: set() for source in sources}
+    if not sources or not client.collection_exists(collection_name):
+        return existing
+
+    for source in sources:
+        offset = None
+        while True:
+            points, offset = client.scroll(
+                collection_name=collection_name,
+                scroll_filter=rest.Filter(
+                    must=[rest.FieldCondition(key=source_key, match=rest.MatchValue(value=source))]
+                ),
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            existing[source].update(str(point.id) for point in points)
+            if offset is None:
+                break
+    return existing
+
+
+def delete_stale_ids(client, collection_name: str, old_ids: dict, new_ids: dict):
+    """仅在新子块和父块均成功写入后删除同源的旧 point。"""
+    stale_ids = set()
+    for source, ids in old_ids.items():
+        stale_ids.update(ids - new_ids.get(source, set()))
+    if not stale_ids:
+        return
+
+    client.delete(
+        collection_name=collection_name,
+        points_selector=rest.PointIdsList(points=sorted(stale_ids)),
+        wait=True,
+    )
+    log(f"[INFO] 已从 {collection_name} 清理 {len(stale_ids)} 个陈旧 point")
+
+
 # ================= SAVE =================
 
 def save_to_qdrant(docs: List[Document], embeddings, cfg: dict, parent_chunks_data: list = None, summary_map: dict = None):
@@ -1111,8 +1167,7 @@ def save_to_qdrant(docs: List[Document], embeddings, cfg: dict, parent_chunks_da
     log("开始写入 Qdrant")
 
     if not docs:
-        log("没有可写入的文档 chunk，跳过入库")
-        return
+        raise ValueError("没有可写入的文档 chunk")
 
     try:
         client = create_qdrant_client(cfg)
@@ -1121,10 +1176,7 @@ def save_to_qdrant(docs: List[Document], embeddings, cfg: dict, parent_chunks_da
 
         # 确保父块集合在所有数据写入之前已创建，避免后续检索时父块展开查询失败
         parent_collection = cfg.get("QDRANT_PARENT_COLLECTION", "lab_knowledge_base_parents")
-        try:
-            ensure_parent_collection(client, parent_collection)
-        except Exception as e:
-            log(f"[ERROR] 父块集合创建失败: {e}，父块数据将无法存储")
+        ensure_parent_collection(client, parent_collection)
 
         collection_name = cfg["QDRANT_COLLECTION_NAME"]
 
@@ -1138,15 +1190,37 @@ def save_to_qdrant(docs: List[Document], embeddings, cfg: dict, parent_chunks_da
             content_payload_key="page_content",
         )
 
-        # 为每个文档生成确定性 ID
+        # 为每个文档生成确定性 ID，并记录每个源文件本次应保留的 ID。
+        child_ids_by_source = {}
         for doc in docs:
             meta = doc.metadata
+            source = meta.get("source", "unknown")
             doc_id = generate_deterministic_id(
-                meta.get("source", "unknown"),
+                source,
                 meta.get("parent_id", "unknown"),
                 meta.get("chunk_index", 0)
             )
             meta["_qdrant_id"] = doc_id
+            child_ids_by_source.setdefault(source, set()).add(doc_id)
+
+        parent_chunks_data = parent_chunks_data or []
+        parent_ids_by_source = {}
+        for item in parent_chunks_data:
+            source = item.get("source", "")
+            parent_ids_by_source.setdefault(source, set()).add(generate_parent_point_id(item))
+
+        # 增量覆盖时先拍摄旧 ID；所有新数据写完后才执行清理，避免失败导致数据丢失。
+        incoming_sources = set(child_ids_by_source) | set(parent_ids_by_source)
+        if cfg.get("QDRANT_RECREATE_COLLECTION", False):
+            old_child_ids = {}
+            old_parent_ids = {}
+        else:
+            old_child_ids = collect_existing_ids_by_source(
+                client, collection_name, incoming_sources, "metadata.source"
+            )
+            old_parent_ids = collect_existing_ids_by_source(
+                client, parent_collection, incoming_sources, "source"
+            )
 
         batch_size = cfg.get("INGEST_BATCH_SIZE", 64)
         total = len(docs)
@@ -1165,10 +1239,11 @@ def save_to_qdrant(docs: List[Document], embeddings, cfg: dict, parent_chunks_da
             # 过滤掉 None 值后检查长度是否与文档数匹配
             filtered_ids = [i for i in ids if i is not None]
             if len(filtered_ids) != len(batch_docs):
-                log(f"[WARNING] 批次 {batch_idx+1}: IDs 数量({len(filtered_ids)})与文档数量({len(batch_docs)})不匹配，将使用自动生成 ID")
-                ids = None
-            else:
-                ids = filtered_ids
+                raise RuntimeError(
+                    f"批次 {batch_idx + 1}: IDs 数量({len(filtered_ids)})"
+                    f"与文档数量({len(batch_docs)})不匹配"
+                )
+            ids = filtered_ids
 
             # 指数退避重试，最多3次
             max_retries = 3
@@ -1191,14 +1266,16 @@ def save_to_qdrant(docs: List[Document], embeddings, cfg: dict, parent_chunks_da
             log(f"  批次 {batch_idx + 1}/{total_batches} 完成 ({end}/{total})")
 
         if failed_batches:
-            log(f"[WARNING] {len(failed_batches)} 个批次写入失败: {failed_batches}")
+            raise RuntimeError(f"{len(failed_batches)} 个子块批次写入失败: {failed_batches}")
 
         log(f"Qdrant 写入完成: 共 {total} 个文档")
 
         # 存储父块到独立集合（父块集合已在子块写入前创建）
         if parent_chunks_data:
-            parent_collection = cfg.get("QDRANT_PARENT_COLLECTION", "lab_knowledge_base_parents")
             store_parent_chunks_batch(client, parent_collection, parent_chunks_data, summary_map=summary_map or {})
+
+        delete_stale_ids(client, collection_name, old_child_ids, child_ids_by_source)
+        delete_stale_ids(client, parent_collection, old_parent_ids, parent_ids_by_source)
 
     except Exception as e:
         log(f"写入 Qdrant 失败: {e}")
@@ -1230,18 +1307,15 @@ def main():
 
         docs = load_documents(cfg["DOCS_PATH"])
         if not docs:
-            log("未加载到任何 .md 文档，请检查 DOCS_PATH 或文件后缀")
-            return
+            raise RuntimeError("未加载到任何 .md 文档，请检查 DOCS_PATH 或文件后缀")
 
         chunks, parent_chunks_data, summary_map = split_documents(docs, cfg)
         if not chunks:
-            log("切块结果为空，任务结束")
-            return
+            raise RuntimeError("切块结果为空")
 
         chunks = filter_chunks(chunks, cfg)
         if not chunks:
-            log("过滤后没有可用 chunk，任务结束")
-            return
+            raise RuntimeError("过滤后没有可用 chunk")
 
         embeddings = build_embeddings(cfg)
         save_to_qdrant(chunks, embeddings, cfg, parent_chunks_data=parent_chunks_data, summary_map=summary_map)
