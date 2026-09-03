@@ -53,6 +53,7 @@ flowchart TB
 | Reranker | BAAI/bge-reranker-v2-m3 (CrossEncoder) |
 | 向量数据库 | Qdrant (远程部署) |
 | Web 框架 | Flask + SSE 流式响应 |
+| 前端 UI | HTML5 + CSS3 (Flexbox/Grid/backdrop-filter) + Vanilla JS，Lucide Icons (CDN)，暗色模式双支持 |
 | 硬件 | 4 卡 GPU 4090 24GB（GPU 2: Embedding + Reranker, GPU 3: vLLM） |
 
 ---
@@ -273,6 +274,14 @@ context ≈ 2000 tokens + history 1500 tokens + prompt 250 tokens + question 100
 - **GPU 0-1 预留**：为其他实验室任务或未来扩展（如更大模型、多模型并行）保留计算资源
 - **vLLM 显存利用率**：配置 `VLLM_GPU_UTIL=0.90`，预留 10% 显存给 CUDA 运行时和临时 buffer
 - **配置项对应**：通过 `.env` 中的 `EMBEDDING_DEVICE=cuda:2`、`RERANKER_DEVICE=cuda:2`、`VLLM_CUDA_DEVICES=3` 控制设备分配，可根据实际硬件灵活调整
+
+### 前端设计
+
+- **设计风格**：iOS 风格毛玻璃 + 中山大学墨绿/金色配色
+- **暗色模式**：`@media (prefers-color-scheme: dark)` + `[data-theme="dark"]` 双覆盖
+- **校徽方案**：base64 内联 PNG，无外部依赖
+- **图标方案**：Lucide Icons CDN + fallback 文字符号
+- **CSP 策略**：nonce 保护内联脚本；允许 cdn.jsdelivr.net、unpkg.com
 
 ---
 

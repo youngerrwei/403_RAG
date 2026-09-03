@@ -125,7 +125,7 @@ curl http://172.18.216.71:6333/collections/lab_knowledge_base
 curl http://172.18.216.71:6333/collections/lab_knowledge_base_parents
 
 # 验证 Embedding 模型路径
-ls -la ./models/bge-m3
+ls -la models/bge-m3
 
 # 验证文档目录
 ls -la /mnt/cpu_share
@@ -144,7 +144,7 @@ grep "SUCCESS\|ERROR" logs/auto_ingest.log | tail -20
 
 **Embedding 模型加载失败：**
 ```log
-2025-01-15 14:00:02 | ERROR | ingest| 模型加载失败: ./models/bge-m3 路径不存在
+2025-01-15 14:00:02 | ERROR | ingest| 模型加载失败: models/bge-m3 路径不存在
 ```
 
 **文档路径不存在：**
@@ -163,7 +163,7 @@ ValueError: Expected vector size 1024, got 768
 |------|---------|
 | DOCS_PATH 不存在 | 确认 `.env` 中的 `DOCS_PATH=/mnt/cpu_share` 路径存在且有读权限 |
 | Qdrant 连接失败 | 检查远程 Qdrant 服务状态，确认网络连通性：`ping 172.18.216.71` |
-| Embedding 模型加载失败 | 确认 `./models/bge-m3` 目录存在且包含完整模型文件 |
+| Embedding 模型加载失败 | 确认 `models/bge-m3` 目录存在且包含完整模型文件 |
 | 集合维度不匹配 | 执行全量重建：`bash auto_ingest.sh --destroy --force && bash auto_ingest.sh --full` |
 | 文件锁冲突 | 检查 `/tmp/auto_ingest.lock` 是否残留：`rm -f /tmp/auto_ingest.lock` |
 | GPU 设备错误 | 确认 `EMBEDDING_DEVICE=cuda:2` 可用：`python -c "import torch; print(torch.cuda.device_count())"` |
@@ -445,6 +445,30 @@ grep "Semaphore\|等待" logs/rag_web.log | tail -10
 
 ---
 
+## 场景八：前端样式/功能异常
+
+### 问题描述
+
+校徽不显示、图标加载失败、按钮无法点击、暗色模式不生效。
+
+### 排查步骤
+
+1. 打开浏览器开发者工具（F12），检查控制台是否有 CSP 报错
+2. 检查 Network 标签，确认 `unpkg.com` (Lucide) 和 `cdn.jsdelivr.net` (marked/DOMPurify/highlight.js/MathJax) 正常加载
+3. 如校徽不显示，检查 CSP 头是否包含 `img-src 'self' data:`
+4. 如按钮无法点击，检查是否有 JavaScript 错误阻止事件绑定
+5. 清除浏览器缓存和 localStorage 后重试
+
+### 解决方案
+
+| 问题 | 解决方案 |
+|------|----------|
+| CSP 问题 | 确认 `web_app.py` 中 CSP 头正确设置 |
+| CDN 不可达 | 检查服务器网络连通性（`curl https://unpkg.com`） |
+| 暗色模式 | 浏览器需支持 CSS3 媒体特性，推荐 Chrome 76+ / Firefox 67+ / Safari 12.1+ |
+
+---
+
 ## 快速诊断
 
 一键检查所有服务状态的命令集合：
@@ -496,8 +520,8 @@ echo ""
 
 # 5. 检查模型文件
 echo ">>> [5/6] 模型文件检查"
-[ -d "./models/bge-m3" ] && echo "  ✓ Embedding 模型存在" || echo "  ✗ Embedding 模型不存在: ./models/bge-m3"
-[ -d "./models/bge-reranker-v2-m3" ] && echo "  ✓ Reranker 模型存在" || echo "  ✗ Reranker 模型不存在: ./models/bge-reranker-v2-m3"
+[ -d "models/bge-m3" ] && echo "  ✓ Embedding 模型存在" || echo "  ✗ Embedding 模型不存在: models/bge-m3"
+[ -d "models/bge-reranker-v2-m3" ] && echo "  ✓ Reranker 模型存在" || echo "  ✗ Reranker 模型不存在: models/bge-reranker-v2-m3"
 echo ""
 
 # 6. 检查最近错误

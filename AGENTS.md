@@ -232,7 +232,7 @@ data: [DONE]
 | 父块集合向量 | 父块 collection 使用 4 维零向量占位，**不参与相似度计算** |
 | `fcntl.flock` 跨平台 | 文件锁在 Windows/macOS 上行为可能与 Linux 不同，需注意兼容性 |
 | `teardown_request` | Flask 的 `teardown_request` 无论请求成功或失败**都会执行**，不要在其中做条件性清理 |
-| `preflight_check()` 行为 | 启动前预检中 Qdrant 连通性检查失败仅发出警告（不阻止启动），允许 Qdrant 服务稍后启动；模型路径不存在则中止启动 |
+| `preflight_check()` 行为 | 启动前预检中 Qdrant 不可达、必要集合缺失或文档目录为空仅发出警告（不阻止启动）；模型路径不存在则中止启动 |
 | `/api/health` 状态含义 | `"degraded"` 表示部分组件不可用但系统仍可接受请求；`"error"` 表示关键服务不可用；修改状态判断逻辑时需同步更新 `start_rag.sh` 中的 JSON 解析逻辑 |
 
 ---
@@ -266,7 +266,7 @@ data: [DONE]
 | 路由 | `/api/health` | 固定路由，无需认证 |
 | 方法 | `GET` | 只读操作 |
 | `status` | `"ok"` / `"degraded"` / `"error"` | 系统整体状态 |
-| `components` | `{"embedding": bool, "reranker": bool, "qdrant": bool, "llm": bool}` | 各组件状态 |
+| `components` | `{"embedding": bool, "reranker": bool, "qdrant": bool, "llm": bool}` | 各组件状态；`qdrant=true` 还要求子块与父块集合都存在 |
 | HTTP 200 | status="ok" 或 "degraded" | 系统可用 |
 | HTTP 503 | status="error" | 系统不可用 |
 
