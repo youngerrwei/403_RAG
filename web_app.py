@@ -1,3 +1,4 @@
+# Flask 服务只做请求编排，模型初始化由 rag_agent 后台管理。
 import os
 import json
 import traceback
@@ -6,12 +7,11 @@ import hmac
 import queue
 import threading
 import time
-import logging
 import secrets
 from collections import defaultdict
 from datetime import datetime, timedelta
 from functools import wraps
-from threading import Semaphore
+from threading import BoundedSemaphore
 
 from flask import (
     Flask,
@@ -26,7 +26,15 @@ from flask import (
     g,
 )
 
-from rag_agent import ask_stream as ask_rag_stream, load_history, clear_user_history, get_runtime, save_history, cleanup_expired_history
+from rag_agent import (
+    ask_stream as ask_rag_stream,
+    load_history,
+    clear_user_history,
+    save_history,
+    cleanup_expired_history,
+    get_runtime_status,
+    start_runtime_prewarm,
+)
 
 from logger import get_logger
 
@@ -82,16 +90,19 @@ def _clear_login_failures(ip: str):
 
 # 并发请求控制
 _MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "20"))
-_request_semaphore = Semaphore(_MAX_CONCURRENT_REQUESTS)
+_request_semaphore = BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
 
 app = Flask(__name__)
 
 # Flask 密钥加固
 secret_key = os.getenv("FLASK_SECRET_KEY", "")
-if not secret_key or len(secret_key) < 32:
-    logging.warning("[SECURITY] FLASK_SECRET_KEY 未设置或强度不足(< 32字符)！建议运行: python -c \"import secrets; print(secrets.token_hex(32))\"")
-    if not secret_key:
-        secret_key = "unsafe-dev-key-change-in-production"
+if len(secret_key) < 32 or secret_key in {
+    "lab403-rag-secret-key-change-me-in-production",
+    "change-me",
+    "changeme",
+    "secret",
+}:
+    raise RuntimeError("FLASK_SECRET_KEY 未设置、强度不足或仍为公开占位值")
 app.secret_key = secret_key
 
 # Session Cookie 安全加固
@@ -104,28 +115,10 @@ app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024  # 1MB
 
 USERS_FILE = os.getenv("USERS_FILE", "config/users.json")
 
-
 @app.before_request
 def _generate_csp_nonce():
     """为每个请求生成 CSP nonce"""
     g.csp_nonce = secrets.token_hex(16)
-
-
-@app.before_request
-def _limit_concurrent():
-    """限制并发请求数（仅对问答接口）"""
-    if request.endpoint == "ask_stream_api":
-        if not _request_semaphore.acquire(blocking=False):
-            return jsonify({"error": "服务繁忙，请稍后重试"}), 503
-        # 标记已获取锁
-        request._acquired_semaphore = True
-
-
-@app.teardown_request
-def _release_concurrent(exc=None):
-    """释放并发锁"""
-    if getattr(request, '_acquired_semaphore', False):
-        _request_semaphore.release()
 
 
 @app.after_request
@@ -171,7 +164,7 @@ def load_users():
                 valid_users.append(item)
         return valid_users
     except Exception:
-        traceback.print_exc()
+        _logger.debug(traceback.format_exc())
         return []
 
 
@@ -212,7 +205,7 @@ def verify_password(username: str, password: str) -> bool:
         return hmac.compare_digest(computed_hash, stored_hash_hex)
 
     except Exception:
-        traceback.print_exc()
+        _logger.debug(traceback.format_exc())
         return False
 
 
@@ -236,60 +229,18 @@ def login_required(view_func):
 @app.route("/api/health", methods=["GET"])
 def health_check():
     """健康检查端点，无需认证，检测各组件就绪状态"""
-    components = {
-        "embedding": False,
-        "reranker": False,
-        "qdrant": False,
-        "llm": False,
-    }
-
     try:
-        runtime = get_runtime()
+        components = get_runtime_status()
     except Exception as e:
-        _logger.warning(f"健康检查：获取运行时失败: {e}")
-        return jsonify({"status": "error", "components": components}), 503
-
-    # 检查 Embedding 模型是否已加载（通过 vectorstore 内部的 embeddings 对象判断）
-    try:
-        vs = runtime.get("vectorstore")
-        if vs and getattr(vs, "_embedding", None) is not None:
-            components["embedding"] = True
-        elif vs and getattr(vs, "embeddings", None) is not None:
-            components["embedding"] = True
-    except Exception as e:
-        _logger.warning(f"健康检查：Embedding 检测异常: {e}")
-
-    # 检查 Reranker 模型是否已加载
-    try:
-        reranker = runtime.get("reranker")
-        if reranker is not None:
-            components["reranker"] = True
-    except Exception as e:
-        _logger.warning(f"健康检查：Reranker 检测异常: {e}")
-
-    # 检查 Qdrant 连接是否正常
-    try:
-        client = runtime.get("client")
-        if client is not None:
-            client.get_collections()
-            components["qdrant"] = True
-    except Exception as e:
-        _logger.warning(f"健康检查：Qdrant 连接异常: {e}")
-
-    # 检查 LLM (vLLM) 是否可用
-    try:
-        llm = runtime.get("llm")
-        if llm is not None:
-            components["llm"] = True
-    except Exception as e:
-        _logger.warning(f"健康检查：LLM 检测异常: {e}")
+        _logger.warning(f"健康检查异常: {e}")
+        components = {"embedding": False, "reranker": False, "qdrant": False, "llm": False}
 
     # 判断整体状态
     healthy_count = sum(components.values())
-    if healthy_count == len(components):
-        status = "ok"
-    elif healthy_count == 0:
+    if not components.get("llm", False):
         status = "error"
+    elif healthy_count == len(components):
+        status = "ok"
     else:
         status = "degraded"
 
@@ -344,7 +295,7 @@ def login():
             "username": username
         })
     except Exception as e:
-        traceback.print_exc()
+        _logger.debug(traceback.format_exc())
         # 不向客户端暴露详细错误
         return jsonify({"success": False, "error": "服务器内部错误，请稍后重试。"}), 500
 
@@ -405,7 +356,7 @@ def save_history_api():
             "message": "历史已保存"
         })
     except Exception as e:
-        traceback.print_exc()
+        _logger.debug(traceback.format_exc())
         return jsonify({
             "success": False,
             "error": "服务器内部错误，请稍后重试。"
@@ -437,6 +388,10 @@ def ask_stream_api():
     username = session.get("username", "anonymous")
     use_agent = data.get("use_agent", False)
 
+    # 流式响应可能在视图函数返回后继续很久，因此令牌必须由生成器持有和释放。
+    if not _request_semaphore.acquire(blocking=False):
+        return jsonify({"error": "服务繁忙，请稍后重试"}), 503
+
     @stream_with_context
     def generate():
         start_time = time.time()
@@ -449,13 +404,20 @@ def ask_stream_api():
         producer_thread = None
         heartbeat_thread = None
         stop_heartbeat = threading.Event()
+        cancel_stream = threading.Event()
+        stream_iter = None
+        done_sent = False
 
         try:
             yield f"data: {json.dumps({'type': 'start', 'question': question}, ensure_ascii=False)}\n\n"
 
             if use_agent:
                 from agent_entry import ask_agent_stream
-                stream_iter = ask_agent_stream(question)
+                stream_iter = ask_agent_stream(
+                    question,
+                    username=username,
+                    chat_history=load_history(username),
+                )
             else:
                 stream_iter = ask_rag_stream(question, username=username)
 
@@ -466,6 +428,8 @@ def ask_stream_api():
                 """生产者线程：从 stream_iter 读取数据放入 Queue"""
                 try:
                     for item in stream_iter:
+                        if cancel_stream.is_set():
+                            break
                         msg_queue.put(item)
                 except Exception as e:
                     # 将异常传递给主生成器处理
@@ -478,6 +442,8 @@ def ask_stream_api():
                 # stop_heartbeat.wait() 返回 True 表示事件已设置（应停止）
                 # 返回 False 表示超时（应发送心跳）
                 while not stop_heartbeat.wait(heartbeat_interval):
+                    if cancel_stream.is_set():
+                        return
                     msg_queue.put({"type": "heartbeat"})
 
             # 启动生产者线程和心跳线程（均为守护线程，防止进程卡死）
@@ -492,8 +458,8 @@ def ask_stream_api():
                 if time.time() - start_time > max_duration:
                     _logger.warning(f"SSE 流响应超时 (user={username}, duration={time.time() - start_time:.1f}s)")
                     yield f"data: {json.dumps({'type': 'error', 'message': '响应超时'}, ensure_ascii=False)}\n\n"
-                    # 超时也需要发送 [DONE] 结束标记，确保前端正确关闭连接
                     yield "data: [DONE]\n\n"
+                    done_sent = True
                     break
 
                 # 从 Queue 获取数据（带超时以便定期检查 max_duration）
@@ -517,6 +483,7 @@ def ask_stream_api():
             # 流正常结束，发送 [DONE] 标记（符合 SSE 协议规范）
             if stream_ended_normally:
                 yield "data: [DONE]\n\n"
+                done_sent = True
 
         except GeneratorExit:
             # 客户端断开连接，正常情况
@@ -524,24 +491,37 @@ def ask_stream_api():
         except Exception as e:
             # 服务端异常，不向客户端暴露详细错误
             _logger.error(f"SSE 生成异常 (user={username}): {repr(e)}")
-            traceback.print_exc()
+            _logger.debug(traceback.format_exc())
             try:
                 yield f"data: {json.dumps({'type': 'error', 'message': '服务器内部错误，请稍后重试。'}, ensure_ascii=False)}\n\n"
-                # 异常情况也需要发送 [DONE] 结束标记，确保前端正确关闭连接
-                yield "data: [DONE]\n\n"
+                if not done_sent:
+                    yield "data: [DONE]\n\n"
+                    done_sent = True
             except GeneratorExit:
                 pass
         finally:
-            # 通知心跳线程停止
+            cancel_stream.set()
             stop_heartbeat.set()
+            if stream_iter is not None:
+                close_stream = getattr(stream_iter, "close", None)
+                if callable(close_stream):
+                    try:
+                        close_stream()
+                    except Exception as e:
+                        _logger.debug(f"关闭上游流时忽略异常: {e}")
             # 等待线程退出（设置超时避免卡死）
             if heartbeat_thread and heartbeat_thread.is_alive():
                 heartbeat_thread.join(timeout=5)
             if producer_thread and producer_thread.is_alive():
                 _logger.warning(f"生产者线程未在超时内退出 (user={username})")
                 producer_thread.join(timeout=5)
+            _request_semaphore.release()
 
-    response = Response(generate(), mimetype="text/event-stream")
+    try:
+        response = Response(generate(), mimetype="text/event-stream")
+    except Exception:
+        _request_semaphore.release()
+        raise
     response.headers["Cache-Control"] = "no-cache"
     response.headers["X-Accel-Buffering"] = "no"
     response.headers["Connection"] = "keep-alive"
@@ -559,7 +539,7 @@ def clear():
             "message": "历史对话已清空。"
         })
     except Exception as e:
-        traceback.print_exc()
+        _logger.debug(traceback.format_exc())
         return jsonify({
             "success": False,
             "error": "服务器内部错误，请稍后重试。"
@@ -606,24 +586,10 @@ if __name__ == "__main__":
     cleanup_thread.start()
     _logger.info("后台清理线程已启动，每天 02:00 自动清理过期历史")
 
-    # 运行时预热：提前加载模型和连接，尽早暴露配置问题
-    _logger.info("正在预热 RAG 运行时组件...")
-    try:
-        runtime = get_runtime()
-        # 输出关键组件就绪状态
-        components = []
-        if runtime.get("vectorstore"):
-            components.append("向量库连接")
-        if runtime.get("llm"):
-            components.append("LLM连接")
-        if runtime.get("reranker"):
-            components.append("Reranker模型")
-        _logger.info(f"RAG 运行时预热成功，就绪组件: {', '.join(components)}")
-    except Exception as e:
-        _logger.warning(f"RAG 运行时预热失败: {e}")
-        _logger.warning("服务将继续启动，但首次请求可能会延迟或失败")
-        _logger.warning("请检查: 1) 模型文件是否存在 2) GPU是否可用 3) Qdrant是否可连接")
+    # 后台预热不阻塞 Flask 监听；Qdrant 不可用时按冷却周期重试。
+    start_runtime_prewarm()
 
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() in {"true", "1", "yes"}
-    _logger.info(f"启动本地网页服务：http://0.0.0.0:5000 (debug={debug_mode})")
-    app.run(host="0.0.0.0", port=5000, debug=debug_mode, use_reloader=False, threaded=True)
+    web_port = int(os.getenv("WEBAPP_PORT", "5000"))
+    _logger.info(f"启动本地网页服务：http://0.0.0.0:{web_port} (debug={debug_mode})")
+    app.run(host="0.0.0.0", port=web_port, debug=debug_mode, use_reloader=False, threaded=True)

@@ -11,9 +11,9 @@ load_dotenv()
 
 # ======== 日志配置（可通过 .env 覆盖）========
 LOG_DIR = os.getenv("LOG_DIR", "logs")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
 LOG_FILE_PREFIX = os.getenv("LOG_FILE_PREFIX", "rag")
-LOG_MAX_DAYS = int(os.getenv("LOG_MAX_DAYS", "30"))
+LOG_MAX_DAYS = int(os.getenv("LOG_MAX_DAYS", "7"))
 
 # 确保日志目录存在
 os.makedirs(LOG_DIR, exist_ok=True)

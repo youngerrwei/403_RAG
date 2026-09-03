@@ -7,8 +7,11 @@ import hashlib
 import secrets
 import traceback
 
+from dotenv import load_dotenv
 
-USERS_FILE = "config/users.json"
+
+load_dotenv()
+USERS_FILE = os.getenv("USERS_FILE", "config/users.json")
 PBKDF2_ITERATIONS = 200000
 
 

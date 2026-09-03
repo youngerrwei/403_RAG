@@ -1,3 +1,4 @@
+# 核心 RAG 运行时是进程内唯一模型与检索资源所有者。
 import os
 import re
 import json
@@ -7,8 +8,11 @@ import shutil
 import hashlib
 import threading
 import traceback
+import tempfile
+import urllib.error
+import urllib.request
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import List, Dict, Optional, Generator
@@ -31,6 +35,10 @@ load_dotenv()
 # 全局状态
 # =========================
 _runtime: Optional[dict] = None
+_runtime_building = False
+_runtime_prewarm_scheduled = False
+_runtime_last_error: Optional[str] = None
+_runtime_last_attempt = 0.0
 
 # =========================
 # 用户级历史隔离（线程安全）
@@ -109,12 +117,13 @@ def load_history(username: str) -> list:
         if (today - file_date).days <= retention_days:
             path = os.path.join(user_dir, fname)
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    fcntl.flock(f, fcntl.LOCK_SH)
+                with open(path + ".lock", "a+", encoding="utf-8") as lock_file:
+                    fcntl.flock(lock_file, fcntl.LOCK_SH)
                     try:
-                        data = json.load(f)
+                        with open(path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
                     finally:
-                        fcntl.flock(f, fcntl.LOCK_UN)
+                        fcntl.flock(lock_file, fcntl.LOCK_UN)
                 if isinstance(data, list):
                     all_history.extend(data)
             except (json.JSONDecodeError, FileNotFoundError, IOError):
@@ -129,12 +138,29 @@ def save_history(username: str, history: list):
     daily_max = int(os.getenv("HISTORY_DAILY_MAX", "200"))
     if len(history) > daily_max:
         history = history[-daily_max:]
-    with open(path, "w", encoding="utf-8") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with open(path + ".lock", "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
         try:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(path, history)
         finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: str, data) -> None:
+    """在同目录写临时文件后原子替换，避免并发或崩溃留下半截 JSON。"""
+    fd, temp_path = tempfile.mkstemp(prefix=".history-", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def append_to_user_history(username: str, role: str, content: str):
@@ -144,36 +170,27 @@ def append_to_user_history(username: str, role: str, content: str):
         path = get_history_path(username, today)
         # 读取当日已有记录
         history = []
-        if os.path.exists(path):
+        with open(path + ".lock", "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    fcntl.flock(f, fcntl.LOCK_SH)
+                if os.path.exists(path):
                     try:
-                        history = json.load(f)
-                    finally:
-                        fcntl.flock(f, fcntl.LOCK_UN)
-            except (json.JSONDecodeError, IOError):
-                history = []
+                        with open(path, "r", encoding="utf-8") as f:
+                            history = json.load(f)
+                    except (json.JSONDecodeError, IOError):
+                        history = []
 
-        # 追加新记录（带时间戳）
-        history.append({
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat()
-        })
-
-        # 单日上限
-        daily_max = int(os.getenv("HISTORY_DAILY_MAX", "200"))
-        if len(history) > daily_max:
-            history = history[-daily_max:]
-
-        # 写入
-        with open(path, "w", encoding="utf-8") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            try:
-                json.dump(history, f, ensure_ascii=False, indent=2)
+                history.append({
+                    "role": role,
+                    "content": content,
+                    "timestamp": datetime.now().isoformat()
+                })
+                daily_max = int(os.getenv("HISTORY_DAILY_MAX", "200"))
+                if len(history) > daily_max:
+                    history = history[-daily_max:]
+                _atomic_write_json(path, history)
             finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 def clear_user_history(username: str):
@@ -218,7 +235,7 @@ def cleanup_expired_history(username: str = None, retention_days: int = None):
                 removed_count += 1
 
     if removed_count > 0:
-        print(f"[INFO] 已清理 {removed_count} 个过期历史文件")
+        _logger.info(f"已清理 {removed_count} 个过期历史文件")
 
 
 # =========================
@@ -467,10 +484,10 @@ def load_config() -> dict:
         "RERANKER_MODEL_NAME": os.getenv("RERANKER_MODEL_NAME", "./models/bge-reranker-v2-m3"),
         "RERANKER_DEVICE": os.getenv("RERANKER_DEVICE", "cuda:2"),
 
-        "KNOWLEDGE_BASE_ROOT": os.getenv("KNOWLEDGE_BASE_ROOT", "").strip(),
+        "KNOWLEDGE_BASE_ROOT": os.getenv("KNOWLEDGE_BASE_ROOT", "/mnt/cpu_share").strip(),
         "ENABLE_FILESYSTEM_TOOL": os.getenv("ENABLE_FILESYSTEM_TOOL", "true").lower() == "true",
         "FILE_SEARCH_LIMIT": int(os.getenv("FILE_SEARCH_LIMIT", "200")),
-        "DIRECTORY_CHILD_LIMIT": int(os.getenv("DIRECTORY_CHILD_LIMIT", "200")),
+        "DIRECTORY_CHILD_LIMIT": int(os.getenv("DIRECTORY_CHILD_LIMIT", "10")),
 
         "ENABLE_HYBRID_SEARCH": os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true",
         "BM25_WEIGHT": float(os.getenv("BM25_WEIGHT", "0.3")),
@@ -487,10 +504,12 @@ def load_config() -> dict:
         "TITLE_BOOST": float(os.getenv("TITLE_BOOST", "1.08")),
 
         "ENABLE_HYDE": os.getenv("ENABLE_HYDE", "true").lower() == "true",
-    }
+        "HYBRID_FILE_CONTEXT_BUDGET": int(os.getenv("HYBRID_FILE_CONTEXT_BUDGET", "1500")),
+        "HEALTHCHECK_TIMEOUT": float(os.getenv("HEALTHCHECK_TIMEOUT", "3")),
+        "RUNTIME_RETRY_INTERVAL": float(os.getenv("RUNTIME_RETRY_INTERVAL", "30")),
 
+    }
     # 配置验证
-    log = _logger.warning
     critical_configs = {
         "VLLM_BASE_URL": cfg.get("VLLM_BASE_URL"),
         "QDRANT_HOST": cfg.get("QDRANT_HOST"),
@@ -537,11 +556,11 @@ def build_llm(base_url: str, api_key: str, model_name: str, cfg: dict = None):
     )
 
 
-def _connect_qdrant_with_retry(host: str, port: int, max_retries: int = 3) -> QdrantClient:
+def _connect_qdrant_with_retry(host: str, port: int, max_retries: int = 1, timeout: float = 3) -> QdrantClient:
     """带重试机制的 Qdrant 客户端连接，防止短暂网络抖动导致启动失败"""
     for attempt in range(max_retries):
         try:
-            client = QdrantClient(host=host, port=port, timeout=30)
+            client = QdrantClient(host=host, port=port, timeout=timeout)
             client.get_collections()  # 验证连接可用
             return client
         except Exception as e:
@@ -553,9 +572,9 @@ def _connect_qdrant_with_retry(host: str, port: int, max_retries: int = 3) -> Qd
                 raise
 
 
-def build_vectorstore(host: str, port: int, collection_name: str, embeddings):
+def build_vectorstore(host: str, port: int, collection_name: str, embeddings, client=None):
     debug_log(f"build_vectorstore host={host} port={port} collection={collection_name}")
-    client = _connect_qdrant_with_retry(host, port)
+    client = client or _connect_qdrant_with_retry(host, port)
     return QdrantVectorStore(
         client=client,
         collection_name=collection_name,
@@ -572,14 +591,35 @@ def build_reranker(model_name: str, device: str):
 def build_runtime():
     with Timer("build_runtime"):
         config = load_config()
-        debug_log("config=", json.dumps(config, ensure_ascii=False))
+        safe_config = {key: value for key, value in config.items() if key != "VLLM_API_KEY"}
+        debug_log("config=", json.dumps(safe_config, ensure_ascii=False))
 
+        # 先验证远程依赖，避免 Qdrant 不可用时仍占用 GPU 加载模型。
+        client = _connect_qdrant_with_retry(
+            config["QDRANT_HOST"],
+            config["QDRANT_PORT"],
+            max_retries=1,
+            timeout=config["HEALTHCHECK_TIMEOUT"],
+        )
+        required_collections = (
+            config["QDRANT_COLLECTION_NAME"],
+            config["QDRANT_PARENT_COLLECTION"],
+        )
+        missing_collections = []
+        for collection_name in required_collections:
+            try:
+                client.get_collection(collection_name)
+            except Exception:
+                missing_collections.append(collection_name)
+        if missing_collections:
+            raise RuntimeError(f"Qdrant 缺少必要集合: {', '.join(missing_collections)}")
         embeddings = build_embeddings(config["EMBEDDING_MODEL_NAME"], config["EMBEDDING_DEVICE"])
         vectorstore = build_vectorstore(
             config["QDRANT_HOST"],
             config["QDRANT_PORT"],
             config["QDRANT_COLLECTION_NAME"],
             embeddings,
+            client=client,
         )
         llm = build_llm(
             config["VLLM_BASE_URL"],
@@ -604,15 +644,123 @@ def build_runtime():
 _runtime_lock = threading.Lock()
 
 
+class RuntimeUnavailableError(RuntimeError):
+    """运行时依赖尚未就绪。对外只应返回通用服务提示。"""
+
+
 def get_runtime():
-    """获取运行时实例，使用 Double-check Locking 防止竞态条件"""
-    global _runtime
-    if _runtime is None:
+    """获取单例运行时；失败后进入冷却，避免请求反复触发模型加载。"""
+    global _runtime, _runtime_building, _runtime_last_error, _runtime_last_attempt
+    if _runtime is not None:
+        return _runtime
+    cfg = load_config()
+    with _runtime_lock:
+        if _runtime is not None:
+            return _runtime
+        now = time.monotonic()
+        if _runtime_building:
+            raise RuntimeUnavailableError("运行时正在初始化")
+        if _runtime_last_error and now - _runtime_last_attempt < cfg["RUNTIME_RETRY_INTERVAL"]:
+            raise RuntimeUnavailableError("运行时依赖暂不可用")
+        _runtime_building = True
+        _runtime_last_attempt = now
+    try:
+        runtime = build_runtime()
+    except Exception as exc:
         with _runtime_lock:
-            if _runtime is None:  # Double-check
-                debug_log("runtime is None, building runtime...")
-                _runtime = build_runtime()
-    return _runtime
+            _runtime_last_error = repr(exc)
+        raise RuntimeUnavailableError("运行时依赖暂不可用") from exc
+    else:
+        with _runtime_lock:
+            _runtime = runtime
+            _runtime_last_error = None
+        return runtime
+    finally:
+        with _runtime_lock:
+            _runtime_building = False
+
+
+def start_runtime_prewarm() -> None:
+    """后台触发一次运行时初始化；已有实例、初始化中或冷却期内均直接返回。"""
+    def _worker():
+        global _runtime_prewarm_scheduled
+        try:
+            get_runtime()
+            _logger.info("RAG 运行时后台预热完成")
+        except RuntimeUnavailableError as exc:
+            _logger.warning(f"RAG 运行时后台预热暂不可用: {exc}")
+        finally:
+            with _runtime_lock:
+                _runtime_prewarm_scheduled = False
+
+    global _runtime_prewarm_scheduled
+    with _runtime_lock:
+        if _runtime is not None or _runtime_building or _runtime_prewarm_scheduled:
+            return
+        _runtime_prewarm_scheduled = True
+    threading.Thread(target=_worker, daemon=True, name="rag-runtime-prewarm").start()
+
+
+def _http_json_reachable(url: str, timeout: float, api_key: str = "") -> bool:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                return False
+            data = json.loads(response.read().decode("utf-8"))
+            return isinstance(data, dict)
+    except (OSError, ValueError, urllib.error.URLError):
+        return False
+
+
+def _qdrant_collections_ready(host: str, port: int, collection_names, timeout: float) -> bool:
+    """Qdrant 仅在连通且所有必要集合存在时才视为可用于检索。"""
+    request = urllib.request.Request(f"http://{host}:{port}/collections")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                return False
+            data = json.loads(response.read().decode("utf-8"))
+            collections = data.get("result", {}).get("collections", [])
+            existing = {
+                item.get("name")
+                for item in collections
+                if isinstance(item, dict) and item.get("name")
+            }
+            return set(collection_names).issubset(existing)
+    except (AttributeError, OSError, TypeError, ValueError, urllib.error.URLError):
+        return False
+
+
+def get_runtime_status() -> dict:
+    """返回快速健康快照，不触发同步模型加载。"""
+    cfg = load_config()
+    timeout = cfg["HEALTHCHECK_TIMEOUT"]
+    runtime = _runtime
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        qdrant_future = executor.submit(
+            _qdrant_collections_ready,
+            cfg["QDRANT_HOST"],
+            cfg["QDRANT_PORT"],
+            (cfg["QDRANT_COLLECTION_NAME"], cfg["QDRANT_PARENT_COLLECTION"]),
+            timeout,
+        )
+        llm_future = executor.submit(
+            _http_json_reachable,
+            cfg["VLLM_BASE_URL"].rstrip("/") + "/models",
+            timeout,
+            cfg["VLLM_API_KEY"],
+        )
+        components = {
+            "embedding": bool(runtime and runtime.get("vectorstore")),
+            "reranker": bool(runtime and runtime.get("reranker")),
+            "qdrant": qdrant_future.result(),
+            "llm": llm_future.result(),
+        }
+    if components["qdrant"] and runtime is None:
+        start_runtime_prewarm()
+    return components
 
 
 # =========================
@@ -984,14 +1132,19 @@ def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_w
             debug_log(f"[RECALL ERROR] q={repr(q)} err={repr(e)}")
             return []
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(search_one, q): q for q in queries}
-        for future in as_completed(futures, timeout=30):
-            try:
-                result = future.result(timeout=10)
-                all_docs.extend(result)
-            except Exception as e:
-                debug_log(f"[WARNING] 检索超时或失败: {e}")
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {executor.submit(search_one, q): q for q in queries}
+    done, pending = wait(futures, timeout=30)
+    for future in done:
+        try:
+            all_docs.extend(future.result())
+        except Exception as e:
+            debug_log(f"[WARNING] 检索失败: {e}")
+    for future in pending:
+        future.cancel()
+    if pending:
+        debug_log(f"[WARNING] {len(pending)} 个检索任务超过 30 秒，已取消等待")
+    executor.shutdown(wait=False, cancel_futures=True)
 
     debug_log(f"[RECALL TOTAL] before merge = {len(all_docs)}")
     return all_docs
@@ -1591,8 +1744,8 @@ def list_paths_by_keyword(keyword: str, limit: int = 1000) -> List[Dict]:
 
 
 def list_catalog_entries(target: str) -> Dict:
-    runtime = get_runtime()
-    config = runtime["config"]
+    # 文件系统目录查询不依赖 Qdrant，降级状态下仍应可用。
+    config = _runtime["config"] if _runtime is not None else load_config()
 
     root_dir = config.get("KNOWLEDGE_BASE_ROOT", "")
     enable_fs = config.get("ENABLE_FILESYSTEM_TOOL", False)
@@ -1619,7 +1772,7 @@ def list_catalog_entries(target: str) -> Dict:
                 children = list_immediate_children(
                     root_dir,
                     best_dir["rel_path"],
-                    limit=config.get("DIRECTORY_CHILD_LIMIT", 200),
+                    limit=config.get("DIRECTORY_CHILD_LIMIT", 10),
                 )
                 return {
                     "mode": "filesystem_directory",
@@ -1775,7 +1928,11 @@ def answer_stream(llm, question: str, context: str, route: str, route_reason: st
 # =========================
 # 主入口：流式
 # =========================
-def ask_stream(question: str, username: str = "anonymous") -> Generator[dict, None, None]:
+def ask_stream(
+    question: str,
+    username: str = "anonymous",
+    persist_history: bool = True,
+) -> Generator[dict, None, None]:
     total_start = time.perf_counter()
 
     try:
@@ -2010,8 +2167,9 @@ def ask_stream(question: str, username: str = "anonymous") -> Generator[dict, No
             "citations": citations,
         }
 
-        append_user_chat_history(username, "user", question)
-        append_user_chat_history(username, "assistant", full_answer)
+        if persist_history:
+            append_user_chat_history(username, "user", question)
+            append_user_chat_history(username, "assistant", full_answer)
 
         total_elapsed = time.perf_counter() - total_start
         debug_log(f"ask_stream done total_elapsed={total_elapsed:.3f}s answer_len={len(full_answer)}")
@@ -2035,7 +2193,7 @@ def ask_stream(question: str, username: str = "anonymous") -> Generator[dict, No
         debug_log(traceback.format_exc())
         yield {
             "type": "error",
-            "content": str(e),
+            "content": "服务暂时不可用，请稍后重试。",
         }
 
 

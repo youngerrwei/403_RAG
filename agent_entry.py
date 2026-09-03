@@ -1,42 +1,31 @@
-# agent_entry.py
+# agent_entry.py：可选 ReAct 编排层，不持有独立模型实例。
 
 import os
 import json
 import time
 import traceback
-from datetime import datetime
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
-from tools import rag_qa, list_group_files
+from logger import get_logger
+from rag_agent import get_runtime, append_user_chat_history
+from tools import rag_qa, list_group_files, agent_tool_context
 
 
 load_dotenv()
+_logger = get_logger("agent")
 
 
 def debug_log(*args):
-    now = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    print(f"[{now}]", *args, flush=True)
+    _logger.debug(" ".join(str(arg) for arg in args))
 
 
 def build_qwen_llm() -> ChatOpenAI:
-    base_url = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
-    api_key = os.getenv("VLLM_API_KEY", "lab-secret-key")
-    model_name = os.getenv("VLLM_MODEL_NAME", "./models/Qwen3-8B-Instruct")
-
-    llm = ChatOpenAI(
-        model=model_name,
-        openai_api_base=base_url,
-        openai_api_key=api_key,
-        temperature=0.1,
-        max_tokens=2048,
-        top_p=0.9,
-        timeout=120,
-    )
-    return llm
+    """兼容旧入口，返回主 RAG 运行时中的同一个 LLM 实例。"""
+    return get_runtime()["llm"]
 
 
 TOOLS = {
@@ -135,22 +124,37 @@ def parse_answer(text: str) -> str:
     return text.strip()
 
 
-def run_react_once(llm: ChatOpenAI, question: str, max_steps: int = 5, debug: bool = True) -> str:
+def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]] = None):
+    messages: List[Dict[str, str]] = [{"role": "system", "content": REACT_SYSTEM_PROMPT}]
+    for item in (chat_history or [])[-20:]:
+        role = item.get("role")
+        content = str(item.get("content", "")).strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": question})
+    return messages
+
+
+def run_react_once(
+    llm: ChatOpenAI,
+    question: str,
+    max_steps: int = 5,
+    debug: bool = True,
+    username: str = "legacy-agent",
+    chat_history: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """
     手写一个简单 ReAct 循环：
     - 系统提示 + 用户问题 → LLM 输出 Thought/Action/Answer
     - 解析 Action，如果有工具调用则执行，并把 Observation 追加到对话中，再次让 LLM 推理
     - 最多 max_steps 次工具调用
     """
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": REACT_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+    messages = _initial_messages(question, chat_history)
 
     observation_text = ""
     for step in range(1, max_steps + 1):
         if debug:
-            print(f"\n----- ReAct Step {step} -----")
+            debug_log(f"ReAct Step {step}")
 
         # 调用模型
         if debug:
@@ -168,14 +172,13 @@ def run_react_once(llm: ChatOpenAI, question: str, max_steps: int = 5, debug: bo
 
         if debug:
             debug_log(f"LLM 调用完成, step={step}, 耗时={llm_cost:.3f}s, 输出字符数={len(content)}")
-            print("LLM 输出：")
-            print(content)
+            debug_log("LLM 输出：", content)
 
         # 尝试解析 Answer（如果模型已经给出最终回答）
         if "Answer:" in content:
             final_answer = parse_answer(content)
             if debug:
-                print("\n解析到最终 Answer，结束循环。")
+                debug_log("解析到最终 Answer，结束循环")
             return final_answer
 
         # 解析 Action
@@ -183,26 +186,27 @@ def run_react_once(llm: ChatOpenAI, question: str, max_steps: int = 5, debug: bo
         if not action:
             # 没有 Action，也没有 Answer，当成直接回答
             if debug:
-                print("\n未解析到 Action，直接将本次输出当作回答。")
+                debug_log("未解析到 Action，直接将本次输出当作回答")
             return content.strip()
 
         tool_name = action["tool_name"]
         arg = action["arg"]
 
         if debug:
-            print(f"\n解析到 Action: tool={tool_name}, arg={arg}")
+            debug_log(f"解析到 Action: tool={tool_name}, arg={arg}")
 
         tool = TOOLS.get(tool_name)
         if tool is None:
             observation_text = f"[工具错误] 未找到名为 {tool_name} 的工具。"
         else:
+            tool_start = time.perf_counter()
             try:
                 # langchain_core.tools.Tool 对象：用 .invoke 调用
                 # 若你的版本不支持 .invoke，可以用 .run 或直接 .func 看实际类型
                 tool_input_key = list(tool.args.keys())[0]  # 第一个参数名
                 tool_input = {tool_input_key: arg}
-                tool_start = time.perf_counter()
-                obs = tool.invoke(tool_input)
+                with agent_tool_context(username):
+                    obs = tool.invoke(tool_input)
                 tool_cost = time.perf_counter() - tool_start
                 observation_text = str(obs)
 
@@ -211,13 +215,12 @@ def run_react_once(llm: ChatOpenAI, question: str, max_steps: int = 5, debug: bo
                         f"工具调用完成: tool={tool_name}, 耗时={tool_cost:.3f}s, observation字符数={len(observation_text)}")
             except Exception as e:
                 tool_cost = time.perf_counter() - tool_start
-                observation_text = f"[工具执行异常] {e}"
+                observation_text = "[工具执行异常] 服务暂时不可用，请稍后重试。"
                 if debug:
                     debug_log(f"工具调用异常: tool={tool_name}, 耗时={tool_cost:.3f}s, error={e}")
 
         if debug:
-            print("\nObservation:")
-            print(observation_text)
+            debug_log("Observation:", observation_text)
 
         # 将本轮 LLM 输出 + Observation 追加到对话历史，再继续下一轮
         messages.append({"role": "assistant", "content": content})
@@ -228,16 +231,33 @@ def run_react_once(llm: ChatOpenAI, question: str, max_steps: int = 5, debug: bo
     return f"工具调用达到最大步数，最后一次观察结果为：\n{observation_text}"
 
 
-def ask_agent(question: str) -> str:
+def ask_agent(
+    question: str,
+    username: str = "legacy-agent",
+    chat_history: Optional[List[Dict[str, str]]] = None,
+) -> str:
     """
     应用侧统一入口：ReAct LLM + 工具。
     """
     llm = build_qwen_llm()
-    answer = run_react_once(llm, question, max_steps=5, debug=True)
+    answer = run_react_once(
+        llm,
+        question,
+        max_steps=5,
+        debug=True,
+        username=username,
+        chat_history=chat_history,
+    )
+    append_user_chat_history(username, "user", question)
+    append_user_chat_history(username, "assistant", answer)
     return answer
 
 
-def ask_agent_stream(question: str):
+def ask_agent_stream(
+    question: str,
+    username: str = "legacy-agent",
+    chat_history: Optional[List[Dict[str, str]]] = None,
+):
     """
     流式 ReAct Agent：
     - type=step_llm：每一步 LLM 的输出（Thought/Action 文本）
@@ -247,10 +267,7 @@ def ask_agent_stream(question: str):
     """
     llm = build_qwen_llm()
 
-    messages: List[Dict[str, str]] = [
-        {"role": "system", "content": REACT_SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
+    messages = _initial_messages(question, chat_history)
 
     observation_text = ""
     used_list_tool = False
@@ -294,6 +311,8 @@ def ask_agent_stream(question: str):
                     continue
 
                 final_answer = parse_answer(content)
+                append_user_chat_history(username, "user", question)
+                append_user_chat_history(username, "assistant", final_answer)
                 yield {
                     "type": "final",
                     "content": final_answer,
@@ -304,9 +323,12 @@ def ask_agent_stream(question: str):
             action = parse_action(content)
             if not action:
                 # 没有 Action，也没有 Answer，当作直接回答
+                final_answer = content.strip()
+                append_user_chat_history(username, "user", question)
+                append_user_chat_history(username, "assistant", final_answer)
                 yield {
                     "type": "final",
-                    "content": content.strip(),
+                    "content": final_answer,
                 }
                 return
 
@@ -321,7 +343,8 @@ def ask_agent_stream(question: str):
                     tool_input_key = list(tool.args.keys())[0]
                     tool_input = {tool_input_key: arg}
                     tool_start = time.perf_counter()
-                    obs = tool.invoke(tool_input)
+                    with agent_tool_context(username):
+                        obs = tool.invoke(tool_input)
                     tool_cost = time.perf_counter() - tool_start
                     observation_text = str(obs)
                     debug_log(
@@ -333,7 +356,8 @@ def ask_agent_stream(question: str):
                         used_rag_after_list = True
 
                 except Exception as e:
-                    observation_text = f"[工具执行异常] {e}"
+                    _logger.error(f"Agent 工具执行异常: tool={tool_name}, error={e!r}")
+                    observation_text = "[工具执行异常] 服务暂时不可用，请稍后重试。"
 
             # 4) 把本次工具调用结果也流出去
             yield {
@@ -357,16 +381,20 @@ def ask_agent_stream(question: str):
             })
 
         # 超出最大步数未得到 Answer
+        final_answer = f"工具调用达到最大步数，最后一次观察结果为：\n{observation_text}"
+        append_user_chat_history(username, "user", question)
+        append_user_chat_history(username, "assistant", final_answer)
         yield {
             "type": "final",
-            "content": f"工具调用达到最大步数，最后一次观察结果为：\n{observation_text}",
+            "content": final_answer,
         }
 
     except Exception as e:
-        traceback.print_exc()
+        _logger.error(f"ReAct 执行异常: {e!r}")
+        _logger.debug(traceback.format_exc())
         yield {
             "type": "error",
-            "content": f"ReAct 执行异常: {e}",
+            "content": "服务暂时不可用，请稍后重试。",
         }
 
 
@@ -375,5 +403,5 @@ if __name__ == "__main__":
     if not q:
         q = "VLC小组有哪些设备？"
     ans = ask_agent(q)
-    print("\n=== Agent 最终回答 ===")
-    print(ans)
+    _logger.info("=== Agent 最终回答 ===")
+    _logger.info(ans)
