@@ -606,7 +606,7 @@ def ask_stream_api():
             yield f"data: {json.dumps({'type': 'start', 'question': question}, ensure_ascii=False)}\n\n"
 
             if use_agent:
-                from agent_entry import ask_agent_stream
+                from .agent_entry import ask_agent_stream
                 stream_iter = ask_agent_stream(
                     question,
                     username=username,
