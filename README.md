@@ -73,6 +73,92 @@ scripts/start_rag.sh
 
 以下命令应在项目根目录执行。若使用其他配置文件，可统一设置 `RAG_ENV_FILE=/绝对路径/自定义.env`；`scripts/convert_to_md.sh`、入库与启动脚本都会使用它。
 
+### SMB/CIFS 文档盘持久化挂载
+
+当前生产文档共享为 `//172.18.216.71/Share`，挂载到 `/mnt/cpu_share`。为避免服务器重启后手工挂载状态丢失，使用 systemd 自动挂载：
+
+```bash
+# Debian/Ubuntu 首次使用 CIFS 时安装；其他发行版安装对应 cifs-utils 包
+command -v mount.cifs >/dev/null || sudo apt-get install -y cifs-utils
+
+# 创建挂载点和仅 root 可读的凭据文件
+sudo mkdir -p /mnt/cpu_share /etc/samba
+sudoedit /etc/samba/cpu_share.credentials
+sudo chmod 600 /etc/samba/cpu_share.credentials
+```
+
+凭据文件格式如下；`domain` 仅在 SMB 服务要求域时填写：
+
+```ini
+username=实际用户名
+password=实际密码
+# domain=WORKGROUP
+```
+
+在 `/etc/fstab` 增加以下一行：
+
+```fstab
+//172.18.216.71/Share /mnt/cpu_share cifs credentials=/etc/samba/cpu_share.credentials,vers=3.0,uid=1018,gid=1019,forceuid,forcegid,file_mode=0664,dir_mode=0775,_netdev,nofail,x-systemd.automount 0 0
+```
+
+> `1018/1019` 是当前生产主机上 `rag_official` 的 UID/GID；迁移到其他主机时先用 `id rag_official` 核对并替换。`forceuid/forcegid` 确保 CIFS 客户端使用这里指定的所有者映射。下划线在 `/etc/fstab` 中不需要转义，必须写成 `/mnt/cpu_share`、`cpu_share.credentials` 和 `_netdev`，不要写成 `\_`。凭据只放在权限为 `0600` 的独立文件中，不要直接写入 fstab 或提交到仓库。
+
+`//172.18.216.71/Share` 是 SMB 服务端导出名，`/mnt/cpu_share` 是 RAG 服务器本地挂载点，两者不是同一路径；应用的 `DOCS_PATH` 和 `KNOWLEDGE_BASE_ROOT` 均继续使用 `/mnt/cpu_share`。
+
+修改后无需重启服务器即可加载和验证：
+
+```bash
+sudo systemctl daemon-reload
+
+# 先判断当前是否已经挂载。已有 CIFS 挂载时不要 restart automount：
+# 活跃的 mnt-cpu_share.mount 会与 automount 的重新启动发生状态冲突。
+if findmnt -rn -t cifs -T /mnt/cpu_share >/dev/null; then
+  echo "CIFS 已挂载；保留当前挂载，fstab 将在下次开机时继续接管"
+else
+  sudo systemctl start mnt-cpu_share.automount
+fi
+
+# 访问目录会触发 x-systemd.automount；timeout 防止网络异常时长期阻塞
+timeout 30 ls -la /mnt/cpu_share
+findmnt -T /mnt/cpu_share -o SOURCE,TARGET,FSTYPE,OPTIONS
+systemctl --no-pager --full status mnt-cpu_share.automount mnt-cpu_share.mount
+
+# 必须能看到实际文档，不能只有一个空的本地挂载点
+find /mnt/cpu_share -type f -print -quit
+
+# 转换结果默认写回共享盘，因此还必须验证创建权限
+touch /mnt/cpu_share/.lab_rag_write_test && rm /mnt/cpu_share/.lab_rag_write_test
+```
+
+预期 `findmnt` 能看到 `//172.18.216.71/Share` 与 `cifs`。如果 `mnt-cpu_share.mount` 已是 `active (mounted)` 且文件可读，即使 `mnt-cpu_share.automount` 显示 `inactive (dead)`，当前文档盘仍然可用；这时不要反复重启 automount。`x-systemd.automount` 会在下次正常开机后由 fstab 生成，并在首次访问目录时触发 mount。若目录未挂载且启动 automount 失败，执行：
+
+```bash
+sudo journalctl -u mnt-cpu_share.automount -u mnt-cpu_share.mount -n 100 --no-pager
+```
+
+最终的持久化验收应在下一次计划内重启后重复执行 `timeout 30 ls`、`findmnt` 和实际文件检查；不要为了验证 automount 在业务运行期间强制卸载正在使用的共享盘。
+
+常见错误：`Permission denied` 通常是凭据对应账号没有 Share 写 ACL，或者挂载缺少运行用户的 `uid/gid/file_mode/dir_mode`。挂载参数只能解决 Linux 客户端权限映射，不能绕过 SMB 服务端的只读权限；必须保证凭据账号在服务端可创建文件。`No such file or directory` 通常是共享名 `Share` 错误；协议协商错误时再根据 SMB 服务端版本调整 `vers=3.0`。挂载恢复后仍需检查 Qdrant 集合，SMB 正常不会自动恢复已经丢失的向量数据。
+
+修改 fstab 不会改变一个已经处于 `active (mounted)` 的旧挂载。若 fstab 行本身不含 `uid/gid`，重新挂载仍会得到 `uid=0,gid=0`；必须先修正 fstab，再执行 `daemon-reload` 和重新挂载。若 fstab 已正确但 `findmnt` 仍显示旧值，说明新参数尚未生效；应由有 sudo 权限的管理员在维护窗口确认没有转换/入库任务占用共享盘后重新挂载，或等待下一次计划内重启。重新挂载后再次执行 `findmnt` 和写探针；不要通过反复 `restart mnt-cpu_share.automount` 更新一个已经挂载的 mount 单元。
+
+服务器重启且 Qdrant 返回 `"collections":[]` 时，先确认共享盘确实包含源文档，再按以下顺序恢复；空集合不需要先执行 `--destroy`：
+
+```bash
+timeout 30 find /mnt/cpu_share -type f -print -quit
+
+# 共享盘已有 Markdown 时不必重新转换全部 PDF；仅增量补齐新增/变更文档
+bash scripts/convert_to_md.sh
+bash scripts/start_vllm.sh --background
+bash scripts/auto_ingest.sh --full
+bash scripts/start_rag.sh restart
+
+curl -fsS http://172.18.216.71:6333/collections
+curl -fsS http://127.0.0.1:5000/api/health
+```
+
+最终应存在 `lab_knowledge_base`、`lab_knowledge_base_parents` 两个集合，且健康接口应从 `degraded` 转为 `ok`。如果共享盘为空或仍未形成真实 CIFS 挂载，必须停止恢复流程，避免用空目录重建知识库。
+
 ## 快速开始
 
 ### 环境准备
@@ -224,6 +310,49 @@ bash scripts/convert_to_md.sh --dry-run
 - **支持格式**：`.pdf`, `.docx`, `.doc`, `.pptx`, `.ppt`（`.xlsx` 仅 MinerU 支持）
 - **日志文件**：`logs/convert_to_md.log`
 - **失败语义**：输出先写同目录临时文件并校验，再原子替换；任一文件失败时脚本返回非零，已成功文件保留
+- **表格结构保真**：入库清洗保留 Markdown 表格、标题、列表和公式的换行，不再把表格压平成单行；所有标准 Markdown 表都会在配置上限内追加逐行结构化转写，供 Embedding、Reranker 和回答模型共同使用
+- **旧数据兼容**：对于已经被 OCR 或旧版清洗压平的“变量格式”表，入库阶段会补充明确的语义恢复表，确保“向量、矩阵使用正体粗体”等规则可被准确检索
+- **通用质量保护**：转换脚本检测到疑似扁平技术表时会自动用 MinerU VLM 重试；若仍无法可靠恢复，入库内容会标记“表格结构疑似丢失”，回答端必须提示核对原图，不能按常识猜测单元格关系
+- **公式渲染保护**：前端在调用 `marked` 前暂存 `$...$`、`$$...$$`、`\(...\)` 和 `\[...\]` 数学片段，避免 Markdown 将 `_` 误解析成强调符；进入 MathJax 前会把模型常见的 `\_` 恢复为下标 `_`
+
+表格保真逻辑属于入库内容变更，升级后必须执行一次 `bash scripts/auto_ingest.sh --full`。如果其他复杂图表在原始 `.md` 文件中已经无法辨认，可先用 `bash scripts/convert_to_md.sh --full --engine mineru --backend vlm` 重新转换，再全量入库；仅本节变量格式表即使已经压平，也可由入库兼容逻辑恢复。
+
+转换脚本会在扫描和模型推理前实际创建一个隐藏探针文件验证 `OUTPUT_DIR` 可写，避免 MinerU 运行数分钟后才因 CIFS `Permission denied` 失败。大文件超时按 `max(CONVERT_TIMEOUT, 文件MB × CONVERT_TIMEOUT_PER_MB)` 计算，并受 `CONVERT_MAX_TIMEOUT` 限制。共享盘只读时可使用 `--output /本地可写目录`，随后把入库使用的 `DOCS_PATH` 指向该镜像目录。
+
+#### 转换连续失败时的判断顺序
+
+若日志同时出现 `Permission denied`、`文件过大` 和 `转换超时`，它们分别代表输出权限、配置上限和时间预算三个问题，并非所有文件都被同一引擎错误击中。按以下顺序处理：
+
+```bash
+# 1. 先确认共享盘真实挂载并且当前运行用户能创建文件；失败时先停止转换
+findmnt -T /mnt/cpu_share -o SOURCE,TARGET,FSTYPE,OPTIONS
+touch /mnt/cpu_share/.lab_rag_write_test && rm /mnt/cpu_share/.lab_rag_write_test
+
+# 2. 升级既有部署时手工核对私有 .env；git pull 不会覆盖已存在且被忽略的 .env
+# 推荐值：
+# CONVERT_TIMEOUT=300
+# CONVERT_TIMEOUT_PER_MB=20
+# CONVERT_MAX_TIMEOUT=3600
+# MAX_FILE_SIZE_MB=200
+
+# 3. 先做语法和待处理范围检查，再只转换需要的子目录
+bash -n scripts/convert_to_md.sh
+bash scripts/convert_to_md.sh --source '/mnt/cpu_share/设备操作指南' --dry-run
+bash scripts/convert_to_md.sh --source '/mnt/cpu_share/设备操作指南'
+```
+
+发现数量达到数万时，通常说明 `--source` 选择得过宽；除首次建立完整 Markdown 镜像外，不应轻易对整个共享盘执行 `--full`。`MAX_FILE_SIZE_MB` 的新代码默认值不会覆盖旧 `.env` 中的 `100`，必须把旧值显式改为 `200` 才能处理 106.81 MB 文件。31.39 MB 文件按推荐配置获得约 640 秒预算，而不再固定在 300 秒中止。
+
+如果共享凭据在服务端只有读取 ACL，不要继续向共享盘原位转换。可将一个明确的源目录输出到本地可写镜像：
+
+```bash
+mkdir -p /home/rag_official/lab_rag_converted
+bash scripts/convert_to_md.sh \
+  --source '/mnt/cpu_share/设备操作指南' \
+  --output /home/rag_official/lab_rag_converted
+```
+
+使用本地镜像时，必须确保它包含计划入库的全部 Markdown，并同步修改 `.env` 的 `DOCS_PATH` 与 `KNOWLEDGE_BASE_ROOT`，不能把一个只含局部资料的目录误当成完整知识库。对于本次已知的“变量格式”扁平表，无需等待 92,718 个文件重转：新版入库兼容逻辑可从现有 Markdown 恢复它，直接执行 `bash scripts/auto_ingest.sh --full` 即可；其他无法从文本辨认的复杂表格才需要重新运行 MinerU VLM。
 
 ---
 
@@ -265,12 +394,16 @@ bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --f
 
 #### 注意事项
 
-- **文件锁**：`data/.auto_ingest.lock`，防止并发执行
-- **日志文件**：`logs/auto_ingest.log`
+- **文件锁**：`data/.auto_ingest.lock`，防止并发执行；锁冲突时脚本会尽量显示持有者 PID、父 PID、运行时长、状态和命令行
+- **状态显示**：前台执行时，Markdown 扫描、切块、摘要、Embedding 初始化和 Qdrant 分批写入日志会实时显示；开始使用 GPU 前的文档扫描、切块或 vLLM 摘要阶段，Embedding 所在 GPU 空闲是正常现象
+- **日志文件**：终端输出同时写入 `logs/auto_ingest.log`；可在另一个终端执行 `tail -f logs/auto_ingest.log` 跟踪已启动的旧任务
+- **退出状态**：脚本保留 Python 入库子进程的真实退出码，并在结束时显示退出码与总耗时；`tee` 写日志不会掩盖失败
+- 摘要开始前会执行一次最小真实生成探针；若 `/health`、`/v1/models` 正常但生成失败，会跳过摘要并继续入库，避免对每个父块重复超时
 - 失败时不更新状态文件，下次运行自动重试
 - 日常模式只用变更检测决定是否启动任务；一旦触发，`src/lab_rag/ingest.py` 仍会扫描全部 Markdown，并以确定性 ID 幂等覆盖，集合不会重建
 - 日常模式自动设置 `QDRANT_RECREATE_COLLECTION=false`
 - 子块或父块任一批失败都会令任务失败；成功覆盖后会清理同源旧 point
+- 若旧终端仍在运行，优先在原终端按 `Ctrl+C`。终端丢失时先用 `lsof data/.auto_ingest.lock`、`ps -fp PID` 和 `pstree -ap PID` 核对进程树，只对确认的入库进程发送 `TERM`；不要删除锁文件冒充解锁，因为进程持有的 `flock` 不会因此释放
 - 配合 cron 时必须先转换再入库，否则新 PDF/DOCX 不会进入知识库：
   ```bash
   0 3 * * * cd /path/to/403_RAG && { bash scripts/convert_to_md.sh && bash scripts/auto_ingest.sh; } >> logs/knowledge_cron.log 2>&1
@@ -311,6 +444,7 @@ bash scripts/start_rag.sh status         # 查看运行及健康状态
 | `.env` 文件存在性 | **中止启动** |
 | `FLASK_SECRET_KEY` 为空、过短或为公开占位值 | **中止启动** |
 | 模型目录存在性（vLLM / Embedding / Reranker） | **中止启动** |
+| 登录页与问答页模板存在且可读 | **中止启动** |
 | `flock`、conda 或指定环境解释器不可用 | **中止启动** |
 | 文档目录 | 不存在或为空时警告；为空通常表示共享盘尚未挂载 |
 | Qdrant 连通性及子块/父块集合 | 不可达或集合缺失时警告并以 `degraded` 启动；集合缺失需执行全量入库 |
@@ -318,11 +452,13 @@ bash scripts/start_rag.sh status         # 查看运行及健康状态
 
 #### 内部行为
 
-- **vLLM 启动**：调用一次 `scripts/start_vllm.sh --background`；同时验证 `/health`、带 API Key 的 `/v1/models` 及模型名
+- **vLLM 启动**：调用一次 `scripts/start_vllm.sh --background`；同时验证 `/health`、带 API Key 的 `/v1/models`、模型名及最小真实生成探针
 - **vLLM 就绪**：最长等待 300 秒；超时会安全停止本次创建的进程并返回非零
 - **web_app 启动**：使用 `RAG_CONDA_ENV` 对应解释器执行 `python -m lab_rag.web_app`
 - **web_app 就绪**：只以 `/api/health` 的 `ok/degraded` 为准，最多等待 60 秒
 - **PID 管理**：`data/.vllm.pid` 和 `data/.web_app.pid`
+- **Web 安全接管**：若仅 `data/.web_app.pid` 丢失，但 5000 端口进程的命令身份确认为 `lab_rag.web_app` 且健康接口返回 `ok/degraded`，`start`/`status` 会重建 PID 文件；未知或不健康进程仍拒绝覆盖
+- **混合与 Agent 文件展示**：目录枚举结果通过 `tool=list_catalog_entries` SSE 事件发送；即使目录结果来自 Agent 内部的 `list_group_files` 或 `rag_qa` 混合路由，也会同步更新前端目录/文件卡片
 
 ---
 
@@ -435,6 +571,8 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | `VLLM_PORT` | `8000` | vLLM 端口 |
 | `VLLM_GPU_UTIL` | `0.85` | GPU 显存利用率 |
 | `VLLM_MAX_MODEL_LEN` | `6000` | 最大上下文长度 |
+| `VLLM_INFERENCE_PROBE_TIMEOUT` | `15` | vLLM 最小真实生成探针超时；用于识别“接口可达但推理引擎卡死” |
+| `VLLM_ENABLE_THINKING` | `false` | 是否让 Qwen3 输出思考过程；Web 问答默认关闭，避免内部推理混入最终答案 |
 | `QDRANT_HOST` | `172.18.216.71` | Qdrant 服务地址 |
 | `QDRANT_PORT` | `6333` | Qdrant 端口 |
 | `EMBEDDING_MODEL_NAME` | `./models/bge-m3` | Embedding 模型路径 |
@@ -443,6 +581,16 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | `RERANKER_DEVICE` | `cuda:2` | Reranker 运行设备 |
 | `DOCS_PATH` | `/mnt/cpu_share` | 知识库文档目录 |
 | `FILE_SEARCH_LIMIT` | `200` | 文件搜索结果上限 |
+| `DIRECTORY_CHILD_LIMIT` | `200` | 目录定位后返回的直接子目录/文件上限 |
+| `CATALOG_SCAN_LIMIT` | `20000` | MatchText 未命中时，Qdrant 路径元数据有界扫描上限 |
+| `ENABLE_TABLE_SEMANTIC_ENRICHMENT` | `true` | 为标准 Markdown 表生成逐行“列名=值”语义转写 |
+| `TABLE_SEMANTIC_MAX_ROWS` | `20` | 每张表最多生成语义转写的行数 |
+| `CONVERT_TABLE_VLM_FALLBACK` | `true` | 检测到疑似扁平技术表时自动使用 MinerU VLM 重试 |
+| `TABLE_FLATTENED_LINE_MIN_CHARS` | `240` | 通用扁平表格质量检测的单行长度阈值 |
+| `CONVERT_TIMEOUT` | `300` | 小文件转换的基础超时秒数 |
+| `CONVERT_TIMEOUT_PER_MB` | `20` | 大文件按体积动态计算的每 MB 超时秒数 |
+| `CONVERT_MAX_TIMEOUT` | `3600` | 单文件动态超时上限 |
+| `MAX_FILE_SIZE_MB` | `200` | 允许转换的文档大小上限 |
 | `MAX_CONCURRENT_REQUESTS` | `20` | 最大并发问答数 |
 | `QDRANT_RECREATE_COLLECTION` | `false` | 常规运行禁止隐式重建；全量脚本会临时覆盖为 true |
 | `VLLM_STARTUP_TIMEOUT` | `300` | vLLM 就绪等待秒数 |
@@ -500,8 +648,9 @@ bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --f
 
 ```bash
 # 1. 文档目录必须存在且有内容；默认部署还应确认它确实是挂载点
-find /mnt/cpu_share -type f -print -quit
-mountpoint /mnt/cpu_share
+timeout 30 ls -la /mnt/cpu_share             # 触发 systemd automount
+findmnt -T /mnt/cpu_share -o SOURCE,TARGET,FSTYPE,OPTIONS
+find /mnt/cpu_share -type f -print -quit      # 必须输出至少一个实际文件
 
 # 2. Qdrant 必须可达；完整链路需要两个集合
 curl -fsS http://172.18.216.71:6333/collections
@@ -603,9 +752,17 @@ SSE 流式问答接口，需先登录获取 Session。
 - **原因**：GPU 显存不足或模型文件损坏
 - **解决**：用 `nvidia-smi` 检查 GPU 显存；确认 `VLLM_GPU_UTIL` 未设过高；检查模型文件完整性；可在 `.env` 中设置 `VLLM_STARTUP_TIMEOUT` 调整超时时间
 
+**现象**：`/health` 和 `/v1/models` 正常，但摘要反复超时或状态命令报告“真实生成探针失败”
+- **原因**：vLLM API 进程仍在监听，但推理引擎、GPU worker 或请求队列已经卡死；这不属于健康状态
+- **解决**：先停止正在重试的入库任务，执行 `bash scripts/start_vllm.sh status` 并检查 `nvidia-smi`、`tail -n 200 logs/vllm_server.log`；纳管进程执行普通 `stop`，PID 文件丢失但脚本已确认模型、端口和命令行均匹配时，按提示执行 `bash scripts/start_vllm.sh stop --orphan`。脚本不会用此选项停止身份不匹配的未知进程。随后用 `--background` 重启，状态通过后重新入库
+
 **现象**：web_app 启动后 `/api/health` 返回 `"error"`
 - **原因**：关键 vLLM 服务不可用或鉴权配置不一致
 - **解决**：执行 `bash scripts/start_vllm.sh status`，核对 `VLLM_API_KEY`、模型名和 `logs/vllm_server.log`；Qdrant 单独不可达时应为 `degraded`
+
+**现象**：`/api/health` 为 `ok`，但访问 `/login` 返回“服务器内部错误”
+- **原因**：健康端点不渲染页面；通常是 `src/lab_rag/templates/login.html` 缺失、不可读，或旧 Web 进程仍使用迁移前代码
+- **解决**：检查 `logs/rag_web.log` 的 `登录请求处理失败` 堆栈及两个模板文件，确认代码同步后执行 `bash scripts/start_rag.sh restart`
 
 ### 入库类问题
 
@@ -668,6 +825,18 @@ SSE 流式问答接口，需先登录获取 Session。
 - **解决**：更新 conda：`conda update -n base conda`
 
 ## 安全加固
+
+### 混合检索的目录驱动规则
+
+混合模式会先调用目录枚举工具。对于“VLC 小组有哪些设备及使用规范”这类问题，只展示小组目录的直接子级（设备目录），不会继续展开到 `Manuals/*.md`；随后把“设备目录 + 用户明确提出的使用方法/操作规范/注意事项”等意图作为 Dense/Sparse 检索词。原始问题不会交给模型自由扩写，从而避免出现与知识库无关的设备名或规范。若 `KNOWLEDGE_BASE_ROOT` 已存在但为空、挂载失效或未找到目录，系统会回退到 Qdrant 路径元数据，并先把深层文档路径折叠回设备层级。
+
+`file_list` 只用于用户明确要求列出或定位目录、文件、路径、设备清单的场景。问题中出现“格式、要求、规范、步骤、怎么写”等词时按文档内容检索处理，不能因为答案可能位于某个模板文件中而路由成文件枚举。只有同时明确要求清单和内容说明（如“某小组有哪些设备及使用规范”）时才进入 `hybrid`。
+
+Agent 模式遵循同一边界，但工具 `Action` 必须由模型实际输出，系统不会合成思考或伪造工具调用。通用状态机只校验下一步是否合法：`rag_search` 必须先调用 `rag_qa`，`file_list` 必须先调用 `list_group_files`，`hybrid` 按“目录枚举 → 正文检索”执行；模型选择错误或在取得依据前直接作答时，会收到通用纠正并自行重新选择。目录未命中不能作为生成知识库外“通用模板”的依据，后续检索必须保留原始意图，禁止使用“总结这些工具怎么用”等与问题无关的固定话术。
+
+若历史摘要中存在 `<think>` 或整段问答污染，检索时会自动过滤；更新代码后建议执行一次 `bash scripts/auto_ingest.sh --full` 重新生成干净摘要。
+
+混合回答会固定包含“目录 / 文件检索结果”区块，不依赖模型自行复述。若该区块为空，右侧面板会显示实际检索目标和已检查的根目录。部署时应确保 `.env` 中 `DOCS_PATH` 与 `KNOWLEDGE_BASE_ROOT` 都是 `/mnt/cpu_share`；`start_rag.sh start` 会在两者不一致、目录不存在或不可读时给出警告。
 
 | 防护项 | 实现方式 |
 |--------|----------|
