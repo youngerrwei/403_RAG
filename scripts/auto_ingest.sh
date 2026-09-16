@@ -18,6 +18,24 @@ log() {
     printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
 }
 
+report_lock_holders() {
+    local holders="" pid details
+    if command -v lsof >/dev/null 2>&1; then
+        holders="$(lsof -t "$LOCK_FILE" 2>/dev/null | sort -u | tr '\n' ' ')"
+    elif command -v fuser >/dev/null 2>&1; then
+        holders="$(fuser "$LOCK_FILE" 2>/dev/null | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+    fi
+    if [[ -z "${holders// }" ]]; then
+        log "INFO: 未找到锁持有者详情；可执行 lsof $LOCK_FILE 或 fuser $LOCK_FILE"
+        return
+    fi
+    for pid in $holders; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        details="$(ps -p "$pid" -o pid=,ppid=,etime=,stat=,args= 2>/dev/null || true)"
+        [[ -n "$details" ]] && log "INFO: 锁持有者: $details"
+    done
+}
+
 [[ -f "$ENV_FILE" ]] || { log "ERROR: .env 不存在: $ENV_FILE"; exit 1; }
 load_env_keys "$ENV_FILE" DOCS_PATH QDRANT_HOST QDRANT_PORT QDRANT_COLLECTION_NAME \
     QDRANT_PARENT_COLLECTION RAG_CONDA_ENV STARTUP_PROBE_TIMEOUT || true
@@ -35,7 +53,11 @@ RAG_PYTHON=""
 
 command -v flock >/dev/null 2>&1 || { log "ERROR: 未找到 flock"; exit 1; }
 exec 200>"$LOCK_FILE"
-flock -n 200 || { log "ERROR: 另一个入库实例正在运行"; exit 1; }
+if ! flock -n 200; then
+    log "ERROR: 另一个入库实例正在运行"
+    report_lock_holders
+    exit 1
+fi
 
 save_manifest() {
     local tmp
@@ -58,14 +80,24 @@ check_deleted_files() {
 }
 
 run_ingest() {
-    local recreate="$1"
+    local recreate="$1" started_at ingest_status
     [[ -n "$RAG_PYTHON" ]] || { log "ERROR: conda 环境不存在或无 Python: $RAG_CONDA_ENV"; return 1; }
     log "INFO: 使用解释器 $RAG_PYTHON 执行入库 (recreate=$recreate)"
+    log "INFO: 入库阶段日志将实时显示，并同步写入 $LOG_FILE"
+    started_at=$SECONDS
     (
         cd "$PROJECT_ROOT"
         export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-        QDRANT_RECREATE_COLLECTION="$recreate" "$RAG_PYTHON" -m lab_rag.ingest
-    ) >> "$LOG_FILE" 2>&1
+        PYTHONUNBUFFERED=1 QDRANT_RECREATE_COLLECTION="$recreate" \
+            "$RAG_PYTHON" -u -m lab_rag.ingest
+    ) 2>&1 | tee -a "$LOG_FILE"
+    ingest_status=${PIPESTATUS[0]}
+    if (( ingest_status == 0 )); then
+        log "INFO: 入库子进程结束 (exit=$ingest_status, elapsed=$((SECONDS - started_at))s)"
+    else
+        log "ERROR: 入库子进程失败 (exit=$ingest_status, elapsed=$((SECONDS - started_at))s)"
+    fi
+    return "$ingest_status"
 }
 
 destroy_collection() {

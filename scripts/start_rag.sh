@@ -16,7 +16,7 @@ mkdir -p "$DATA_DIR" "$RAG_LOG_DIR"
 load_env_keys "$ENV_FILE" \
     VLLM_MODEL_NAME VLLM_API_KEY VLLM_PORT QDRANT_HOST QDRANT_PORT \
     QDRANT_COLLECTION_NAME QDRANT_PARENT_COLLECTION \
-    EMBEDDING_MODEL_NAME RERANKER_MODEL_NAME DOCS_PATH FLASK_SECRET_KEY \
+    EMBEDDING_MODEL_NAME RERANKER_MODEL_NAME DOCS_PATH KNOWLEDGE_BASE_ROOT FLASK_SECRET_KEY \
     RAG_CONDA_ENV WEBAPP_PORT WEBAPP_STARTUP_TIMEOUT STARTUP_PROBE_TIMEOUT || true
 
 VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-./models/Qwen3-8B-Instruct}"
@@ -30,6 +30,8 @@ EMBEDDING_MODEL_NAME="${EMBEDDING_MODEL_NAME:-./models/bge-m3}"
 RERANKER_MODEL_NAME="${RERANKER_MODEL_NAME:-./models/bge-reranker-v2-m3}"
 DOCS_PATH="${DOCS_PATH:-/mnt/cpu_share}"
 [[ "$DOCS_PATH" = /* ]] || DOCS_PATH="$(resolve_project_path "$DOCS_PATH")"
+KNOWLEDGE_BASE_ROOT="${KNOWLEDGE_BASE_ROOT:-$DOCS_PATH}"
+[[ "$KNOWLEDGE_BASE_ROOT" = /* ]] || KNOWLEDGE_BASE_ROOT="$(resolve_project_path "$KNOWLEDGE_BASE_ROOT")"
 FLASK_SECRET_KEY="${FLASK_SECRET_KEY:-}"
 RAG_CONDA_ENV="${RAG_CONDA_ENV:-rag}"
 WEBAPP_PORT="${WEBAPP_PORT:-5000}"
@@ -74,10 +76,23 @@ preflight_check() {
         path="$(resolve_project_path "$configured")"
         [[ -d "$path" ]] || { echo "[错误] 模型目录不存在: $path"; failed=1; }
     done
+    for path in \
+        "$PROJECT_ROOT/src/lab_rag/templates/login.html" \
+        "$PROJECT_ROOT/src/lab_rag/templates/index.html"; do
+        [[ -r "$path" ]] || { echo "[错误] Web 模板不存在或不可读: $path"; failed=1; }
+    done
     if [[ ! -d "$DOCS_PATH" ]]; then
         echo "[警告] 文档目录不存在: $DOCS_PATH"
     elif [[ -z "$(find "$DOCS_PATH" -type f -print -quit 2>/dev/null)" ]]; then
         echo "[警告] 文档目录为空: $DOCS_PATH；请确认共享盘已挂载，入库当前不可执行"
+    fi
+    if [[ "$KNOWLEDGE_BASE_ROOT" != "$DOCS_PATH" ]]; then
+        echo "[警告] KNOWLEDGE_BASE_ROOT 与 DOCS_PATH 不一致: $KNOWLEDGE_BASE_ROOT != $DOCS_PATH"
+    fi
+    if [[ ! -d "$KNOWLEDGE_BASE_ROOT" ]]; then
+        echo "[警告] 文件枚举根目录不存在: $KNOWLEDGE_BASE_ROOT"
+    elif [[ ! -r "$KNOWLEDGE_BASE_ROOT" ]]; then
+        echo "[警告] 文件枚举根目录不可读: $KNOWLEDGE_BASE_ROOT"
     fi
     if [[ -n "$RAG_PYTHON" ]] && qdrant_collections_ready "$RAG_PYTHON" \
         "http://${QDRANT_HOST}:${QDRANT_PORT}/collections" 3 \
@@ -99,6 +114,12 @@ start_web() {
         pid="$(web_pid || true)"
         if [[ "$pid" == "$listener" ]] && web_health_status; then
             echo "[信息] Web 已运行，状态=$WEB_HEALTH_STATUS，PID=$pid"
+            return 0
+        fi
+        # PID 文件可能在重启或部署后丢失；仅在命令身份和稳定健康接口均匹配时安全接管。
+        if pid_is_webapp "$listener" && web_health_status; then
+            printf '%s\n' "$listener" > "$PID_WEBAPP"
+            echo "[警告] Web PID 文件缺失，已验证进程身份和健康接口并重新纳管：状态=$WEB_HEALTH_STATUS，PID=$listener"
             return 0
         fi
         echo "[错误] 端口 ${WEBAPP_PORT} 已被未知或不健康进程占用 (PID: $listener)"
@@ -180,6 +201,11 @@ do_status() {
     bash "$SCRIPT_DIR/start_vllm.sh" status || failed=1
     pid="$(web_pid || true)"
     listener="$(port_pid "$WEBAPP_PORT")"
+    if [[ -z "$pid" && -n "$listener" ]] && pid_is_webapp "$listener" && web_health_status; then
+        printf '%s\n' "$listener" > "$PID_WEBAPP"
+        pid="$listener"
+        echo "Web 管理状态: PID 文件缺失，已验证并重新纳管"
+    fi
     if [[ -n "$pid" && "$pid" == "$listener" ]] && web_health_status; then
         if [[ "$WEB_HEALTH_STATUS" == "ok" ]]; then
             echo "Web 状态: 健康（ok），PID=$pid，端口=$WEBAPP_PORT"

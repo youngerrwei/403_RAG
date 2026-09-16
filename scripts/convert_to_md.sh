@@ -21,13 +21,17 @@ LOG_DIR="${PROJECT_ROOT}/logs"
 LOG_FILE="${LOG_DIR}/convert_to_md.log"
 LOCK_FILE="/tmp/convert_to_md.lock"
 source "${SCRIPT_DIR}/runtime_common.sh"
-load_env_keys "${ENV_FILE}" DOCS_PATH MINERU_CONDA_ENV CONVERT_TIMEOUT CONVERT_MAX_RETRIES MAX_FILE_SIZE_MB MIN_OUTPUT_SIZE || true
+load_env_keys "${ENV_FILE}" DOCS_PATH MINERU_CONDA_ENV CONVERT_TIMEOUT CONVERT_TIMEOUT_PER_MB CONVERT_MAX_TIMEOUT CONVERT_MAX_RETRIES MAX_FILE_SIZE_MB MIN_OUTPUT_SIZE CONVERT_TABLE_VLM_FALLBACK TABLE_FLATTENED_LINE_MIN_CHARS || true
 
 # ========== 兜底机制配置 ==========
 CONVERT_TIMEOUT="${CONVERT_TIMEOUT:-300}"          # 单文件转换超时（秒）
+CONVERT_TIMEOUT_PER_MB="${CONVERT_TIMEOUT_PER_MB:-20}"
+CONVERT_MAX_TIMEOUT="${CONVERT_MAX_TIMEOUT:-3600}"
 CONVERT_MAX_RETRIES="${CONVERT_MAX_RETRIES:-2}"    # 最大重试次数
-MAX_FILE_SIZE_MB="${MAX_FILE_SIZE_MB:-100}"         # 最大文件大小（MB）
+MAX_FILE_SIZE_MB="${MAX_FILE_SIZE_MB:-200}"         # 最大文件大小（MB）
 MIN_OUTPUT_SIZE="${MIN_OUTPUT_SIZE:-10}"            # 输出文件最小有效大小（字节）
+CONVERT_TABLE_VLM_FALLBACK="${CONVERT_TABLE_VLM_FALLBACK:-true}"
+TABLE_FLATTENED_LINE_MIN_CHARS="${TABLE_FLATTENED_LINE_MIN_CHARS:-240}"
 
 # ========== 文件跳过模式 ==========
 # 以下模式的文件会在文件发现阶段被过滤掉
@@ -76,9 +80,35 @@ log_debug() {
     echo "[DEBUG] [${timestamp}] $*" >> "${LOG_FILE}"
 }
 
+require_positive_integer_config() {
+    local name="$1"
+    local value="$2"
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+        log_error "配置 ${name} 必须是正整数，当前值: ${value}"
+        exit 1
+    fi
+}
+
+require_nonnegative_integer_config() {
+    local name="$1"
+    local value="$2"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        log_error "配置 ${name} 必须是非负整数，当前值: ${value}"
+        exit 1
+    fi
+}
+
 # ========== 初始化目录 ==========
 mkdir -p "${LOG_DIR}"
 mkdir -p "${PROJECT_ROOT}/data"
+
+require_positive_integer_config "CONVERT_TIMEOUT" "$CONVERT_TIMEOUT"
+require_positive_integer_config "CONVERT_TIMEOUT_PER_MB" "$CONVERT_TIMEOUT_PER_MB"
+require_positive_integer_config "CONVERT_MAX_TIMEOUT" "$CONVERT_MAX_TIMEOUT"
+require_nonnegative_integer_config "CONVERT_MAX_RETRIES" "$CONVERT_MAX_RETRIES"
+require_positive_integer_config "MAX_FILE_SIZE_MB" "$MAX_FILE_SIZE_MB"
+require_positive_integer_config "MIN_OUTPUT_SIZE" "$MIN_OUTPUT_SIZE"
+require_positive_integer_config "TABLE_FLATTENED_LINE_MIN_CHARS" "$TABLE_FLATTENED_LINE_MIN_CHARS"
 
 # ========== 帮助信息 ==========
 show_help() {
@@ -114,9 +144,13 @@ show_help() {
 
 环境变量:
   CONVERT_TIMEOUT       单文件转换超时秒数（默认 300）
+  CONVERT_TIMEOUT_PER_MB  按文件大小计算超时的每 MB 秒数（默认 20）
+  CONVERT_MAX_TIMEOUT   动态超时上限秒数（默认 3600）
   CONVERT_MAX_RETRIES   转换失败最大重试次数（默认 2）
-  MAX_FILE_SIZE_MB      允许的最大文件大小 MB（默认 100）
+  MAX_FILE_SIZE_MB      允许的最大文件大小 MB（默认 200）
   MIN_OUTPUT_SIZE       输出文件最小有效字节数（默认 10）
+  CONVERT_TABLE_VLM_FALLBACK  检测到疑似扁平表格时自动用 MinerU VLM 重试（默认 true）
+  TABLE_FLATTENED_LINE_MIN_CHARS  疑似扁平表格的单行长度阈值（默认 240）
 
 增量逻辑:
   - 通过状态文件 data/.convert_state 记录每个文件的转换时间戳
@@ -473,6 +507,35 @@ validate_output_file() {
     fi
 
     return 0
+}
+
+verify_output_directory_writable() {
+    local probe_file="${OUTPUT_DIR}/.lab_rag_write_probe.$$"
+    if ! (umask 077; : > "$probe_file") 2>/dev/null; then
+        log_error "输出目录不可写: ${OUTPUT_DIR}"
+        log_error "若为 CIFS，请检查服务端写权限及 fstab 的 uid/gid/file_mode/dir_mode；也可用 --output 指向本地可写目录"
+        return 1
+    fi
+    if ! rm -f "$probe_file" 2>/dev/null; then
+        log_error "输出目录可创建文件但无法删除: ${OUTPUT_DIR}"
+        log_error "请检查 CIFS 服务端删除权限，或用 --output 指向本地可写目录"
+        return 1
+    fi
+}
+
+# 检测疑似被 OCR 压成单行的技术表格；命中后可自动改用 MinerU VLM 重试。
+has_suspect_flattened_table() {
+    local output_file="$1"
+    awk -v min_chars="${TABLE_FLATTENED_LINE_MIN_CHARS}" '
+        length($0) >= min_chars {
+            hits = 0
+            if ($0 ~ /(变量类型|参数名称|字段名称|列名|序号|parameter|column)/) hits++
+            if ($0 ~ /(单位|说明|含义|格式|规格|类型|description|unit|type)/) hits++
+            if ($0 ~ /(标量|集合|向量|矩阵|最大值|最小值|默认值|范围|vector|matrix|default|range)/) hits++
+            if (hits >= 3) found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$output_file"
 }
 
 # ========== 依赖检测与引擎选择 ==========
@@ -966,11 +1029,22 @@ convert_pptx_fallback() {
 convert_document_once() {
     local source_file="$1"
     local target_md="$2"
+    local size_bytes size_mb size_timeout effective_timeout
 
     if [[ "$ENGINE" == "none" ]]; then
         log_error "无可用的文档转换引擎，跳过: $(basename "$source_file")"
         return 1
     fi
+
+    size_bytes="$(get_file_size_bytes "$source_file")"
+    effective_timeout="$CONVERT_TIMEOUT"
+    if [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+        size_mb=$(( (size_bytes + 1048575) / 1048576 ))
+        size_timeout=$(( size_mb * CONVERT_TIMEOUT_PER_MB ))
+        (( size_timeout > effective_timeout )) && effective_timeout="$size_timeout"
+    fi
+    (( effective_timeout > CONVERT_MAX_TIMEOUT )) && effective_timeout="$CONVERT_MAX_TIMEOUT"
+    log_debug "转换超时预算: $(basename "$source_file") -> ${effective_timeout}s"
 
     # 导出环境变量，让 timeout 子进程自动继承
     export CONDA_CMD CONDA_ENV_NAME BACKEND DEVICE LOG_FILE
@@ -1023,13 +1097,13 @@ convert_document_once() {
         } > "$tmp_script"
         chmod +x "$tmp_script"
 
-        $timeout_cmd "${CONVERT_TIMEOUT}" bash "$tmp_script" "$source_file" "$target_md"
+        $timeout_cmd "${effective_timeout}" bash "$tmp_script" "$source_file" "$target_md"
         convert_result=$?
         rm -f "$tmp_script"
 
         # timeout 返回 124 表示超时
         if [[ $convert_result -eq 124 ]]; then
-            log_error "转换超时 (${CONVERT_TIMEOUT}s): $(basename "$source_file")"
+            log_error "转换超时 (${effective_timeout}s): $(basename "$source_file")"
             return 1
         fi
     else
@@ -1259,7 +1333,7 @@ log_info "转换引擎: ${ENGINE}"
 [[ "$ENGINE" == "mineru" ]] && log_info "MinerU 后端: ${BACKEND}"
 log_info "运行设备: ${DEVICE}"
 log_info "模式: $([ "$FULL_MODE" == "true" ] && echo "全量转换" || echo "增量转换")"
-log_info "超时: ${CONVERT_TIMEOUT}s | 重试: ${CONVERT_MAX_RETRIES}次 | 大小上限: ${MAX_FILE_SIZE_MB}MB"
+log_info "超时: 基础 ${CONVERT_TIMEOUT}s / ${CONVERT_TIMEOUT_PER_MB}s 每 MB / 上限 ${CONVERT_MAX_TIMEOUT}s | 重试: ${CONVERT_MAX_RETRIES}次 | 大小上限: ${MAX_FILE_SIZE_MB}MB"
 [[ "$DRY_RUN" == "true" ]] && log_info "DRY-RUN 模式：仅预览，不实际转换"
 
 echo ""
@@ -1267,7 +1341,8 @@ echo -e "  引擎:   ${GREEN}${ENGINE}${NC}"
 [[ "$ENGINE" == "mineru" ]] && echo -e "  后端:   ${GREEN}${BACKEND}${NC}"
 echo -e "  设备:   ${GREEN}${DEVICE}${NC}"
 echo -e "  模式:   ${GREEN}$([ "$FULL_MODE" == "true" ] && echo "全量" || echo "增量")${NC}"
-echo -e "  超时:   ${GREEN}${CONVERT_TIMEOUT}s${NC}  重试: ${GREEN}${CONVERT_MAX_RETRIES}${NC}次"
+echo -e "  超时:   ${GREEN}${CONVERT_TIMEOUT}s${NC} 基础 / ${GREEN}${CONVERT_TIMEOUT_PER_MB}s${NC} 每 MB / ${GREEN}${CONVERT_MAX_TIMEOUT}s${NC} 上限"
+echo -e "  重试:   ${GREEN}${CONVERT_MAX_RETRIES}${NC}次  大小上限: ${GREEN}${MAX_FILE_SIZE_MB}MB${NC}"
 echo ""
 
 # 验证源目录
@@ -1283,7 +1358,13 @@ fi
 
 # 创建输出目录（如果与源目录不同）
 if [[ "${OUTPUT_DIR}" != "${SOURCE_DIR}" ]]; then
-    mkdir -p "${OUTPUT_DIR}"
+    if ! mkdir -p "${OUTPUT_DIR}"; then
+        log_error "无法创建输出目录: ${OUTPUT_DIR}"
+        exit 1
+    fi
+fi
+if [[ "$DRY_RUN" != "true" ]]; then
+    verify_output_directory_writable || exit 1
 fi
 
 # ========== 收集需要处理的文件 ==========
@@ -1525,6 +1606,19 @@ for i in "${!files_to_convert[@]}"; do
             if ( convert_document_with_retry "$source_file" "$target_tmp" ); then
                 if validate_output_file "$target_tmp"; then
                     convert_success=true
+                    if [[ "$CONVERT_TABLE_VLM_FALLBACK" == "true" && "$ENGINE" == "mineru" && "$BACKEND" != "vlm" ]] && \
+                            has_suspect_flattened_table "$target_tmp"; then
+                        vlm_tmp="${target_tmp}.vlm"
+                        rm -f "$vlm_tmp"
+                        log_warn "检测到疑似扁平表格，自动使用 MinerU VLM 重试: $(basename "$source_file")"
+                        if ( BACKEND=vlm; convert_document_once "$source_file" "$vlm_tmp" ) && validate_output_file "$vlm_tmp"; then
+                            mv -f "$vlm_tmp" "$target_tmp"
+                            log_info "VLM 表格恢复转换成功: $(basename "$source_file")"
+                        else
+                            rm -f "$vlm_tmp"
+                            log_warn "VLM 表格恢复失败，保留原转换结果并由入库质量保护处理: $(basename "$source_file")"
+                        fi
+                    fi
                 else
                     fail_reason="转换产生空文件或过小文件"
                     rm -f "$target_tmp"
