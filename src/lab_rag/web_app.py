@@ -39,7 +39,7 @@ from .rag_agent import (
 )
 
 from .logger import get_logger
-from .paths import resolve_project_path
+from .paths import PROJECT_ROOT, resolve_project_path
 
 _logger = get_logger("web")
 
@@ -95,7 +95,8 @@ def _clear_login_failures(ip: str):
 _MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "20"))
 _request_semaphore = BoundedSemaphore(_MAX_CONCURRENT_REQUESTS)
 
-app = Flask(__name__)
+TEMPLATE_DIR = PROJECT_ROOT / "src" / "lab_rag" / "templates"
+app = Flask(__name__, template_folder=str(TEMPLATE_DIR))
 
 # Flask 密钥加固
 secret_key = os.getenv("FLASK_SECRET_KEY", "")
@@ -299,7 +300,7 @@ def _validated_mcp_limit(value, default: int, maximum: int):
 def _project_catalog_result(file_result: dict, limit: int) -> dict:
     """限制目录结果数量，保持原始字段结构不变。"""
     projected = dict(file_result or {})
-    if projected.get("mode") == "filesystem_directory":
+    if projected.get("mode") in {"filesystem_directory", "qdrant_directory"}:
         directories = list(projected.get("directories") or [])[:limit]
         remaining = max(0, limit - len(directories))
         projected["directories"] = directories
@@ -488,8 +489,8 @@ def login():
             "message": "登录成功。",
             "username": username
         })
-    except Exception as e:
-        _logger.debug(traceback.format_exc())
+    except Exception:
+        _logger.exception("登录请求处理失败")
         # 不向客户端暴露详细错误
         return jsonify({"success": False, "error": "服务器内部错误，请稍后重试。"}), 500
 

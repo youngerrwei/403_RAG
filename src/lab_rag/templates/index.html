@@ -10,7 +10,12 @@
     <script nonce="{{ nonce }}" src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
     <script nonce="{{ nonce }}">
         window.MathJax = {
-            tex: { inlineMath: [['$', '$'], ['\\(', '\\)']], displayMath: [['$$', '$$'], ['\\[', '\\]']] },
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                // 字符串拼接可避开 Jinja 将左花括号与井号误判为模板注释起始符。
+                macros: { bs: ['\\boldsymbol{' + '#1}', 1] }
+            },
             svg: { fontCache: 'global' },
             options: { skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'] }
         };
@@ -648,7 +653,24 @@
     window.addEventListener("resize", syncLayoutHeight);
 
     marked.setOptions({ gfm: true, breaks: true });
-    function renderMarkdown(text) { return DOMPurify.sanitize(marked.parse(text || "")); }
+    function renderMarkdown(text) {
+        // 先保护 LaTeX，防止 marked 把 _ 当作 Markdown 强调符并破坏 MathJax 输入。
+        const mathSegments = [];
+        const protectedText = String(text || "").replace(
+            /\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)|\$[^$\n]+\$/g,
+            value => {
+                const index = mathSegments.push(value) - 1;
+                return `MATHSEGMENTTOKEN${index}END`;
+            }
+        );
+        let html = marked.parse(protectedText);
+        html = html.replace(/MATHSEGMENTTOKEN(\d+)END/g, (_, rawIndex) => {
+            // LLM 常为规避 Markdown 将下标写成 \_；数学环境中应恢复为真正的 _。
+            const value = (mathSegments[Number(rawIndex)] || "").replace(/\\_/g, "_");
+            return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        });
+        return DOMPurify.sanitize(html);
+    }
     // 剥离 LLM 思考过程标签，避免 DOMPurify 清除时吐掉后续内容
     function stripThinkTags(text) {
         if (!text) return '';
@@ -857,11 +879,12 @@
         if (!fileResult) { box.innerHTML = '<div class="muted">暂无目录或文件结果</div>'; return; }
         // 省略中间一大段不需修改的渲染逻辑...
         const mode = fileResult.mode || "";
-        if (mode === "filesystem_directory") {
+        if (mode === "filesystem_directory" || mode === "qdrant_directory") {
             const matchedDir = fileResult.matched_dir || "";
             const dirs = fileResult.directories || [];
             const files = fileResult.files || [];
-            let html = `<div class="catalog-card"><div><strong>模式：</strong>目录定位</div><div><strong>匹配目录：</strong>${escapeHtml(matchedDir)}</div></div>`;
+            const modeLabel = mode === "qdrant_directory" ? "索引目录定位" : "目录定位";
+            let html = `<div class="catalog-card"><div><strong>模式：</strong>${modeLabel}</div><div><strong>匹配目录：</strong>${escapeHtml(matchedDir)}</div></div>`;
             if (dirs.length) {
                 html += `<div class="catalog-section-title">下一级子目录</div>`;
                 html += dirs.map((d, i) => `<div class="catalog-item"><span class="catalog-index">${i + 1}.</span><span class="catalog-type">[目录]</span><span class="catalog-name">${escapeHtml(d.name || "")}</span><div class="catalog-path">${escapeHtml(d.rel_path || "")}</div></div>`).join("");
@@ -874,7 +897,17 @@
             box.innerHTML = html; return;
         }
         const entries = fileResult.entries || [];
-        if (!entries.length) { box.innerHTML = '<div class="muted">未找到匹配的目录或文件。</div>'; return; }
+        if (!entries.length) {
+            const checkedRoots = (fileResult.checked_roots || []).map(item => {
+                const state = item.exists && item.is_dir && item.readable ? "可读但无匹配" : "不可用";
+                return `${item.path || "未知路径"}（${state}）`;
+            });
+            let html = '<div class="muted">未找到匹配的目录或文件。</div>';
+            if (fileResult.query) html += `<div class="catalog-path">检索目标：${escapeHtml(fileResult.query)}</div>`;
+            if (checkedRoots.length) html += `<div class="catalog-path">已检查：${escapeHtml(checkedRoots.join("；"))}</div>`;
+            box.innerHTML = html;
+            return;
+        }
         let html = `<div class="catalog-card"><div><strong>模式：</strong>${escapeHtml(mode || "搜索")}</div><div><strong>结果数：</strong>${entries.length}</div></div>`;
         html += entries.slice(0, 100).map((item, i) => {
             const type = item.type || "file";
