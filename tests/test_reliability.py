@@ -147,6 +147,15 @@ class ScriptContractTests(unittest.TestCase):
             "MCP_RESULT_LIMIT",
             "MCP_RESULT_MAX_CHARS",
             "VLLM_STARTUP_TIMEOUT",
+            "VLLM_INFERENCE_PROBE_TIMEOUT",
+            "VLLM_ENABLE_THINKING",
+            "CATALOG_SCAN_LIMIT",
+            "ENABLE_TABLE_SEMANTIC_ENRICHMENT",
+            "TABLE_SEMANTIC_MAX_ROWS",
+            "CONVERT_TABLE_VLM_FALLBACK",
+            "TABLE_FLATTENED_LINE_MIN_CHARS",
+            "CONVERT_TIMEOUT_PER_MB",
+            "CONVERT_MAX_TIMEOUT",
             "WEBAPP_STARTUP_TIMEOUT",
             "HEALTHCHECK_TIMEOUT",
             "RUNTIME_RETRY_INTERVAL",
@@ -154,6 +163,9 @@ class ScriptContractTests(unittest.TestCase):
         }
         self.assertFalse(required - values.keys())
         self.assertEqual(values["FLASK_SECRET_KEY"], "")
+        self.assertEqual(values["MAX_FILE_SIZE_MB"], "200")
+        self.assertEqual(values["CONVERT_TIMEOUT_PER_MB"], "20")
+        self.assertEqual(values["CONVERT_MAX_TIMEOUT"], "3600")
         self.assertEqual(values["MCP_INTERNAL_TOKEN"], "")
         self.assertEqual(values["QDRANT_RECREATE_COLLECTION"], "false")
 
@@ -193,10 +205,48 @@ class ScriptContractTests(unittest.TestCase):
         converter = (PROJECT_ROOT / "scripts" / "convert_to_md.sh").read_text(encoding="utf-8")
         ingest = (PROJECT_ROOT / "scripts" / "auto_ingest.sh").read_text(encoding="utf-8")
         starter = (PROJECT_ROOT / "scripts" / "start_rag.sh").read_text(encoding="utf-8")
+        vllm_starter = (PROJECT_ROOT / "scripts" / "start_vllm.sh").read_text(encoding="utf-8")
         self.assertIn('RAG_ENV_FILE:-${PROJECT_ROOT}/.env', converter)
         self.assertIn("require_option_value", converter)
         self.assertIn("manifest_paths", ingest)
+        self.assertIn("PYTHONUNBUFFERED=1", ingest)
+        self.assertIn('2>&1 | tee -a "$LOG_FILE"', ingest)
+        self.assertIn("PIPESTATUS[0]", ingest)
+        self.assertIn("report_lock_holders", ingest)
+        self.assertIn('lsof -t "$LOCK_FILE"', ingest)
+        self.assertIn("probe_vllm_inference", vllm_starter)
+        self.assertIn("真实生成探针失败", vllm_starter)
+        self.assertIn("expected_vllm_listener", vllm_starter)
+        self.assertIn("stop --orphan", vllm_starter)
         self.assertIn("服务进程启动成功（degraded）", starter)
+        self.assertIn("已验证进程身份和健康接口并重新纳管", starter)
+        self.assertIn("templates/login.html", starter)
+        self.assertIn("templates/index.html", starter)
+        self.assertIn("has_suspect_flattened_table", converter)
+        self.assertIn("BACKEND=vlm", converter)
+        self.assertIn("verify_output_directory_writable", converter)
+        self.assertIn("输出目录可创建文件但无法删除", converter)
+        self.assertIn("require_positive_integer_config", converter)
+        self.assertIn("CONVERT_TIMEOUT_PER_MB", converter)
+        self.assertIn("effective_timeout", converter)
+        rag_source = (PROJECT_ROOT / "src" / "lab_rag" / "rag_agent.py").read_text(encoding="utf-8")
+        self.assertIn("chat_template_kwargs", rag_source)
+        self.assertIn("CATALOG_SCAN_LIMIT", rag_source)
+        self.assertIn("build_catalog_answer_section", rag_source)
+        agent_source = (PROJECT_ROOT / "src" / "lab_rag" / "agent_entry.py").read_text(encoding="utf-8")
+        self.assertIn('"tool_name": "list_catalog_entries"', agent_source)
+        self.assertIn('rag_result.get("file_result")', agent_source)
+        self.assertIn('"file_result": latest_catalog_result', agent_source)
+
+    def test_readme_documents_persistent_cifs_mount(self):
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("//172.18.216.71/Share /mnt/cpu_share cifs", readme)
+        self.assertIn("credentials=/etc/samba/cpu_share.credentials", readme)
+        self.assertIn("_netdev,nofail,x-systemd.automount", readme)
+        self.assertIn("findmnt -rn -t cifs -T /mnt/cpu_share", readme)
+        self.assertIn("systemctl start mnt-cpu_share.automount", readme)
+        self.assertNotIn("systemctl restart mnt-cpu_share.automount", readme)
+        self.assertIn("findmnt -T /mnt/cpu_share", readme)
 
     def test_shell_entrypoints_target_the_packaged_modules(self):
         entrypoints = {
@@ -276,6 +326,165 @@ class WebContractTests(unittest.TestCase):
             session["username"] = "reliability-test"
         return client
 
+    def test_login_page_renders_from_packaged_template(self):
+        self.assertEqual(
+            Path(self.web_app.app.template_folder).resolve(),
+            (PROJECT_ROOT / "src" / "lab_rag" / "templates").resolve(),
+        )
+        response = self.web_app.app.test_client().get("/login")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("LAB-403 登录", response.get_data(as_text=True))
+
+    def test_vlc_hybrid_route_lists_group_devices(self):
+        question = "VLC小组的设备和使用规范"
+        route = self.rag_agent.rule_based_route(question)
+        self.assertEqual(route["route"], "hybrid")
+        self.assertEqual(route["target"], "VLC小组")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            group_dir = Path(temp_dir) / "设备操作指南" / "VLC小组"
+            device_dir = group_dir / "HOLOEYE LETO-3 空间光调制器"
+            device_dir.mkdir(parents=True)
+            (group_dir / "VLC小组设备使用规范.md").write_text("规范", encoding="utf-8")
+
+            runtime = {
+                "config": {
+                    "KNOWLEDGE_BASE_ROOT": temp_dir,
+                    "ENABLE_FILESYSTEM_TOOL": True,
+                    "FILE_SEARCH_LIMIT": 200,
+                    "DIRECTORY_CHILD_LIMIT": 200,
+                }
+            }
+            with patch.object(self.rag_agent, "_runtime", runtime):
+                result = self.rag_agent.list_catalog_entries(route["target"])
+
+        self.assertEqual(result["mode"], "filesystem_directory")
+        self.assertEqual(result["matched_dir"], "设备操作指南/VLC小组")
+        self.assertIn("HOLOEYE LETO-3 空间光调制器", {item["name"] for item in result["directories"]})
+        self.assertIn("VLC小组设备使用规范.md", {item["name"] for item in result["files"]})
+        self.assertEqual(self.rag_agent.catalog_result_count(result), 2)
+        catalog_queries = self.rag_agent.build_catalog_retrieval_queries(result, route["target"], question)
+        self.assertNotIn(question, catalog_queries)
+        self.assertTrue(all("使用方法" in query for query in catalog_queries))
+
+    def test_content_format_routes_to_document_search(self):
+        route = self.rag_agent.rule_based_route("文档格式是什么")
+        self.assertEqual(route["route"], "rag_search")
+        self.assertEqual(route["target"], "文档格式是什么")
+        self.assertFalse(self.rag_agent.should_skip_rewrite("规范怎么写"))
+        self.assertTrue(self.rag_agent.should_skip_rewrite("文档格式"))
+
+        forbidden_entity = "\u5468\u62a5"
+        for module_name in ("rag_agent.py", "agent_entry.py"):
+            runtime_source = (PROJECT_ROOT / "src" / "lab_rag" / module_name).read_text(encoding="utf-8")
+            self.assertNotIn(forbidden_entity, runtime_source)
+
+        # 明确同时询问设备清单和规范的既有场景仍保持混合路由。
+        hybrid = self.rag_agent.rule_based_route("VLC小组有哪些设备及使用规范")
+        self.assertEqual(hybrid["route"], "hybrid")
+
+    def test_qdrant_catalog_collapses_manuals_to_device_level(self):
+        entries = [
+            {
+                "rel_path": "设备操作指南/VLC小组/HOLOEYE LETO-3 空间光调制器/Manuals/LETO-3-Manual.md",
+                "count": 100,
+            },
+            {
+                "rel_path": "设备操作指南/VLC小组/HOLOEYE LETO-3 空间光调制器/Application.md",
+                "count": 20,
+            },
+            {
+                "rel_path": "设备操作指南/VLC小组/Keysight EDU36311A 电源/User-Guide.md",
+                "count": 30,
+            },
+        ]
+        result = self.rag_agent.collapse_qdrant_entries_to_directory(entries, "VLC小组")
+        self.assertEqual(result["mode"], "qdrant_directory")
+        self.assertEqual(result["matched_dir"], "设备操作指南/VLC小组")
+        self.assertEqual(
+            {item["name"] for item in result["directories"]},
+            {"HOLOEYE LETO-3 空间光调制器", "Keysight EDU36311A 电源"},
+        )
+        self.assertEqual(result["files"], [])
+
+    def test_summary_sanitization_removes_thinking_and_pollution(self):
+        self.assertEqual(self.rag_agent.sanitize_summary("<think>internal</think> clean summary"), "clean summary")
+        self.assertEqual(self.rag_agent.sanitize_summary("知识库中未找到足够相关内容。"), "")
+        leaked = "有效回答。\n```\n上下文结果：\n[目录/文件结果]\n重复内容"
+        self.assertEqual(self.rag_agent.sanitize_generated_answer(leaked), "有效回答。")
+
+    def test_retrieval_display_preserves_markdown_table_rows(self):
+        table = "| 类型 | 格式 |\n| --- | --- |\n| 向量、矩阵 | 正体+粗体 |"
+        cleaned = self.rag_agent.clean_retrieval_display_text(table)
+        self.assertEqual(cleaned.count("\n"), 2)
+        self.assertIn("| 向量、矩阵 | 正体+粗体 |", cleaned)
+
+    def test_notation_answer_respects_ordered_vector_matrix_examples(self):
+        context = (
+            "[来源1] [文档标题] 论文格式规范\n"
+            "- 变量类型=向量、矩阵；英文字母=正体+粗体，例：$\\mathbf{k}$、$\\mathbf{K}$；"
+            "罗马字母=正体+粗体，例：$\\bs{\\lambda}$、$\\bs{\\theta}$"
+        )
+        answer = self.rag_agent.build_grounded_notation_answer(context)
+        self.assertIn(r"向量使用小写正体粗体，如 $\mathbf{k}$", answer)
+        self.assertIn(r"矩阵使用大写正体粗体，如 $\mathbf{K}$", answer)
+        self.assertNotIn("并未用大小写区分", answer)
+
+    def test_agent_multiline_answer_excludes_reasoning_prefix(self):
+        from lab_rag.agent_entry import parse_answer
+
+        output = "Thought: 已完成检索。\nAnswer: 第一行\n第二行\n主要来源：VLC小组"
+        self.assertEqual(parse_answer(output), "第一行\n第二行\n主要来源：VLC小组")
+
+    def test_agent_tool_contract_is_route_generic(self):
+        from lab_rag.agent_entry import expected_agent_tool
+
+        self.assertEqual(expected_agent_tool("rag_search", False, False), "rag_qa")
+        self.assertIsNone(expected_agent_tool("rag_search", False, True))
+        self.assertEqual(expected_agent_tool("file_list", False, False), "list_group_files")
+        self.assertIsNone(expected_agent_tool("file_list", True, False))
+        self.assertEqual(expected_agent_tool("hybrid", False, False), "list_group_files")
+        self.assertEqual(expected_agent_tool("hybrid", True, False), "rag_qa")
+        self.assertIsNone(expected_agent_tool("hybrid", True, True))
+
+    def test_agent_model_must_emit_the_tool_action(self):
+        from lab_rag import agent_entry
+
+        class Response:
+            def __init__(self, content):
+                self.content = content
+
+        class FakeLlm:
+            def __init__(self):
+                self.responses = iter((
+                    'Thought: 先找模板。\nAction: list_group_files["文档格式"]',
+                    'Thought: 应检索正文。\nAction: rag_qa["规范怎么写"]',
+                    'Answer: 根据知识库内容回答 [来源1]',
+                ))
+                self.invoke_count = 0
+
+            def invoke(self, _messages):
+                self.invoke_count += 1
+                return Response(next(self.responses))
+
+        fake_llm = FakeLlm()
+        with patch.object(agent_entry, "build_qwen_llm", return_value=fake_llm), \
+                patch.object(
+                    agent_entry,
+                    "ask_rag",
+                    return_value={"answer": "知识库观察结果 [来源1]", "file_result": None},
+                ) as mocked_rag, \
+                patch.object(agent_entry, "list_catalog_entries") as mocked_catalog, \
+                patch.object(agent_entry, "append_user_chat_history"):
+            events = list(agent_entry.ask_agent_stream("规范怎么写", username="tester"))
+
+        self.assertEqual(fake_llm.invoke_count, 3)
+        mocked_catalog.assert_not_called()
+        mocked_rag.assert_called_once_with("规范怎么写", username="tester")
+        tool_events = [event for event in events if event["type"] == "step_tool"]
+        self.assertEqual([event["tool"] for event in tool_events], ["rag_qa"])
+        self.assertEqual(events[-1]["content"], "根据知识库内容回答 [来源1]")
+
     def test_health_requires_llm_but_allows_qdrant_degraded(self):
         with self._client() as client:
             with patch(
@@ -349,6 +558,66 @@ class WebContractTests(unittest.TestCase):
 
 
 class IngestContractTests(unittest.TestCase):
+    def test_clean_text_preserves_and_enriches_variable_format_table(self):
+        from lab_rag.ingest import clean_text
+
+        markdown = """### 3、变量格式：
+
+| 变量类型 | 英文字母 | 罗马字母 |
+| --- | --- | --- |
+| 标量 | 斜体，例：$k$ | 不限格式，例：$\\alpha$ |
+| 集合 | 正体+大写，例：$\\mathrm{K}$ | 大写，例：$\\Omega$、$\\Phi$ |
+| 向量、矩阵 | 正体+粗体，例：$\\mathbf{k}$、$\\mathbf{K}$ | 正体+粗体，例：$\\bs{\\lambda}$、$\\bs{\\theta}$ |
+"""
+        cleaned = clean_text(markdown)
+        self.assertIn("\n| 变量类型 | 英文字母 | 罗马字母 |\n", cleaned)
+        self.assertIn("[表格结构化转写]", cleaned)
+        self.assertIn("变量类型=向量、矩阵", cleaned)
+        self.assertIn("英文字母=正体+粗体", cleaned)
+        self.assertIn(r"罗马字母=正体+粗体，例：$\bs{\lambda}$、$\bs{\theta}$", cleaned)
+
+        flattened = (
+            "3、变量格式：变量类型英文字母罗马字母标量斜体，例：k不限格式，例：α"
+            "集合正体+大写，例：K大写，例：Ω、Φ向量、矩阵正体+粗体，例：k、K"
+            "正体+粗体，例：λ、θ 注：罗马字母的正体+粗体命令：\\bs{}"
+        )
+        recovered = clean_text(flattened)
+        self.assertIn("[变量格式表语义恢复]", recovered)
+        self.assertIn("明确规则：向量和矩阵均使用正体粗体，不能写成普通斜体", recovered)
+        self.assertIn(r"英文字母向量用小写正体粗体 $\mathbf{k}$", recovered)
+        self.assertIn(r"矩阵用大写正体粗体 $\mathbf{K}$", recovered)
+
+        generic_table = "| 参数 | 单位 |\n| --- | --- |\n| 功率 | dBm |"
+        generic_cleaned = clean_text(generic_table)
+        self.assertIn("参数=功率；单位=dBm", generic_cleaned)
+
+    def test_vllm_availability_requires_real_generation(self):
+        from lab_rag import ingest
+
+        class FakeResponse:
+            def __init__(self, status_code=200, payload=None):
+                self.status_code = status_code
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        cfg = {
+            "VLLM_BASE_URL": "http://127.0.0.1:8000/v1",
+            "VLLM_API_KEY": "test-key",
+            "VLLM_MODEL_NAME": "./models/Qwen3-8B-Instruct",
+            "VLLM_INFERENCE_PROBE_TIMEOUT": 1,
+        }
+        with patch.object(ingest.requests, "get", return_value=FakeResponse()):
+            with patch.object(
+                    ingest.requests,
+                    "post",
+                    return_value=FakeResponse(payload={"choices": [{"message": {"content": "OK"}}]}),
+            ):
+                self.assertTrue(ingest.check_vllm_availability(cfg))
+            with patch.object(ingest.requests, "post", side_effect=ingest.requests.Timeout):
+                self.assertFalse(ingest.check_vllm_availability(cfg))
+
     def test_parent_ids_are_deterministic(self):
         from lab_rag.ingest import generate_parent_point_id
 

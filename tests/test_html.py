@@ -128,6 +128,11 @@ def main():
         parse_ok,
         "" if parse_ok else f"解析错误: {parse_error}",
     )
+    T.check(
+        "Jinja 注释标签完整闭合",
+        html_content.count("{#") == html_content.count("#}"),
+        "防止 JavaScript 字符串中的 {# 被误判为未闭合的 Jinja 注释",
+    )
 
     # 问答输入区域
     T.check(
@@ -199,6 +204,16 @@ def main():
         "renderSourceLinks 函数定义存在",
         bool(re.search(r'\bfunction\s+renderSourceLinks\s*\(', js_text)),
         "搜索 function renderSourceLinks(",
+    )
+    T.check(
+        "Markdown 渲染前保护 LaTeX 片段",
+        "MATHSEGMENTTOKEN" in js_text and "mathSegments" in js_text,
+        "防止 marked 破坏公式中的下标和星号",
+    )
+    T.check(
+        "数学环境恢复转义下标",
+        '.replace(/\\\\_/g, "_")' in js_text,
+        "将 LLM 输出的 \\_ 恢复为 LaTeX 下标 _",
     )
 
     # HISTORY_STATE 对象（含 SYNCED/MODIFIED/SAVING）
