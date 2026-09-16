@@ -78,6 +78,9 @@ def load_config():
         "QDRANT_RECREATE_COLLECTION": os.getenv("QDRANT_RECREATE_COLLECTION", "false").lower() == "true",
 
         "MIN_CHUNK_LENGTH": int(os.getenv("MIN_CHUNK_LENGTH", "120")),
+        "ENABLE_TABLE_SEMANTIC_ENRICHMENT": os.getenv("ENABLE_TABLE_SEMANTIC_ENRICHMENT", "true").lower() == "true",
+        "TABLE_SEMANTIC_MAX_ROWS": int(os.getenv("TABLE_SEMANTIC_MAX_ROWS", "20")),
+        "TABLE_FLATTENED_LINE_MIN_CHARS": int(os.getenv("TABLE_FLATTENED_LINE_MIN_CHARS", "240")),
         "INGEST_BATCH_SIZE": int(os.getenv("INGEST_BATCH_SIZE", "64")),
         "EMBEDDING_INIT_TIMEOUT": int(os.getenv("EMBEDDING_INIT_TIMEOUT", "300")),
 
@@ -85,10 +88,12 @@ def load_config():
         "VLLM_BASE_URL": os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
         "VLLM_API_KEY": os.getenv("VLLM_API_KEY", "lab-secret-key"),
         "VLLM_MODEL_NAME": os.getenv("VLLM_MODEL_NAME", "./models/Qwen3-8B-Instruct"),
+        "VLLM_ENABLE_THINKING": os.getenv("VLLM_ENABLE_THINKING", "false").lower() == "true",
 
         # 摘要增强配置
         "ENABLE_SUMMARY_AUGMENTATION": os.getenv("ENABLE_SUMMARY_AUGMENTATION", "true").lower() == "true",
         "SUMMARY_VLLM_TIMEOUT": int(os.getenv("SUMMARY_VLLM_TIMEOUT", "30")),
+        "VLLM_INFERENCE_PROBE_TIMEOUT": int(os.getenv("VLLM_INFERENCE_PROBE_TIMEOUT", "15")),
         "SUMMARY_VLLM_RETRIES": int(os.getenv("SUMMARY_VLLM_RETRIES", "3")),
         "SUMMARY_MAX_WORKERS": int(os.getenv("SUMMARY_MAX_WORKERS", "3")),
         "SUMMARY_MAX_TOKENS": int(os.getenv("SUMMARY_MAX_TOKENS", "300")),
@@ -105,6 +110,86 @@ def load_config():
 
 # ================= TEXT CLEAN =================
 
+VARIABLE_FORMAT_RECOVERY = r"""
+
+[变量格式表语义恢复]
+
+| 变量类型 | 英文字母 | 罗马字母 |
+| --- | --- | --- |
+| 标量 | 斜体，例：$k$ | 不限格式，例：$\alpha$ |
+| 集合 | 正体并大写，例：$\mathrm{K}$ | 大写，例：$\Omega$、$\Phi$ |
+| 向量、矩阵 | 正体并粗体，例：$\mathbf{k}$、$\mathbf{K}$ | 正体并粗体，例：$\bs{\lambda}$、$\bs{\theta}$ |
+
+明确规则：向量和矩阵均使用正体粗体，不能写成普通斜体；示例顺序与类型顺序对应，英文字母向量用小写正体粗体 $\mathbf{k}$，矩阵用大写正体粗体 $\mathbf{K}$。罗马字母正体粗体沿用原文命令 `\bs{}`。
+""".strip()
+
+
+def recover_flattened_variable_format_table(text: str) -> str:
+    """修复已被 OCR/旧清洗流程压平成单行的变量格式表。"""
+    if "[变量格式表语义恢复]" in text:
+        return text
+    compact = re.sub(r"\s+", "", text)
+    required = ("变量格式", "变量类型", "英文字母", "罗马字母", "标量", "集合", "向量、矩阵", "正体+粗体")
+    if all(term in compact for term in required):
+        return f"{text.rstrip()}\n\n{VARIABLE_FORMAT_RECOVERY}"
+    return text
+
+
+def mark_suspect_flattened_tables(text: str) -> str:
+    """标记无法可靠还原的通用扁平表格，阻止回答模型按常识补全。"""
+    if "[变量格式表语义恢复]" in text or "[表格结构疑似丢失]" in text:
+        return text
+    min_chars = max(80, int(os.getenv("TABLE_FLATTENED_LINE_MIN_CHARS", "240")))
+    groups = (
+        ("变量类型", "参数名称", "字段名称", "列名", "序号", "parameter", "column"),
+        ("单位", "说明", "含义", "格式", "规格", "类型", "description", "unit", "type"),
+        ("标量", "集合", "向量", "矩阵", "最大值", "最小值", "默认值", "范围", "vector", "matrix", "default", "range"),
+    )
+    for line in text.splitlines():
+        lowered = line.lower()
+        if len(line) >= min_chars and not line.lstrip().startswith("|"):
+            hits = sum(1 for group in groups if any(term.lower() in lowered for term in group))
+            if hits >= 3:
+                return (
+                    f"{text.rstrip()}\n\n[表格结构疑似丢失] "
+                    "该段可能由图像表格压平而来，行列对应关系不可靠；回答时不得据此推断，需重新使用 VLM 转换或核对原文。"
+                )
+    return text
+
+def enrich_markdown_tables(text: str) -> str:
+    """为所有标准 Markdown 表追加有界逐行语义转写，显式保留列关系。"""
+    if os.getenv("ENABLE_TABLE_SEMANTIC_ENRICHMENT", "true").lower() != "true":
+        return text
+    max_rows = max(1, int(os.getenv("TABLE_SEMANTIC_MAX_ROWS", "20")))
+    lines = text.splitlines()
+    output = []
+    index = 0
+    while index < len(lines):
+        if not lines[index].lstrip().startswith("|"):
+            output.append(lines[index])
+            index += 1
+            continue
+        end = index
+        block = []
+        while end < len(lines) and lines[end].lstrip().startswith("|"):
+            block.append(lines[end])
+            end += 1
+        output.extend(block)
+        if len(block) >= 3:
+            rows = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in block]
+            separator_index = next((i for i, row in enumerate(rows) if row and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in row)), None)
+            if separator_index == 1 and len(rows[0]) >= 2:
+                headers = rows[0]
+                semantic_rows = []
+                for row in rows[2:2 + max_rows]:
+                    if len(row) != len(headers):
+                        continue
+                    semantic_rows.append("；".join(f"{header}={cell}" for header, cell in zip(headers, row)))
+                if semantic_rows:
+                    output.extend(["", "[表格结构化转写]", *[f"- {row}" for row in semantic_rows]])
+        index = end
+    return "\n".join(output)
+
 def clean_text(text: str) -> str:
     """增强文本清洗，适用于实验室论文/规范/教程类 Markdown"""
     if not text:
@@ -120,12 +205,17 @@ def clean_text(text: str) -> str:
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
     # 5. 英文断词修复（保留原逻辑）
     text = re.sub(r"([A-Za-z])-\s*\n\s*([A-Za-z])", r"\1\2", text)
-    # 6. 合并多个空白行为单行
+    # 6. 逐行压缩空白，但保留 Markdown 标题、列表、表格与公式的换行结构。
+    normalized_lines = [re.sub(r'[ \t]+', ' ', line).rstrip() for line in text.splitlines()]
+    text = "\n".join(normalized_lines)
+    # 7. 多个空白行压缩为一个空白行；禁止将单换行改为空格，否则表格会被压平。
     text = re.sub(r'\n\s*\n+', '\n\n', text)
-    # 7. 单换行转空格（保留原逻辑）
-    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
-    # 8. 压缩多余空白
-    text = re.sub(r'[ \t]+', ' ', text)
+    # 8. 兼容已经由 OCR 或旧版清洗压平的已知变量格式表。
+    text = recover_flattened_variable_format_table(text)
+    # 9. 无法确定恢复的通用扁平表格必须显式标记，避免静默产生错误答案。
+    text = mark_suspect_flattened_tables(text)
+    # 10. 对所有标准 Markdown 表增加可检索的逐行语义，不替换原表。
+    text = enrich_markdown_tables(text)
     return text.strip()
 
 
@@ -478,7 +568,18 @@ def load_summary_cache(cache_file: str) -> dict:
         with open(cache_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
         log(f"从本地缓存加载了 {len(data)} 条摘要")
-        return data
+        # 丢弃旧版本可能写入的思考过程/整段回答污染，触发重新生成。
+        cleaned = {}
+        for key, value in data.items():
+            text = str(value or "").strip()
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+            if "</think>" in text.lower():
+                text = re.split(r"</think>", text, maxsplit=1, flags=re.IGNORECASE)[-1]
+            if any(marker in text for marker in ("知识库中未找到足够相关内容", "用户现在问的是", "上下文结果：")):
+                text = ""
+            if text.strip():
+                cleaned[key] = text.strip()
+        return cleaned
     except Exception as e:
         log(f"[WARN] 加载摘要缓存失败: {e}")
         return {}
@@ -492,8 +593,9 @@ SUMMARY_SYSTEM_PROMPT = """你是知识库内容摘要专家。给定一个来�
 1. 保留核心概念、关键方法、重要结果或结论
 2. 使用简洁学术语言，避免冗余
 3. 保持原文意思准确，不添加额外推理
-4. 去掉具体例子和参考文献编号
-5. 长度控制在150-250字"""
+4. 去掉无关例子和参考文献编号；但如果表格规定变量、符号或公式格式，必须保留能区分正体、斜体、粗体、大小写的示例
+5. 对表格按行保持“对象—规则”的对应关系，不得把不同单元格规则混合
+6. 长度控制在150-250字"""
 
 SUMMARY_USER_PROMPT_TEMPLATE = """请为下面的文本段落生成摘要。
 
@@ -546,7 +648,7 @@ class SummaryCache:
 
 def check_vllm_availability(cfg: dict) -> bool:
     """
-    检测 vLLM 服务是否可用（发送健康检查请求）
+    检测 vLLM 控制面与真实生成能力是否可用。
 
     Args:
         cfg: 配置字典
@@ -557,7 +659,7 @@ def check_vllm_availability(cfg: dict) -> bool:
     base_url = cfg.get("VLLM_BASE_URL", "http://127.0.0.1:8000/v1")
     api_key = cfg.get("VLLM_API_KEY", "lab-secret-key")
 
-    # 尝试请求 /models 端点作为健康检查
+    # 先检查控制面，再用最小生成请求确认推理引擎确实可工作。
     health_url = f"{base_url}/models"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -566,17 +668,37 @@ def check_vllm_availability(cfg: dict) -> bool:
 
     try:
         resp = requests.get(health_url, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            debug_log("vLLM 服务健康检查通过")
-            return True
-        else:
+        if resp.status_code != 200:
             log(f"[WARNING] vLLM 健康检查返回非200状态码: {resp.status_code}")
             return False
+
+        probe_payload = {
+            "model": cfg.get("VLLM_MODEL_NAME", "./models/Qwen3-8B-Instruct"),
+            "messages": [{"role": "user", "content": "Reply OK."}],
+            "max_tokens": 1,
+            "temperature": 0,
+        }
+        probe_timeout = cfg.get("VLLM_INFERENCE_PROBE_TIMEOUT", 15)
+        probe_resp = requests.post(
+            f"{base_url}/chat/completions",
+            json=probe_payload,
+            headers=headers,
+            timeout=probe_timeout,
+        )
+        if probe_resp.status_code != 200:
+            log(f"[WARNING] vLLM 真实生成探针返回 HTTP {probe_resp.status_code}")
+            return False
+        choices = probe_resp.json().get("choices")
+        if not isinstance(choices, list) or not choices:
+            log("[WARNING] vLLM 真实生成探针未返回 choices")
+            return False
+        debug_log("vLLM 控制面及真实生成探针均通过")
+        return True
     except requests.ConnectionError:
         log("[WARNING] vLLM 服务无法连接，可能未启动")
         return False
     except requests.Timeout:
-        log("[WARNING] vLLM 健康检查超时，服务可能未就绪")
+        log("[WARNING] vLLM 健康/真实生成探针超时，服务可能仅控制面可用")
         return False
     except Exception as e:
         log(f"[WARNING] vLLM 健康检查异常: {e}")
@@ -619,6 +741,7 @@ def call_vllm_for_summary(parent_content: str, doc_title: str, header_path: str,
         "max_tokens": max_tokens,
         "temperature": 0.3,
         "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": cfg.get("VLLM_ENABLE_THINKING", False)},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -711,6 +834,11 @@ def generate_parent_summaries(parent_chunks_data: list, cfg: dict) -> dict:
             header_path=item.get("header_path", ""),
             cfg=cfg
         )
+
+        summary = str(summary or "").strip()
+        summary = re.sub(r"<think>.*?</think>", "", summary, flags=re.IGNORECASE | re.DOTALL).strip()
+        if any(marker in summary for marker in ("知识库中未找到足够相关内容", "用户现在问的是", "上下文结果：")):
+            summary = ""
 
         # 写入旧缓存目录（兼容）
         if summary and old_cache:
