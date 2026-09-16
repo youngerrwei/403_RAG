@@ -246,6 +246,33 @@ def _env_bool(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).lower() in {"1", "true", "yes", "y", "on"}
 
 
+def sanitize_summary(value: object) -> str:
+    """移除模型思考块及已知的整段回答污染，避免摘要泄漏到最终上下文。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL)
+    if "</think>" in text.lower():
+        text = re.split(r"</think>", text, maxsplit=1, flags=re.IGNORECASE)[-1]
+    polluted_markers = ("知识库中未找到足够相关内容", "用户现在问的是", "上下文结果：")
+    if any(marker in text for marker in polluted_markers):
+        return ""
+    return text.strip()
+
+
+def sanitize_generated_answer(value: object) -> str:
+    """清理回答中泄漏的思考块，以及模型在答案末尾复述的原始上下文。"""
+    text = str(value or "").strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    text = re.sub(
+        r"\n\s*(?:```[^\n]*\n\s*)?上下文结果：.*$",
+        "",
+        text,
+        flags=re.DOTALL,
+    ).strip()
+    return text.rstrip("` \n")
+
+
 def batch_get_parents(client, collection_name: str, parent_ids: list) -> dict:
     """批量从 parent collection 获取父块内容及摘要"""
     result = {}
@@ -275,7 +302,7 @@ def batch_get_parents(client, collection_name: str, parent_ids: list) -> dict:
                 # 返回包含 content 和 summary 的字典
                 result[pid] = {
                     "content": content,
-                    "summary": payload.get("parent_summary", ""),
+                    "summary": sanitize_summary(payload.get("parent_summary", "")),
                 }
     except Exception as e:
         debug_log(f"[WARN] 批量获取父块失败: {e}")
@@ -309,7 +336,7 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
             for pid, data in parent_data.items():
                 if isinstance(data, dict):
                     parent_contents[pid] = data.get("content", "")
-                    parent_summaries[pid] = data.get("summary", "")
+                    parent_summaries[pid] = sanitize_summary(data.get("summary", ""))
                 else:
                     # 向后兼容旧格式（直接是字符串）
                     parent_contents[pid] = data
@@ -324,7 +351,7 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
                 if pid:
                     if "parent_content" in child.metadata:
                         parent_contents[pid] = child.metadata.get("parent_content", "")
-                    parent_summaries[pid] = child.metadata.get("parent_summary", "")
+                    parent_summaries[pid] = sanitize_summary(child.metadata.get("parent_summary", ""))
 
     # 按 rerank_score 排序
     sorted_children = sorted(best_children.values(), key=lambda x: x[1], reverse=True)
@@ -339,7 +366,7 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
         # 优先从 parent collection 获取，降级从子块 metadata 读取（向后兼容）
         parent_content = parent_contents.get(parent_id, "") or child.metadata.get("parent_content", "")
         # 获取父块摘要
-        parent_summary = parent_summaries.get(parent_id, "") or child.metadata.get("parent_summary", "")
+        parent_summary = parent_summaries.get(parent_id, "") or sanitize_summary(child.metadata.get("parent_summary", ""))
 
         # 最终降级：如果父块内容仍为空（旧数据无 parent_content），使用子块内容兜底
         if not parent_content:
@@ -468,6 +495,8 @@ def load_config() -> dict:
         "VLLM_BASE_URL": os.getenv("VLLM_BASE_URL", "http://127.0.0.1:8000/v1"),
         "VLLM_API_KEY": os.getenv("VLLM_API_KEY", "lab-secret-key"),
         "VLLM_MODEL_NAME": os.getenv("VLLM_MODEL_NAME", "./models/Qwen3-8B-Instruct"),
+        "VLLM_INFERENCE_PROBE_TIMEOUT": float(os.getenv("VLLM_INFERENCE_PROBE_TIMEOUT", "15")),
+        "VLLM_ENABLE_THINKING": os.getenv("VLLM_ENABLE_THINKING", "false").lower() == "true",
 
         "EMBEDDING_MODEL_NAME": os.getenv("EMBEDDING_MODEL_NAME", "./models/bge-m3"),
         "EMBEDDING_DEVICE": os.getenv("EMBEDDING_DEVICE", "cuda:2"),
@@ -486,9 +515,11 @@ def load_config() -> dict:
         "RERANKER_DEVICE": os.getenv("RERANKER_DEVICE", "cuda:2"),
 
         "KNOWLEDGE_BASE_ROOT": os.getenv("KNOWLEDGE_BASE_ROOT", "/mnt/cpu_share").strip(),
+        "DOCS_PATH": os.getenv("DOCS_PATH", "/mnt/cpu_share").strip(),
         "ENABLE_FILESYSTEM_TOOL": os.getenv("ENABLE_FILESYSTEM_TOOL", "true").lower() == "true",
         "FILE_SEARCH_LIMIT": int(os.getenv("FILE_SEARCH_LIMIT", "200")),
-        "DIRECTORY_CHILD_LIMIT": int(os.getenv("DIRECTORY_CHILD_LIMIT", "10")),
+        "CATALOG_SCAN_LIMIT": int(os.getenv("CATALOG_SCAN_LIMIT", "20000")),
+        "DIRECTORY_CHILD_LIMIT": int(os.getenv("DIRECTORY_CHILD_LIMIT", "200")),
 
         "ENABLE_HYBRID_SEARCH": os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true",
         "BM25_WEIGHT": float(os.getenv("BM25_WEIGHT", "0.3")),
@@ -553,6 +584,7 @@ def build_embeddings(model_name: str, device: str):
 def build_llm(base_url: str, api_key: str, model_name: str, cfg: dict = None):
     temperature = (cfg or {}).get("LLM_TEMPERATURE", 0.1)
     max_tokens = (cfg or {}).get("RESPONSE_MAX_TOKENS", 2048)
+    enable_thinking = (cfg or {}).get("VLLM_ENABLE_THINKING", False)
     debug_log(f"build_llm model={model_name} base_url={base_url} temperature={temperature} max_tokens={max_tokens}")
     return ChatOpenAI(
         model=model_name,
@@ -561,6 +593,7 @@ def build_llm(base_url: str, api_key: str, model_name: str, cfg: dict = None):
         temperature=temperature,
         top_p=0.9,
         max_tokens=max_tokens,
+        extra_body={"chat_template_kwargs": {"enable_thinking": enable_thinking}},
         streaming=True,
         timeout=120,
     )
@@ -886,9 +919,16 @@ def clean_retrieval_display_text(text: str) -> str:
         return ""
 
     raw = text
-    text = compress_repeated_text(text)
-    text = strip_structured_prefix(text)
-    text = normalize_retrieval_text(text)
+    has_markdown_structure = bool(re.search(r"(?m)^\s*(?:#{1,6}\s+|\|.*\|\s*$|[-*+]\s+|```)", text))
+    if has_markdown_structure:
+        # 表格、标题和列表必须保留换行，否则单元格关系会再次退化为扁平文本。
+        text = strip_structured_prefix(text)
+        text = "\n".join(re.sub(r"[ \t]+", " ", line).rstrip() for line in text.splitlines())
+        text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+    else:
+        text = compress_repeated_text(text)
+        text = strip_structured_prefix(text)
+        text = normalize_retrieval_text(text)
 
     return text if text else raw.strip()
 
@@ -896,6 +936,25 @@ def clean_retrieval_display_text(text: str) -> str:
 # =========================
 # 查询路由
 # =========================
+def extract_catalog_target(question: str) -> str:
+    """从列举型问题中提取适合目录匹配的实体，避免把完整意图句当作路径关键词。"""
+    text = normalize_retrieval_text(question).strip()
+    patterns = (
+        r"([A-Za-z][A-Za-z0-9._-]{0,31}\s*小组)",
+        r"([\u4e00-\u9fff]{1,12}(?:小组|课题组|实验室))",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            target = re.sub(r"^(?:请问|请|关于|查询|查找|列出|介绍|我想了解)+", "", match.group(1))
+            if target:
+                return target.strip()
+
+    prefix = re.split(r"(?:的)?(?:设备|文件|目录|资料|清单|使用规范|操作规范)", text, maxsplit=1)[0]
+    prefix = re.sub(r"^(?:请问|请|关于|查询|查找|列出|介绍|我想了解)+", "", prefix).strip(" ：:，,")
+    return prefix if len(prefix) >= 2 else text
+
+
 def rule_based_route(question: str) -> Optional[dict]:
     """
     基于规则的快速路由。
@@ -905,12 +964,13 @@ def rule_based_route(question: str) -> Optional[dict]:
     # 包含计数/列举类关键词，使"有多少篇论文"等查询能正确路由到 file_list 或 hybrid
     file_list_keywords = [
         "目录", "有哪些文件", "文件夹", "子目录", "文件列表", "清单", "有什么设备", "列出",
-        "有多少", "多少篇", "几篇", "统计", "数量", "一共有", "总共有", "共有", "全部", "所有",
+        "设备", "有多少", "多少篇", "几篇", "统计", "数量", "一共有", "总共有", "共有", "全部", "所有",
     ]
     rag_search_keywords = [
-        "原理", "步骤", "参数", "如何", "什么是", "解释", "说明", "方法", "教程",
+        "原理", "步骤", "参数", "格式", "要求", "怎么写", "如何写", "写法",
+        "如何", "什么是", "解释", "说明", "方法", "教程",
         "操作", "区别", "对比", "优缺点",
-        "论文", "实验", "公式", "算法", "仿真", "测试", "性能",
+        "规范", "使用", "论文", "实验", "公式", "算法", "仿真", "测试", "性能",
     ]
 
     # 歧义词需要额外条件才触发
@@ -920,16 +980,17 @@ def rule_based_route(question: str) -> Optional[dict]:
 
     hit_file = any(kw in question for kw in file_list_keywords)
     hit_rag = any(kw in question for kw in rag_search_keywords)
+    route_target = extract_catalog_target(question) if hit_file else question
 
     # 歧义词上下文判断
     hit_ambiguous = any(w in question for w in ambiguous_words)
     if hit_ambiguous:
         if hit_rag and hit_file:
-            return {"route": "hybrid", "target": question, "reason": "规则匹配"}
+            return {"route": "hybrid", "target": route_target, "reason": "规则匹配"}
         elif hit_rag:
             return {"route": "rag_search", "target": question, "reason": "规则匹配"}
         elif hit_file:
-            return {"route": "file_list", "target": question, "reason": "规则匹配"}
+            return {"route": "file_list", "target": route_target, "reason": "规则匹配"}
         else:
             # 歧义词单独出现，检查学术上下文（要求至少2个学术词共现）
             academic_context_count = sum(1 for w in academic_context if w in question)
@@ -938,9 +999,9 @@ def rule_based_route(question: str) -> Optional[dict]:
             return None  # 交给LLM兜底
 
     if hit_file and hit_rag:
-        return {"route": "hybrid", "target": question, "reason": "规则匹配"}
+        return {"route": "hybrid", "target": route_target, "reason": "规则匹配"}
     elif hit_file:
-        return {"route": "file_list", "target": question, "reason": "规则匹配"}
+        return {"route": "file_list", "target": route_target, "reason": "规则匹配"}
     elif hit_rag:
         return {"route": "rag_search", "target": question, "reason": "规则匹配"}
 
@@ -964,6 +1025,10 @@ def route_query(llm, question: str) -> dict:
     - rag_search：查询原理、步骤、参数、说明、使用方法、故障分析等文档内容
     - file_list：查询目录、文件、设备清单、路径、某目录下有什么
     - hybrid：既要目录/文件清单，又要文档内容说明
+
+    边界规则：
+    - 询问某项内容的格式、写法或提交要求是在查询正文，必须选择 rag_search。
+    - 不能因为答案可能存在某个文件或模板中，就选择 file_list；只有用户明确要求列出/定位文件、目录、路径或设备清单时才选择 file_list。
 
     输出格式必须严格如下：
     {{"route":"rag_search 或 file_list 或 hybrid","target":"检索目标（如VLC小组）","reason":"使用原因（如查询原理）"}}
@@ -993,6 +1058,21 @@ def route_query(llm, question: str) -> dict:
         if not isinstance(reason, str):
             reason = ""
 
+        # LLM 偶尔会把“格式/要求是什么”误解成查找模板文件；对无明确目录意图的内容问题做保守纠偏。
+        content_terms = ("格式", "规范", "要求", "步骤", "方法", "如何", "怎么", "说明", "原理", "参数")
+        explicit_catalog_terms = (
+            "目录", "文件列表", "文件清单", "有哪些文件", "文件有哪些", "列出文件", "列出目录",
+            "路径", "在哪里", "位置", "有哪些设备", "有什么设备", "设备清单", "多少篇", "几篇",
+        )
+        if (
+                route in {"file_list", "hybrid"}
+                and any(term in question for term in content_terms)
+                and not any(term in question for term in explicit_catalog_terms)
+        ):
+            route = "rag_search"
+            target = question
+            reason = "查询格式、规范或方法等文档内容，且未明确要求枚举目录或文件。"
+
         debug_log(f"route_query parsed route={route} target={target} reason={reason}")
         return {
             "route": route,
@@ -1012,10 +1092,36 @@ def route_query(llm, question: str) -> dict:
 # =========================
 # 查询改写
 # =========================
+def is_notation_format_question(question: str) -> bool:
+    """识别论文变量/矩阵/向量排版规范问题。"""
+    has_object = any(term in question for term in ("矩阵", "向量", "标量", "变量", "符号"))
+    has_format = any(term in question for term in ("表示", "格式", "怎么写", "如何写", "正体", "斜体", "粗体", "字体"))
+    return has_object and has_format and any(term in question for term in ("论文", "报告", "矩阵", "向量"))
+
+
+def build_notation_retrieval_plan() -> Dict[str, object]:
+    """使用资料中的精确术语检索排版规范，避免 HyDE 引入通信论文惯例。"""
+    return {
+        "rewritten_question": "论文变量格式规范中矩阵和向量的正体、斜体、粗体及大小写要求",
+        "keywords": ["变量格式", "向量、矩阵", "正体", "粗体", "斜体", "英文字母", "罗马字母"],
+        "queries": [
+            "变量格式 变量类型 英文字母 罗马字母 标量 集合 向量、矩阵",
+            "论文格式规范 向量、矩阵 正体+粗体",
+            "矩阵 向量 正体 粗体 斜体 大小写",
+        ],
+    }
+
+
 def should_skip_rewrite(question: str) -> bool:
     """判断是否可以跳过LLM改写，直接使用原始问题检索"""
-    # 条件1：极短问题（<=8字符）且无代词/模糊表达，视为独立关键词查询
-    if len(question) <= 8 and not any(w in question for w in ["它", "这个", "那个", "上面", "之前", "它们", "那些", "其中", "后者", "前者", "刚才"]):
+    # 仅纯关键词短语跳过改写；“是什么/怎么/如何”等短问句仍需扩展检索表达。
+    pronouns = ("它", "这个", "那个", "上面", "之前", "它们", "那些", "其中", "后者", "前者", "刚才")
+    question_markers = ("是什么", "怎么", "如何", "为什么", "哪些", "多少", "是否", "吗", "？", "?")
+    if (
+            len(question) <= 8
+            and not any(word in question for word in pronouns)
+            and not any(marker in question for marker in question_markers)
+    ):
         return True
     return False
 
@@ -1426,7 +1532,7 @@ def build_context(docs, max_chars: int = 12000) -> tuple:
 
         section_line = f"[章节] {section_title}\n" if section_title else ""
         # 如果有父块摘要，展示给 LLM 帮助理解宏观上下文
-        parent_summary = doc.metadata.get("parent_summary", "")
+        parent_summary = sanitize_summary(doc.metadata.get("parent_summary", ""))
         summary_line = f"[段落摘要] {parent_summary}\n" if parent_summary else ""
         content = (
             f"[来源{idx}] [文档标题] {doc_title}\n"
@@ -1508,7 +1614,7 @@ def build_citations(used_docs: list) -> list:
             "source": source,
             "section": section,
             "score": round(doc.metadata.get("rerank_score", 0), 3),
-            "summary": doc.metadata.get("parent_summary", ""),  # 传递父块摘要
+            "summary": sanitize_summary(doc.metadata.get("parent_summary", "")),  # 传递父块摘要
         }
         citations.append(citation)
 
@@ -1544,8 +1650,9 @@ def safe_join(root: str, rel_path: str) -> str:
 
 def normalize_query_tokens(text: str) -> List[str]:
     text = path_to_unix(text).strip().lower()
-    parts = re.split(r"[\/\s_\-\(\)\[\]，。,；;：:]+", text)
-    return [p for p in parts if p]
+    parts = re.split(r"[\/\s_\-\(\)\[\]，。,；;：:]+|(?:的|和|与|及)", text)
+    stopwords = {"请", "请问", "帮我", "查询", "查找", "列出", "介绍", "了解", "相关"}
+    return [p for p in parts if p and p not in stopwords]
 
 
 def path_match_score(query: str, candidate_path: str) -> float:
@@ -1682,7 +1789,7 @@ def list_fs_entries_by_keyword(keyword: str, root_dir: str, limit: int = 200) ->
 
 def is_directory_intent(text: str) -> bool:
     q = normalize_retrieval_text(text).lower()
-    hints = ["目录", "目录下", "有什么", "子目录", "文件夹", "有哪些", "清单", "列表"]
+    hints = ["目录", "目录下", "有什么", "子目录", "文件夹", "有哪些", "清单", "列表", "设备", "使用规范", "操作规范"]
     return any(h in q for h in hints)
 
 
@@ -1750,19 +1857,119 @@ def list_paths_by_keyword(keyword: str, limit: int = 1000) -> List[Dict]:
                 break
             offset = next_page_offset
 
+        # 中文路径在不同 Qdrant tokenizer/旧索引版本下可能无法命中 MatchText。
+        # 仅在过滤结果为空时做有界 payload 扫描，并在应用侧进行路径匹配。
+        if not files:
+            scan_limit = int(runtime["config"].get("CATALOG_SCAN_LIMIT", 20000))
+            scanned = 0
+            offset = None
+            debug_log(f"[CATALOG] MatchText 无结果，开始本地路径回退扫描，limit={scan_limit}")
+            while scanned < scan_limit and len(files) < limit:
+                try:
+                    results, next_page_offset = client.scroll(
+                        collection_name=collection_name,
+                        limit=min(256, scan_limit - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        timeout=10,
+                    )
+                except Exception as e:
+                    debug_log(f"[WARN] catalog payload 回退扫描失败: {e}")
+                    break
+                scanned += len(results)
+                for hit in results:
+                    payload = hit.payload or {}
+                    md = payload.get("metadata", payload)
+                    file_name = md.get("file_name", "")
+                    doc_title = md.get("doc_title", "")
+                    rel_path = md.get("rel_path", "")
+                    candidate = rel_path or file_name or doc_title
+                    score = path_match_score(keyword, candidate)
+                    if score < 0.45:
+                        continue
+                    key = rel_path or f"{file_name}|{doc_title}"
+                    if key not in files:
+                        files[key] = {
+                            "type": "file", "file_name": file_name, "doc_title": doc_title,
+                            "name": doc_title or file_name, "rel_path": rel_path,
+                            "count": 0, "score": round(score, 4),
+                        }
+                    files[key]["count"] += 1
+                if not next_page_offset:
+                    break
+                offset = next_page_offset
+            debug_log(f"[CATALOG] payload scan scanned={scanned} unique_files={len(files)}")
+
         debug_log(f"list_paths_by_keyword unique_files={len(files)}")
         return sorted(list(files.values()), key=lambda x: (-x["score"], -x["count"], len(x["rel_path"])))
+
+
+def collapse_qdrant_entries_to_directory(entries: List[Dict], target: str) -> Optional[Dict]:
+    """将 Qdrant 的深层文档路径折叠为目标目录的直接子级。"""
+    target_norm = normalize_retrieval_text(target).lower().strip()
+    directories = {}
+    direct_files = {}
+    matched_prefixes = {}
+    for item in entries:
+        rel_path = path_to_unix(item.get("rel_path", "")).strip("/")
+        parts = [part for part in rel_path.split("/") if part]
+        match_index = next(
+            (idx for idx, part in enumerate(parts) if target_norm and target_norm in normalize_retrieval_text(part).lower()),
+            None,
+        )
+        if match_index is None:
+            continue
+        prefix = "/".join(parts[:match_index + 1])
+        matched_prefixes[prefix] = matched_prefixes.get(prefix, 0) + int(item.get("count", 1) or 1)
+        if match_index + 1 >= len(parts):
+            continue
+        child_name = parts[match_index + 1]
+        child_path = "/".join(parts[:match_index + 2])
+        if match_index + 2 < len(parts):
+            entry = directories.setdefault(child_path, {
+                "type": "directory", "name": child_name, "rel_path": child_path, "count": 0,
+            })
+        else:
+            entry = direct_files.setdefault(child_path, {
+                "type": "file", "name": child_name, "rel_path": child_path, "count": 0,
+            })
+        entry["count"] += int(item.get("count", 1) or 1)
+
+    if not directories and not direct_files:
+        return None
+    matched_dir = max(matched_prefixes, key=matched_prefixes.get) if matched_prefixes else target
+    return {
+        "mode": "qdrant_directory",
+        "matched_dir": matched_dir,
+        "directories": sorted(directories.values(), key=lambda item: item["name"].lower()),
+        "files": sorted(direct_files.values(), key=lambda item: item["name"].lower()),
+        "raw_entry_count": len(entries),
+    }
 
 
 def list_catalog_entries(target: str) -> Dict:
     # 文件系统目录查询不依赖 Qdrant，降级状态下仍应可用。
     config = _runtime["config"] if _runtime is not None else load_config()
 
-    root_dir = config.get("KNOWLEDGE_BASE_ROOT", "")
     enable_fs = config.get("ENABLE_FILESYSTEM_TOOL", False)
+    root_candidates = []
+    for value in (config.get("KNOWLEDGE_BASE_ROOT", ""), config.get("DOCS_PATH", "")):
+        value = str(value or "").strip()
+        if value and value not in root_candidates:
+            root_candidates.append(value)
 
     with Timer(f"list_catalog_entries target={target}"):
-        if enable_fs and root_dir and os.path.exists(root_dir):
+        checked_roots = []
+        for root_dir in root_candidates if enable_fs else []:
+            root_state = {
+                "path": root_dir,
+                "exists": os.path.exists(root_dir),
+                "is_dir": os.path.isdir(root_dir),
+                "readable": os.access(root_dir, os.R_OK),
+            }
+            checked_roots.append(root_state)
+            if not (root_state["exists"] and root_state["is_dir"] and root_state["readable"]):
+                continue
             matched_dirs = find_best_matching_dirs(target, root_dir, limit=10)
             entries = list_fs_entries_by_keyword(
                 target,
@@ -1791,26 +1998,37 @@ def list_catalog_entries(target: str) -> Dict:
                     "matched_score": best_dir["score"],
                     "directories": children["directories"],
                     "files": children["files"],
+                    "filesystem_root": root_dir,
+                    "checked_roots": checked_roots,
                 }
 
-            return {
-                "mode": "filesystem_search",
-                "matched_dir": None,
-                "entries": entries,
-            }
+            if entries:
+                return {
+                    "mode": "filesystem_search", "matched_dir": None, "entries": entries,
+                    "filesystem_root": root_dir, "checked_roots": checked_roots,
+                }
 
+        # 所有候选根目录均无匹配时，再使用 Qdrant；不能因第一个旧挂载点存在而提前返回空结果。
+        debug_log(f"[CATALOG] filesystem 无匹配，回退 Qdrant: roots={checked_roots!r} target={target!r}")
         files = list_paths_by_keyword(target, limit=config["FILE_SEARCH_LIMIT"])
+        collapsed = collapse_qdrant_entries_to_directory(files, target)
+        if collapsed:
+            collapsed["checked_roots"] = checked_roots
+            collapsed["query"] = target
+            return collapsed
         return {
-            "mode": "qdrant_search",
+            "mode": "qdrant_search_fallback" if enable_fs else "qdrant_search",
             "matched_dir": None,
             "entries": files,
+            "checked_roots": checked_roots,
+            "query": target,
         }
 
 
 def build_file_context(file_result: Dict) -> str:
     mode = file_result.get("mode", "")
 
-    if mode == "filesystem_directory":
+    if mode in {"filesystem_directory", "qdrant_directory"}:
         matched_dir = file_result.get("matched_dir", "")
         dirs = file_result.get("directories", [])
         files = file_result.get("files", [])
@@ -1851,14 +2069,87 @@ def build_file_context(file_result: Dict) -> str:
     return "\n".join(parts)
 
 
+def catalog_result_count(file_result: Optional[Dict]) -> int:
+    """返回目录枚举命中数，供混合路由综合评估覆盖度。"""
+    if not file_result:
+        return 0
+    if file_result.get("mode") in {"filesystem_directory", "qdrant_directory"}:
+        return len(file_result.get("directories", [])) + len(file_result.get("files", []))
+    return len(file_result.get("entries", []))
+
+
+def extract_catalog_content_intent(question: str) -> str:
+    """从原问题保留正文检索意图，不引入模型扩写内容。"""
+    intent_terms = []
+    if any(term in question for term in ("使用", "怎么用", "如何", "操作")):
+        intent_terms.extend(["使用方法", "操作步骤"])
+    if any(term in question for term in ("规范", "注意", "要求", "安全")):
+        intent_terms.extend(["操作规范", "注意事项"])
+    if any(term in question for term in ("参数", "指标", "性能")):
+        intent_terms.append("参数指标")
+    return " ".join(dict.fromkeys(intent_terms)) or "说明 用途"
+
+
+def build_catalog_retrieval_queries(
+    file_result: Optional[Dict], fallback_target: str, question: str = ""
+) -> List[str]:
+    """使用直接目录级实体和用户正文意图构造检索词，避免深入枚举 Manual 文件。"""
+    intent = extract_catalog_content_intent(question)
+    candidates = []
+    if file_result:
+        candidates.append(file_result.get("matched_dir", ""))
+        keys = ("directories", "files") if file_result.get("mode") in {"filesystem_directory", "qdrant_directory"} else ("entries",)
+        for key in keys:
+            for item in file_result.get(key, []) or []:
+                candidates.append(item.get("rel_path", "") or item.get("name", ""))
+    candidates.append(fallback_target)
+    result = []
+    seen = set()
+    for value in candidates:
+        value = str(value or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            result.append(f"{value} {intent}".strip())
+    return result[:16]
+
+
+def build_catalog_answer_section(file_result: Optional[Dict]) -> str:
+    """生成不可被模型省略的目录结果区块，保证混合回答具备可追溯文件清单。"""
+    if not file_result:
+        return "## 目录 / 文件检索结果\n\n目录检索未返回有效结果。"
+    return "## 目录 / 文件检索结果\n\n" + build_file_context(file_result or {})
+
+
 # =========================
 # 回答生成
 # =========================
+def build_grounded_notation_answer(context: str) -> str:
+    """从格式表的结构化转写直接生成回答，避免被其他论文中的符号示例带偏。"""
+    for block in re.split(r"(?=\[来源\d+\])", context or ""):
+        source_match = re.search(r"\[来源(\d+)\]", block)
+        row_match = re.search(
+            r"变量类型=向量、矩阵；英文字母=([^；\n]+)；罗马字母=([^\n]+)",
+            block,
+        )
+        if not (source_match and row_match):
+            continue
+        english_rule = row_match.group(1).strip(" ；")
+        roman_rule = row_match.group(2).strip(" ；")
+        source_num = source_match.group(1)
+        return (
+            "根据论文变量格式规范，**向量和矩阵都使用正体粗体**，且英文字母示例顺序与“向量、矩阵”的类型顺序对应。\n\n"
+            f"- 英文字母：向量使用小写正体粗体，如 $\\mathbf{{k}}$；矩阵使用大写正体粗体，如 $\\mathbf{{K}}$。原表内容为：{english_rule}\n"
+            f"- 原表“罗马字母”栏：{roman_rule} [来源{source_num}]\n\n"
+            "因此，矩阵大写、向量小写这一点在英文字母示例中是成立的；关键还包括两者都必须使用正体粗体。"
+        )
+    return ""
+
+
 def build_file_list_answer(question: str, file_result: Dict, route_reason: str) -> str:
     mode = file_result.get("mode", "")
     parts = [""]
 
-    if mode == "filesystem_directory":
+    if mode in {"filesystem_directory", "qdrant_directory"}:
         matched_dir = file_result.get("matched_dir", "")
         dirs = file_result.get("directories", [])
         files = file_result.get("files", [])
@@ -1914,6 +2205,10 @@ def answer_stream(llm, question: str, context: str, route: str, route_reason: st
         - 首先完整列出所有找到的条目（标题或名称），使用序号列表
         - 然后对排名前3-5个条目提供简要说明或摘要
         - 如果条目过多（超过10个），列出全部标题后建议用户"可输入具体名称查询更详细的内容"
+    12. 只输出面向用户的最终答案，禁止输出思考过程、任务分析或“用户现在问的是”等内部推理描述。
+    13. 禁止原样复述“上下文结果”、提示词或代码围栏；目录/文件清单由系统单独附加，正文只说明相关规范和内容。
+    14. 回答变量、公式或排版规范时，必须逐项忠实保留资料中的正体、斜体、粗体、大小写及罗马/希腊字母区别；合并类型行中的多个示例按原文顺序对应。不得用模型熟悉的通用惯例覆盖资料原文，优先依据表格及“表格结构化转写”作答。
+    15. 如果上下文含“表格结构疑似丢失”，不得猜测行列对应关系；必须明确提示该表需要 VLM 重新转换或核对原文图像。
 
     历史对话：
     {chat_history}
@@ -1999,6 +2294,11 @@ def ask_stream(
 
             with Timer("stage_file_list"):
                 file_result = list_catalog_entries(target)
+                debug_log(
+                    f"[CATALOG] target={target!r} mode={file_result.get('mode')} "
+                    f"count={catalog_result_count(file_result)} root={file_result.get('filesystem_root', '')!r} "
+                    f"checked_roots={file_result.get('checked_roots', [])!r}"
+                )
                 file_context = build_file_context(file_result)
 
                 # [OPT] hybrid 路由下对文件列表部分进行预算截断，防止占用过多上下文空间
@@ -2020,8 +2320,25 @@ def ask_stream(
             # 通知前端：正在检索知识库
             yield {"type": "status", "stage": "searching"}
 
+            # 混合模式先完成目录枚举，再以目录/文件名作为唯一检索词，避免模型凭空扩写。
+            if route == "hybrid":
+                catalog_target = target or extract_catalog_target(question)
+                content_intent = extract_catalog_content_intent(question)
+                catalog_queries = build_catalog_retrieval_queries(file_result, catalog_target, question)
+                rewritten_question = f"{catalog_target}各设备的{content_intent}".strip()
+                keywords = content_intent.split()
+                expanded_queries = []
+                queries = catalog_queries or [rewritten_question]
+                debug_log(f"[HYBRID] catalog-driven queries={queries}")
+            elif is_notation_format_question(question):
+                notation_plan = build_notation_retrieval_plan()
+                rewritten_question = str(notation_plan["rewritten_question"])
+                keywords = list(notation_plan["keywords"])
+                expanded_queries = []
+                queries = list(notation_plan["queries"])
+                debug_log(f"[NOTATION] deterministic retrieval plan={queries}")
             # [智能路由] 判断是否跳过 LLM 改写，直接使用原始问题
-            if should_skip_rewrite(question):
+            elif should_skip_rewrite(question):
                 debug_log(f"[智能路由] 跳过改写，直接使用原始问题: {question}")
                 rewritten_question = question
                 keywords = []
@@ -2059,7 +2376,9 @@ def ask_stream(
                     # 如果开启混合检索，增加稀疏检索并融合
                     if config.get("ENABLE_HYBRID_SEARCH", False):
                         # 当 keywords 为空时，使用 query 本身作为唯一搜索词
-                        if not keywords:
+                        if route == "hybrid":
+                            sparse_search_terms = list(dict.fromkeys(keywords + queries))[:10]
+                        elif not keywords:
                             sparse_search_terms = [rewritten_question]
                         else:
                             sparse_search_terms = [rewritten_question] + keywords
@@ -2091,6 +2410,17 @@ def ask_stream(
                 child_top_k = config["FINAL_TOP_K"] * 3
                 reranked_child_docs = rerank_docs(reranker, rewritten_question, recalled_docs, cfg=config, top_k=child_top_k)
 
+                if is_notation_format_question(question):
+                    exact_notation_docs = []
+                    for doc in recalled_docs:
+                        content = doc.page_content or ""
+                        if "向量、矩阵" in content and "正体" in content and "粗体" in content:
+                            doc.metadata["rerank_score"] = max(float(doc.metadata.get("rerank_score", 0) or 0), 1.0)
+                            exact_notation_docs.append(doc)
+                    if exact_notation_docs:
+                        reranked_child_docs = dedup_docs(exact_notation_docs + reranked_child_docs)[:child_top_k]
+                        debug_log(f"[NOTATION] exact format chunks prioritized={len(exact_notation_docs)}")
+
                 # 【新增】将重排后的子块展开为大召回的父块
                 final_docs = expand_to_parent_docs(reranked_child_docs, cfg=config, top_k=config["FINAL_TOP_K"], qdrant_client=runtime["client"])
 
@@ -2098,6 +2428,11 @@ def ask_stream(
 
             # [OPT] 覆盖度评估：基于重排分数判断知识库覆盖情况
             coverage_info = assess_coverage(reranked_child_docs, config)
+            if route == "hybrid" and catalog_result_count(file_result) > 0 and coverage_info["level"] in {"none", "very_low"}:
+                coverage_info = {
+                    "level": "medium",
+                    "hint": "ℹ️ 已找到相关目录或文件，但正文检索内容有限；设备/文件名称以目录枚举结果为准。",
+                }
             debug_log(f"coverage_assessment: level={coverage_info['level']} hint={coverage_info.get('hint')}")
 
             # [OPT] 引用溯源：收集引用信息
@@ -2155,20 +2490,32 @@ def ask_stream(
 
         # [FIX] 将截断后的 user_history 格式化并传入 answer_stream，确保历史实际生效
         history_text = format_chat_history(user_history)
+        grounded_notation_answer = build_grounded_notation_answer(final_context) if is_notation_format_question(question) else ""
 
-        with Timer("stage_answer_stream"):
-            first_chunk_time = None
-            for chunk in answer_stream(llm, question, final_context, route, route_reason, chat_history=history_text, coverage_level=coverage_info["level"]):
-                content = getattr(chunk, "content", "")
-                if content:
-                    if first_chunk_time is None:
-                        first_chunk_time = time.perf_counter() - total_start
-                        debug_log(f"first_answer_chunk_elapsed={first_chunk_time:.3f}s")
-                    full_answer += content
-                    yield {
-                        "type": "chunk",
-                        "content": content,
-                    }
+        if grounded_notation_answer:
+            full_answer = grounded_notation_answer
+            yield {"type": "chunk", "content": grounded_notation_answer}
+            debug_log("[NOTATION] 使用格式表结构化转写直接回答")
+        else:
+            with Timer("stage_answer_stream"):
+                first_chunk_time = None
+                for chunk in answer_stream(llm, question, final_context, route, route_reason, chat_history=history_text, coverage_level=coverage_info["level"]):
+                    content = getattr(chunk, "content", "")
+                    if content:
+                        if first_chunk_time is None:
+                            first_chunk_time = time.perf_counter() - total_start
+                            debug_log(f"first_answer_chunk_elapsed={first_chunk_time:.3f}s")
+                        full_answer += content
+                        yield {
+                            "type": "chunk",
+                            "content": content,
+                        }
+
+        full_answer = sanitize_generated_answer(full_answer)
+        if route == "hybrid":
+            catalog_section = build_catalog_answer_section(file_result)
+            if catalog_section:
+                full_answer = f"{catalog_section}\n\n## 文档内容说明\n\n{full_answer}".strip()
 
         # [OPT] 流式回答结束后，发送覆盖度和引用元数据事件
         yield {

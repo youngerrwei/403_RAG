@@ -1,7 +1,5 @@
 # agent_entry.py：可选 ReAct 编排层，不持有独立模型实例。
 
-import os
-import json
 import time
 import traceback
 import re
@@ -12,7 +10,16 @@ from langchain_openai import ChatOpenAI
 
 from .logger import get_logger
 from .paths import PROJECT_ROOT
-from .rag_agent import get_runtime, append_user_chat_history
+from .rag_agent import (
+    append_user_chat_history,
+    build_catalog_answer_section,
+    build_file_context,
+    get_runtime,
+    list_catalog_entries,
+    rule_based_route,
+    sanitize_generated_answer,
+)
+from .rag_tool import ask_rag
 from .tools import rag_qa, list_group_files, agent_tool_context
 
 
@@ -68,6 +75,10 @@ REACT_SYSTEM_PROMPT = """你是实验室内部知识库助手，采用 ReAct 思
 
 重要约束：
 - 回答时必须优先依据工具返回结果，不要凭空编造。
+- “格式是什么/怎么写/要求/规范/步骤/方法”等是在查询文档内容，必须直接调用 rag_qa；不能先调用 list_group_files 猜测模板文件。
+- list_group_files 仅用于用户明确要求列出或定位文件、目录、路径、设备清单的情况。
+- 如果目录工具未找到结果，不代表知识库正文没有答案；应使用用户原始问题调用 rag_qa，禁止改为输出通用模板或知识库外常识。
+- 未获得工具返回的知识库依据时，不得输出“通用规范”“通用模板”或虚构“主要参考”。
 - 当你在使用工具后进行总结时，请明确使用类似表述：“根据知识库内容可概括为”。
 - 对于“有哪些/清单/列表”等问题：
   * 应在 Observation 中提供的所有文件信息基础上，尽量汇总并去重相关实体（如设备名称、文档名称、工具名称）。
@@ -117,12 +128,24 @@ def parse_answer(text: str) -> str:
     形如: Answer: xxx
     如果没有显式 Answer: 则返回全文。
     """
-    lines = text.strip().splitlines()
-    for line in lines:
-        if line.strip().startswith("Answer:"):
-            return line.split("Answer:", 1)[1].strip()
+    match = re.search(r"(?:^|\n)\s*Answer:\s*([\s\S]*)$", text.strip())
+    if match:
+        return match.group(1).strip()
     # 没有显式 Answer，则直接返回原文
     return text.strip()
+
+
+def expected_agent_tool(route: Optional[str], used_list_tool: bool, used_rag_tool: bool) -> Optional[str]:
+    """根据通用路由语义和已完成步骤返回下一项必需工具；None 表示可以回答。"""
+    if route == "rag_search":
+        return None if used_rag_tool else "rag_qa"
+    if route == "file_list":
+        return None if used_list_tool else "list_group_files"
+    if route == "hybrid":
+        if not used_list_tool:
+            return "list_group_files"
+        return None if used_rag_tool else "rag_qa"
+    return None
 
 
 def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]] = None):
@@ -151,6 +174,10 @@ def run_react_once(
     - 最多 max_steps 次工具调用
     """
     messages = _initial_messages(question, chat_history)
+    initial_route = rule_based_route(question)
+    route_name = initial_route.get("route") if initial_route else None
+    used_list_tool = False
+    used_rag_tool = False
 
     observation_text = ""
     for step in range(1, max_steps + 1):
@@ -177,6 +204,14 @@ def run_react_once(
 
         # 尝试解析 Answer（如果模型已经给出最终回答）
         if "Answer:" in content:
+            required_tool = expected_agent_tool(route_name, used_list_tool, used_rag_tool)
+            if required_tool:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": f"尚未取得回答所需的知识库依据。请先调用 {required_tool}，不得直接作答。",
+                })
+                continue
             final_answer = parse_answer(content)
             if debug:
                 debug_log("解析到最终 Answer，结束循环")
@@ -185,13 +220,47 @@ def run_react_once(
         # 解析 Action
         action = parse_action(content)
         if not action:
-            # 没有 Action，也没有 Answer，当成直接回答
+            required_tool = expected_agent_tool(route_name, used_list_tool, used_rag_tool)
+            if required_tool:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": f"输出缺少可执行的 Action。请由你调用 {required_tool} 后再回答。",
+                })
+                continue
+            if route_name:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": "必需工具调用已经完成。请严格使用 Answer: 开头输出有知识库依据的最终回答。",
+                })
+                continue
+            # 路由未规定必需工具时，兼容模型的直接回答。
             if debug:
                 debug_log("未解析到 Action，直接将本次输出当作回答")
             return content.strip()
 
         tool_name = action["tool_name"]
         arg = action["arg"]
+
+        required_tool = expected_agent_tool(route_name, used_list_tool, used_rag_tool)
+        if required_tool and tool_name != required_tool:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"该调用不符合当前通用工具契约：下一步必须调用 {required_tool}。"
+                    "请保留用户原始问题的内容意图并重新选择工具。"
+                ),
+            })
+            continue
+        if route_name and required_tool is None:
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": "必需工具调用已经完成，不要继续调用工具。请使用 Answer: 输出最终回答。",
+            })
+            continue
 
         if debug:
             debug_log(f"解析到 Action: tool={tool_name}, arg={arg}")
@@ -210,6 +279,8 @@ def run_react_once(
                     obs = tool.invoke(tool_input)
                 tool_cost = time.perf_counter() - tool_start
                 observation_text = str(obs)
+                used_list_tool = used_list_tool or tool_name == "list_group_files"
+                used_rag_tool = used_rag_tool or tool_name == "rag_qa"
 
                 if debug:
                     debug_log(
@@ -266,15 +337,23 @@ def ask_agent_stream(
     - type=final：最终 Answer 文本
     - type=error：错误信息
     """
-    llm = build_qwen_llm()
-
-    messages = _initial_messages(question, chat_history)
+    initial_route = rule_based_route(question)
+    route_name = initial_route.get("route") if initial_route else None
 
     observation_text = ""
     used_list_tool = False
-    used_rag_after_list = False
+    used_rag_tool = False
+    latest_catalog_result = None
+
+    def finalize_answer(value: str) -> str:
+        answer = sanitize_generated_answer(value)
+        if latest_catalog_result and "## 目录 / 文件检索结果" not in answer:
+            answer = f"{build_catalog_answer_section(latest_catalog_result)}\n\n## 文档内容说明\n\n{answer}".strip()
+        return answer
 
     try:
+        llm = build_qwen_llm()
+        messages = _initial_messages(question, chat_history)
         max_steps = 4
 
         for step in range(1, max_steps + 1):
@@ -298,63 +377,114 @@ def ask_agent_stream(
 
             # 2) 判断是否是最终 Answer
             if "Answer:" in content:
-                if used_list_tool and not used_rag_after_list:
-                    # 拦截过早的 Answer，强制继续 rag_qa
+                required_tool = expected_agent_tool(route_name, used_list_tool, used_rag_tool)
+                if required_tool:
+                    # 模型必须自行完成所需工具调用；这里只拒绝无依据的过早回答，不伪造 Action。
                     messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
                         "content": (
-                            "你已经看到了相关文件列表，但还没有基于这些文件调用 rag_qa 深入阅读、总结‘分别怎么用’。"
-                            "请先调用 rag_qa 工具，构造一个包含‘根据上面的 Observation，总结这些工具分别怎么用’的具体问题，"
-                            "再根据 rag_qa 的 Observation 输出 Answer。"
+                            f"尚未取得回答所需的知识库依据。请先调用 {required_tool}，不得直接作答。"
+                            "工具参数必须保留用户原始问题的意图。"
                         )
                     })
                     continue
 
-                final_answer = parse_answer(content)
+                final_answer = finalize_answer(parse_answer(content))
                 append_user_chat_history(username, "user", question)
                 append_user_chat_history(username, "assistant", final_answer)
                 yield {
                     "type": "final",
                     "content": final_answer,
+                    "file_result": latest_catalog_result,
                 }
                 return
 
             # 3) 解析 Action
             action = parse_action(content)
             if not action:
-                # 没有 Action，也没有 Answer，当作直接回答
-                final_answer = content.strip()
+                required_tool = expected_agent_tool(route_name, used_list_tool, used_rag_tool)
+                if required_tool:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": f"输出缺少可执行的 Action。请由你调用 {required_tool} 后再回答。",
+                    })
+                    continue
+                if route_name:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": "必需工具调用已经完成。请严格使用 Answer: 开头输出有知识库依据的最终回答。",
+                    })
+                    continue
+                # 路由未规定必需工具时，兼容模型的直接回答。
+                final_answer = finalize_answer(content)
                 append_user_chat_history(username, "user", question)
                 append_user_chat_history(username, "assistant", final_answer)
                 yield {
                     "type": "final",
                     "content": final_answer,
+                    "file_result": latest_catalog_result,
                 }
                 return
 
             tool_name = action["tool_name"]
             arg = action["arg"]
 
+            required_tool = expected_agent_tool(route_name, used_list_tool, used_rag_tool)
+            if required_tool and tool_name != required_tool:
+                debug_log(
+                    f"[stream] 拒绝不符合工具契约的调用: route={route_name}, "
+                    f"proposed={tool_name}, required={required_tool}"
+                )
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"该调用不符合当前通用工具契约：下一步必须调用 {required_tool}。"
+                        "请由你重新输出正确的 Action；系统不会替你调用或改写工具。"
+                    ),
+                })
+                continue
+            if route_name and required_tool is None:
+                messages.append({"role": "assistant", "content": content})
+                messages.append({
+                    "role": "user",
+                    "content": "必需工具调用已经完成，不要继续调用工具。请使用 Answer: 输出最终回答。",
+                })
+                continue
+
             tool = TOOLS.get(tool_name)
+            catalog_result = None
             if tool is None:
                 observation_text = f"[工具错误] 未找到名为 {tool_name} 的工具。"
             else:
                 try:
-                    tool_input_key = list(tool.args.keys())[0]
-                    tool_input = {tool_input_key: arg}
                     tool_start = time.perf_counter()
-                    with agent_tool_context(username):
-                        obs = tool.invoke(tool_input)
+                    if tool_name == "list_group_files":
+                        catalog_result = list_catalog_entries(arg)
+                        observation_text = build_file_context(catalog_result)
+                    elif tool_name == "rag_qa":
+                        rag_result = ask_rag(arg, username=username)
+                        observation_text = rag_result.get("answer", "")
+                        catalog_result = rag_result.get("file_result")
+                    else:
+                        tool_input_key = list(tool.args.keys())[0]
+                        tool_input = {tool_input_key: arg}
+                        with agent_tool_context(username):
+                            obs = tool.invoke(tool_input)
+                        observation_text = str(obs)
                     tool_cost = time.perf_counter() - tool_start
-                    observation_text = str(obs)
                     debug_log(
                         f"[stream] step={step} tool={tool_name} 耗时={tool_cost:.3f}s, observation字符数={len(observation_text)}")
 
                     if tool_name == "list_group_files":
                         used_list_tool = True
-                    if used_list_tool and tool_name == "rag_qa":
-                        used_rag_after_list = True
+                    if tool_name == "rag_qa":
+                        used_rag_tool = True
+                    if catalog_result:
+                        latest_catalog_result = catalog_result
 
                 except Exception as e:
                     _logger.error(f"Agent 工具执行异常: tool={tool_name}, error={e!r}")
@@ -368,6 +498,12 @@ def ask_agent_stream(
                 "arg": arg,
                 "observation": observation_text,
             }
+            if catalog_result:
+                yield {
+                    "type": "tool",
+                    "tool_name": "list_catalog_entries",
+                    "content": catalog_result,
+                }
 
             # 5) 历史追加，进入下一轮
             messages.append({"role": "assistant", "content": content})
@@ -376,18 +512,19 @@ def ask_agent_stream(
                 "content": (
                     f"Observation: {observation_text}\n"
                     "请继续思考并决定下一步：如果信息尚不足以回答，继续选择合适的工具调用；"
-                    "如果信息已经足够，并且（若你之前调用过 list_group_files）已经在此基础上调用过 rag_qa，"
+                    "如果信息已经足够，并且（仅当原始问题同时要求清单和内容说明时）已在目录结果基础上调用过 rag_qa，"
                     "则可以给出 Answer。"
                 )
             })
 
         # 超出最大步数未得到 Answer
-        final_answer = f"工具调用达到最大步数，最后一次观察结果为：\n{observation_text}"
+        final_answer = finalize_answer(f"工具调用达到最大步数，最后一次观察结果为：\n{observation_text}")
         append_user_chat_history(username, "user", question)
         append_user_chat_history(username, "assistant", final_answer)
         yield {
             "type": "final",
             "content": final_answer,
+            "file_result": latest_catalog_result,
         }
 
     except Exception as e:
