@@ -103,6 +103,41 @@ with urllib.request.urlopen(request, timeout=timeout) as response:
 PY
 }
 
+# 真实生成一个 token，避免仅凭 /health 和 /v1/models 将失去推理能力的 API 外壳误判为就绪。
+probe_vllm_inference() {
+    local python_bin="$1" url="$2" timeout="$3" token="$4" model="$5"
+    RAG_HTTP_TOKEN="$token" "$python_bin" - "$url" "$timeout" "$model" <<'PY'
+import json
+import os
+import sys
+import urllib.request
+
+url, timeout, model = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+payload = json.dumps({
+    "model": model,
+    "messages": [{"role": "user", "content": "Reply OK."}],
+    "max_tokens": 1,
+    "temperature": 0,
+    "chat_template_kwargs": {"enable_thinking": False},
+}).encode("utf-8")
+request = urllib.request.Request(
+    url,
+    data=payload,
+    headers={
+        "Authorization": f"Bearer {os.environ.get('RAG_HTTP_TOKEN', '')}",
+        "Content-Type": "application/json",
+    },
+    method="POST",
+)
+with urllib.request.urlopen(request, timeout=timeout) as response:
+    if response.status < 200 or response.status >= 300:
+        raise RuntimeError(f"HTTP {response.status}")
+    result = json.load(response)
+choices = result.get("choices")
+raise SystemExit(0 if isinstance(choices, list) and choices else 1)
+PY
+}
+
 # Qdrant 只有在服务可达且所有必要集合存在时才可用于完整检索。
 qdrant_collections_ready() {
     local python_bin="$1" url="$2" timeout="$3"

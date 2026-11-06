@@ -16,7 +16,8 @@ mkdir -p "$DATA_DIR" "$LOG_DIR"
 load_env_keys "$ENV_FILE" \
     VLLM_MODEL_NAME VLLM_API_KEY VLLM_CUDA_DEVICES VLLM_HOST VLLM_PORT \
     VLLM_GPU_UTIL VLLM_MAX_MODEL_LEN VLLM_ENABLE_PREFIX_CACHING \
-    VLLM_CONDA_ENV VLLM_STARTUP_TIMEOUT STARTUP_PROBE_TIMEOUT || true
+    VLLM_CONDA_ENV VLLM_STARTUP_TIMEOUT VLLM_INFERENCE_PROBE_TIMEOUT \
+    STARTUP_PROBE_TIMEOUT || true
 
 VLLM_MODEL_NAME="${VLLM_MODEL_NAME:-./models/Qwen3-8B-Instruct}"
 VLLM_API_KEY="${VLLM_API_KEY:-lab-secret-key}"
@@ -28,6 +29,7 @@ VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-6000}"
 VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
 VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-rag-vllm}"
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-300}"
+VLLM_INFERENCE_PROBE_TIMEOUT="${VLLM_INFERENCE_PROBE_TIMEOUT:-15}"
 STARTUP_PROBE_TIMEOUT="${STARTUP_PROBE_TIMEOUT:-5}"
 MODEL_PATH="$(resolve_project_path "$VLLM_MODEL_NAME")"
 CONDA_CMD="$(find_conda || true)"
@@ -45,6 +47,10 @@ probe_vllm() {
     PROBE_MODEL="$(printf '%s' "$response" | extract_vllm_model_id "$PYTHON_BIN" 2>/dev/null || true)"
     [[ -n "$PROBE_MODEL" ]] || return 2
     model_names_match "$PROBE_MODEL" "$VLLM_MODEL_NAME" || return 1
+    probe_vllm_inference "$PYTHON_BIN" \
+        "http://127.0.0.1:${VLLM_PORT}/v1/chat/completions" \
+        "$VLLM_INFERENCE_PROBE_TIMEOUT" "$VLLM_API_KEY" "$VLLM_MODEL_NAME" \
+        >/dev/null 2>&1 || return 4
 }
 
 managed_pid() {
@@ -60,12 +66,32 @@ managed_pid() {
     return 1
 }
 
+expected_vllm_listener() {
+    local pid="$1" cmd
+    cmd="$(pid_cmdline "$pid" 2>/dev/null || true)"
+    [[ "$cmd" == *"vllm.entrypoints.openai.api_server"* ]] || return 1
+    [[ "$cmd" == *"--port $VLLM_PORT"* ]] || return 1
+    [[ "$cmd" == *"--model $MODEL_PATH"* || "$cmd" == *"--model $VLLM_MODEL_NAME"* ]]
+}
+
 do_stop() {
-    local pid listener
+    local orphan_mode="${1:-}" pid listener
     pid="$(managed_pid || true)"
     if [[ -z "$pid" ]]; then
         listener="$(port_pid "$VLLM_PORT")"
         if [[ -n "$listener" ]]; then
+            if [[ "$orphan_mode" == "--orphan" ]] && expected_vllm_listener "$listener"; then
+                echo "[警告] PID 文件缺失，但已确认 PID $listener 是当前模型和端口的 vLLM；正在停止孤儿进程"
+                stop_pid_gracefully "$listener" "vLLM 孤儿进程"
+                rm -f "$PID_FILE"
+                echo "[信息] vLLM 孤儿进程已停止"
+                return 0
+            fi
+            if expected_vllm_listener "$listener"; then
+                echo "[错误] 端口 ${VLLM_PORT} 由符合当前配置但未纳管的 vLLM 占用 (PID: $listener)"
+                echo "[提示] 核对进程后可执行: bash scripts/start_vllm.sh stop --orphan"
+                return 1
+            fi
             echo "[错误] 端口 ${VLLM_PORT} 由未纳管进程占用 (PID: $listener)，拒绝停止"
             return 1
         fi
@@ -91,7 +117,12 @@ do_status() {
         echo "============================================="
         return 0
     fi
-    if [[ -n "$listener" ]]; then
+    if [[ -n "${PROBE_MODEL:-}" ]]; then
+        echo "  vLLM 状态: API/模型可达，但真实生成探针失败"
+        echo "  模型:      $PROBE_MODEL"
+        echo "  PID:       ${pid:-${listener:-未知}}"
+        echo "  建议:      检查 GPU 与 logs/vllm_server.log，必要时安全重启"
+    elif [[ -n "$listener" ]]; then
         echo "  vLLM 状态: 端口已占用但服务未通过认证健康检查"
         echo "  PID:       $listener"
     else
@@ -103,7 +134,14 @@ do_status() {
 }
 
 case "${1:-}" in
-    stop) do_stop; exit $? ;;
+    stop)
+        [[ $# -le 2 && ( $# -eq 1 || "${2:-}" == "--orphan" ) ]] || {
+            echo "用法: bash scripts/start_vllm.sh stop [--orphan]"
+            exit 1
+        }
+        do_stop "${2:-}"
+        exit $?
+        ;;
     status) do_status; exit $? ;;
 esac
 
@@ -169,14 +207,16 @@ fi
 VLLM_PID=$!
 printf '%s\n' "$VLLM_PID" > "$PID_FILE"
 
+started_at=$SECONDS
 elapsed=0
-while (( elapsed < VLLM_STARTUP_TIMEOUT )); do
+while (( SECONDS - started_at < VLLM_STARTUP_TIMEOUT )); do
     if ! kill -0 "$VLLM_PID" 2>/dev/null; then
         rm -f "$PID_FILE"
         echo "[错误] vLLM 进程提前退出，请检查 $LOG_FILE"
         exit 1
     fi
     if probe_vllm; then
+        elapsed=$((SECONDS - started_at))
         echo "[信息] vLLM 已就绪，模型=$PROBE_MODEL，耗时=${elapsed}s"
         if [[ "$BACKGROUND" == "false" ]]; then
             wait "$VLLM_PID"
@@ -184,7 +224,7 @@ while (( elapsed < VLLM_STARTUP_TIMEOUT )); do
         exit 0
     fi
     sleep 3
-    elapsed=$((elapsed + 3))
+    elapsed=$((SECONDS - started_at))
 done
 
 echo "[错误] vLLM 在 ${VLLM_STARTUP_TIMEOUT}s 内未就绪，停止本次启动的进程"
