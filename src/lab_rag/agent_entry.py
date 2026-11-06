@@ -178,6 +178,7 @@ def run_react_once(
     route_name = initial_route.get("route") if initial_route else None
     used_list_tool = False
     used_rag_tool = False
+    completed_calls = set()
 
     observation_text = ""
     for step in range(1, max_steps + 1):
@@ -254,11 +255,11 @@ def run_react_once(
                 ),
             })
             continue
-        if route_name and required_tool is None:
+        if (tool_name, arg.strip()) in completed_calls:
             messages.append({"role": "assistant", "content": content})
             messages.append({
                 "role": "user",
-                "content": "必需工具调用已经完成，不要继续调用工具。请使用 Answer: 输出最终回答。",
+                "content": "同一工具和参数已有结果，请利用已有证据回答，或保留原始问题意图换一个查询补充查证。",
             })
             continue
 
@@ -279,6 +280,7 @@ def run_react_once(
                     obs = tool.invoke(tool_input)
                 tool_cost = time.perf_counter() - tool_start
                 observation_text = str(obs)
+                completed_calls.add((tool_name, arg.strip()))
                 used_list_tool = used_list_tool or tool_name == "list_group_files"
                 used_rag_tool = used_rag_tool or tool_name == "rag_qa"
 
@@ -343,6 +345,7 @@ def ask_agent_stream(
     observation_text = ""
     used_list_tool = False
     used_rag_tool = False
+    completed_calls = set()
     latest_catalog_result = None
 
     def finalize_answer(value: str) -> str:
@@ -447,11 +450,11 @@ def ask_agent_stream(
                     ),
                 })
                 continue
-            if route_name and required_tool is None:
+            if (tool_name, arg.strip()) in completed_calls:
                 messages.append({"role": "assistant", "content": content})
                 messages.append({
                     "role": "user",
-                    "content": "必需工具调用已经完成，不要继续调用工具。请使用 Answer: 输出最终回答。",
+                    "content": "同一工具和参数已有结果，请利用已有证据回答，或保留原始问题意图换一个查询补充查证。",
                 })
                 continue
 
@@ -476,6 +479,7 @@ def ask_agent_stream(
                             obs = tool.invoke(tool_input)
                         observation_text = str(obs)
                     tool_cost = time.perf_counter() - tool_start
+                    completed_calls.add((tool_name, arg.strip()))
                     debug_log(
                         f"[stream] step={step} tool={tool_name} 耗时={tool_cost:.3f}s, observation字符数={len(observation_text)}")
 

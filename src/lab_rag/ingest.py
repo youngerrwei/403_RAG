@@ -28,6 +28,10 @@ from langchain_qdrant import QdrantVectorStore
 
 from .logger import get_logger
 from .paths import PROJECT_ROOT
+from .document_structure import (
+    preserve_html_tables, split_table_row, strip_ingest_prefix,
+    has_structured_evidence, markdown_header_matches, split_markdown_text,
+)
 
 
 # ================= LOG =================
@@ -78,6 +82,7 @@ def load_config():
         "QDRANT_RECREATE_COLLECTION": os.getenv("QDRANT_RECREATE_COLLECTION", "false").lower() == "true",
 
         "MIN_CHUNK_LENGTH": int(os.getenv("MIN_CHUNK_LENGTH", "120")),
+        "MIN_STRUCTURED_CHUNK_LENGTH": int(os.getenv("MIN_STRUCTURED_CHUNK_LENGTH", "12")),
         "ENABLE_TABLE_SEMANTIC_ENRICHMENT": os.getenv("ENABLE_TABLE_SEMANTIC_ENRICHMENT", "true").lower() == "true",
         "TABLE_SEMANTIC_MAX_ROWS": int(os.getenv("TABLE_SEMANTIC_MAX_ROWS", "20")),
         "TABLE_FLATTENED_LINE_MIN_CHARS": int(os.getenv("TABLE_FLATTENED_LINE_MIN_CHARS", "240")),
@@ -110,34 +115,9 @@ def load_config():
 
 # ================= TEXT CLEAN =================
 
-VARIABLE_FORMAT_RECOVERY = r"""
-
-[变量格式表语义恢复]
-
-| 变量类型 | 英文字母 | 罗马字母 |
-| --- | --- | --- |
-| 标量 | 斜体，例：$k$ | 不限格式，例：$\alpha$ |
-| 集合 | 正体并大写，例：$\mathrm{K}$ | 大写，例：$\Omega$、$\Phi$ |
-| 向量、矩阵 | 正体并粗体，例：$\mathbf{k}$、$\mathbf{K}$ | 正体并粗体，例：$\bs{\lambda}$、$\bs{\theta}$ |
-
-明确规则：向量和矩阵均使用正体粗体，不能写成普通斜体；示例顺序与类型顺序对应，英文字母向量用小写正体粗体 $\mathbf{k}$，矩阵用大写正体粗体 $\mathbf{K}$。罗马字母正体粗体沿用原文命令 `\bs{}`。
-""".strip()
-
-
-def recover_flattened_variable_format_table(text: str) -> str:
-    """修复已被 OCR/旧清洗流程压平成单行的变量格式表。"""
-    if "[变量格式表语义恢复]" in text:
-        return text
-    compact = re.sub(r"\s+", "", text)
-    required = ("变量格式", "变量类型", "英文字母", "罗马字母", "标量", "集合", "向量、矩阵", "正体+粗体")
-    if all(term in compact for term in required):
-        return f"{text.rstrip()}\n\n{VARIABLE_FORMAT_RECOVERY}"
-    return text
-
-
 def mark_suspect_flattened_tables(text: str) -> str:
     """标记无法可靠还原的通用扁平表格，阻止回答模型按常识补全。"""
-    if "[变量格式表语义恢复]" in text or "[表格结构疑似丢失]" in text:
+    if "[表格结构疑似丢失]" in text:
         return text
     min_chars = max(80, int(os.getenv("TABLE_FLATTENED_LINE_MIN_CHARS", "240")))
     groups = (
@@ -176,7 +156,7 @@ def enrich_markdown_tables(text: str) -> str:
             end += 1
         output.extend(block)
         if len(block) >= 3:
-            rows = [[cell.strip() for cell in row.strip().strip("|").split("|")] for row in block]
+            rows = [split_table_row(row) for row in block]
             separator_index = next((i for i, row in enumerate(rows) if row and all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in row)), None)
             if separator_index == 1 and len(rows[0]) >= 2:
                 headers = rows[0]
@@ -185,7 +165,8 @@ def enrich_markdown_tables(text: str) -> str:
                     if len(row) != len(headers):
                         continue
                     semantic_rows.append("；".join(f"{header}={cell}" for header, cell in zip(headers, row)))
-                if semantic_rows:
+                following = next((line.strip() for line in lines[end:] if line.strip()), "")
+                if semantic_rows and following != "[表格结构化转写]":
                     output.extend(["", "[表格结构化转写]", *[f"- {row}" for row in semantic_rows]])
         index = end
     return "\n".join(output)
@@ -198,8 +179,9 @@ def clean_text(text: str) -> str:
     text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
     # 2. 移除 Markdown 图片语法，保留 [图片] 占位
     text = re.sub(r'!\[([^\]]*)\]\([^)]*\)', lambda m: f'[图片: {m.group(1)}]' if m.group(1) else '[图片]', text)
-    # 3. 移除 HTML 标签
-    text = re.sub(r'<[^>]+>', '', text)
+    # 3. 先保留 HTML 表的行列，再清理展示标签，避免误删 x < y 等数学比较式。
+    text = preserve_html_tables(text)
+    text = re.sub(r'</?(?:table|thead|tbody|tfoot|tr|td|th|caption|span|div|p|br|b|i|strong|em|a|img)\b[^>]*>', '', text, flags=re.IGNORECASE)
     # 4. 清理零宽字符和控制字符
     text = re.sub(r'[\u200b\u200c\u200d\ufeff\u00ad]', '', text)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', text)
@@ -210,11 +192,9 @@ def clean_text(text: str) -> str:
     text = "\n".join(normalized_lines)
     # 7. 多个空白行压缩为一个空白行；禁止将单换行改为空格，否则表格会被压平。
     text = re.sub(r'\n\s*\n+', '\n\n', text)
-    # 8. 兼容已经由 OCR 或旧版清洗压平的已知变量格式表。
-    text = recover_flattened_variable_format_table(text)
-    # 9. 无法确定恢复的通用扁平表格必须显式标记，避免静默产生错误答案。
+    # 8. 无法确定恢复的通用扁平表格必须显式标记，禁止凭固定模板补写事实。
     text = mark_suspect_flattened_tables(text)
-    # 10. 对所有标准 Markdown 表增加可检索的逐行语义，不替换原表。
+    # 9. 对所有标准 Markdown 表增加可检索的逐行语义，不替换原表。
     text = enrich_markdown_tables(text)
     return text.strip()
 
@@ -355,14 +335,26 @@ def enrich_chunk_with_titles(doc: Document) -> Document:
 
 # ================= MARKDOWN STRUCTURE SPLIT =================
 
+def split_structured_documents(docs: List[Document], splitter, chunk_size: int) -> List[Document]:
+    """父/子/章节预切统一保留表头；普通文本继续使用现有分块及 overlap。"""
+    chunks = []
+    for doc in docs:
+        parts = split_markdown_text(doc.page_content, chunk_size, splitter.split_text)
+        oversized = sum(len(part) > chunk_size for part in parts)
+        if oversized:
+            log(f"[WARNING] {doc.metadata.get('file_name', '文档')} 有 {oversized} 个结构块超过 {chunk_size} 字符；保留完整表行，需检查超长单元格及模型输入上限")
+        chunks.extend(Document(page_content=part, metadata=dict(doc.metadata)) for part in parts if part.strip())
+    return chunks
+
+
 def split_by_markdown_headers(doc: Document, parent_chunk_size: int = 1500, parent_chunk_overlap: int = 200) -> List[Document]:
     """
-    按 Markdown 标题（#、##、###）将文档切分为逻辑段落。
+    按 Markdown 标题（一级至六级）将文档切分为逻辑段落，跳过代码围栏。
 
     每个段落继承原始 doc 的 metadata，并新增：
     - section_title: 当前段落的标题文本
     - header_path: 标题层级路径（如 "第三章 系统设计 > 3.1 硬件架构"）
-    - header_level: 标题级别（1/2/3）
+    - header_level: 标题级别（1 至 6）
 
     如果文档无任何标题，返回原始文档列表（回退）。
     如果某段落过长（超过 parent_chunk_size * 2），递归切分。
@@ -371,9 +363,8 @@ def split_by_markdown_headers(doc: Document, parent_chunk_size: int = 1500, pare
     if not text or not text.strip():
         return [doc]
 
-    # 匹配 Markdown 标题行：# / ## / ###
-    header_pattern = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
-    matches = list(header_pattern.finditer(text))
+    # 支持手册常见的深层标题；代码围栏中的 # 不是章节。
+    matches = markdown_header_matches(text)
 
     # 如果无任何标题，回退返回原始文档
     if not matches:
@@ -384,7 +375,7 @@ def split_by_markdown_headers(doc: Document, parent_chunk_size: int = 1500, pare
     header_stack = {}  # level -> title
 
     for i, match in enumerate(matches):
-        level = len(match.group(1))  # 1, 2, or 3
+        level = len(match.group(1))
         title = match.group(2).strip()
         start = match.start()
 
@@ -441,7 +432,7 @@ def split_by_markdown_headers(doc: Document, parent_chunk_size: int = 1500, pare
                 chunk_overlap=parent_chunk_overlap,
                 separators=["\n\n", "\n", "。", ". ", " "]
             )
-            sub_docs = sub_splitter.split_documents([sec])
+            sub_docs = split_structured_documents([sec], sub_splitter, parent_chunk_size)
             # 每个子文档继承该段落的 metadata
             for sd in sub_docs:
                 sd.metadata.update(sec.metadata)
@@ -914,7 +905,7 @@ def split_documents(docs: List[Document], cfg: dict):
         parent_chunks_to_store = []
 
         # 第一层：切分父文档
-        parent_chunks = parent_splitter.split_documents(logical_docs)
+        parent_chunks = split_structured_documents(logical_docs, parent_splitter, parent_chunk_size)
         # 注意：不再对父块注入结构前缀，前缀统一在子块层面通过 build_contextual_prefix() 注入
         # 避免子块继承父块前缀导致重复（子块切分自父块文本，会携带父块中的前缀文本）
 
@@ -954,7 +945,7 @@ def split_documents(docs: List[Document], cfg: dict):
             ))
 
             # 切分子块
-            child_chunks = child_splitter.split_documents([p_chunk])
+            child_chunks = split_structured_documents([p_chunk], child_splitter, cfg["CHILD_CHUNK_SIZE"])
 
             # 获取当前父块的摘要
             parent_summary = summary_map.get(parent_id, "")
@@ -999,7 +990,13 @@ def analyze_bad_chunk_reason(text: str, cfg: dict) -> str:
     """分析低质量 chunk 原因，适配实验室文档场景"""
     if not text or not text.strip():
         return "empty"
-    text = text.strip()
+    text = strip_ingest_prefix(text)
+    if not text:
+        return "empty"
+
+    # 结构性条款不能被固定 120 字阈值误删，且不能仅凭路径前缀过长获得保留。
+    if len(text) >= cfg.get("MIN_STRUCTURED_CHUNK_LENGTH", 12) and has_structured_evidence(text):
+        return "good"
 
     min_length = cfg.get("MIN_CHUNK_LENGTH", 120)
     if len(text) < min_length:

@@ -42,6 +42,9 @@ class ScriptContractTests(unittest.TestCase):
         files = (
             "src/lab_rag/agent_entry.py",
             "src/lab_rag/create_user.py",
+            "src/lab_rag/document_structure.py",
+            "src/lab_rag/lexical_retrieval.py",
+            "scripts/evaluate_lexical_retrieval.py",
             "src/lab_rag/ingest.py",
             "src/lab_rag/logger.py",
             "src/lab_rag/mcp_server.py",
@@ -419,16 +422,9 @@ class WebContractTests(unittest.TestCase):
         self.assertEqual(cleaned.count("\n"), 2)
         self.assertIn("| 向量、矩阵 | 正体+粗体 |", cleaned)
 
-    def test_notation_answer_respects_ordered_vector_matrix_examples(self):
-        context = (
-            "[来源1] [文档标题] 论文格式规范\n"
-            "- 变量类型=向量、矩阵；英文字母=正体+粗体，例：$\\mathbf{k}$、$\\mathbf{K}$；"
-            "罗马字母=正体+粗体，例：$\\bs{\\lambda}$、$\\bs{\\theta}$"
-        )
-        answer = self.rag_agent.build_grounded_notation_answer(context)
-        self.assertIn(r"向量使用小写正体粗体，如 $\mathbf{k}$", answer)
-        self.assertIn(r"矩阵使用大写正体粗体，如 $\mathbf{K}$", answer)
-        self.assertNotIn("并未用大小写区分", answer)
+    def test_no_topic_specific_answer_shortcuts(self):
+        self.assertFalse(hasattr(self.rag_agent, "build_grounded_notation_answer"))
+        self.assertFalse(hasattr(self.rag_agent, "build_notation_retrieval_plan"))
 
     def test_agent_multiline_answer_excludes_reasoning_prefix(self):
         from lab_rag.agent_entry import parse_answer
@@ -582,10 +578,9 @@ class IngestContractTests(unittest.TestCase):
             "正体+粗体，例：λ、θ 注：罗马字母的正体+粗体命令：\\bs{}"
         )
         recovered = clean_text(flattened)
-        self.assertIn("[变量格式表语义恢复]", recovered)
-        self.assertIn("明确规则：向量和矩阵均使用正体粗体，不能写成普通斜体", recovered)
-        self.assertIn(r"英文字母向量用小写正体粗体 $\mathbf{k}$", recovered)
-        self.assertIn(r"矩阵用大写正体粗体 $\mathbf{K}$", recovered)
+        self.assertNotIn("[变量格式表语义恢复]", recovered)
+        self.assertNotIn("明确规则", recovered)
+        self.assertIn(flattened, recovered)
 
         generic_table = "| 参数 | 单位 |\n| --- | --- |\n| 功率 | dBm |"
         generic_cleaned = clean_text(generic_table)

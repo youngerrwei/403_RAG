@@ -6,6 +6,7 @@ import time
 import fcntl
 import shutil
 import hashlib
+import copy
 import threading
 import traceback
 import tempfile
@@ -29,6 +30,8 @@ from sentence_transformers import CrossEncoder
 
 from .logger import get_logger
 from .paths import PROJECT_ROOT
+from .document_structure import evidence_window, strip_ingest_prefix, markdown_tables
+from .lexical_retrieval import search_lexical_candidates
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -321,9 +324,11 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
     for child in child_docs:
         pid = child.metadata.get("parent_id")
         score = child.metadata.get("rerank_score", 0)
-        if pid and (pid not in best_children or score > best_children[pid][1]):
-            best_children[pid] = (child, score)
-            needed_parent_ids.add(pid)
+        key = (child.metadata.get("rel_path") or child.metadata.get("source", ""), pid) if pid else retrieval_doc_key(child)
+        if key not in best_children or score > best_children[key][1]:
+            best_children[key] = (child, score)
+            if pid:
+                needed_parent_ids.add(pid)
 
     # 批量从 parent collection 获取父块内容及摘要（带降级策略）
     parent_contents = {}
@@ -357,7 +362,6 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
     sorted_children = sorted(best_children.values(), key=lambda x: x[1], reverse=True)
 
     parent_docs = []
-    seen_parent_ids = set()
     accumulated_length = 0
 
     for child, score in sorted_children:
@@ -376,10 +380,11 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
         # [FIX] 单个 parent_content 字段级截断，防止异常大文档占用整个 context 预算
         max_single_content = max_context_chars // 2  # 单个文档最多占一半预算
         if len(parent_content) > max_single_content:
-            parent_content = parent_content[:max_single_content]
+            parent_content = evidence_window(parent_content, child.page_content, max_single_content)
             debug_log(f"[WARN] parent_content 过大，已截断至 {max_single_content} 字符")
 
-        if not parent_id or parent_id in seen_parent_ids:
+        if not parent_content.strip():
+            debug_log("[WARN] 命中结构无法在上下文预算内完整呈现，跳过该父块")
             continue
 
         # 长度控制：预估加入该父块后是否超限
@@ -391,6 +396,7 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
         # 构建父文档，确保 parent_summary 被正确设置到 metadata
         parent_meta = {k: v for k, v in child.metadata.items() if k != "parent_content"}
         parent_meta["is_parent"] = True
+        parent_meta["matched_child_content"] = strip_ingest_prefix(child.page_content)
         if parent_summary:
             parent_meta["parent_summary"] = parent_summary
 
@@ -400,7 +406,6 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
         )
 
         parent_docs.append(parent_doc)
-        seen_parent_ids.add(parent_id)
         accumulated_length += content_length
 
         if len(parent_docs) >= top_k:
@@ -523,6 +528,9 @@ def load_config() -> dict:
 
         "ENABLE_HYBRID_SEARCH": os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true",
         "BM25_WEIGHT": float(os.getenv("BM25_WEIGHT", "0.3")),
+        "SPARSE_CANDIDATE_LIMIT": int(os.getenv("SPARSE_CANDIDATE_LIMIT", "256")),
+        "SPARSE_MAX_TERMS": int(os.getenv("SPARSE_MAX_TERMS", "8")),
+        "SPARSE_TIMEOUT": float(os.getenv("SPARSE_TIMEOUT", "10")),
         "DENSE_WEIGHT": float(os.getenv("DENSE_WEIGHT", "0.7")),
 
         "MAX_CONTEXT_CHARS": int(os.getenv("MAX_CONTEXT_CHARS", "3000")),
@@ -535,7 +543,7 @@ def load_config() -> dict:
         "KEYWORD_BOOST": float(os.getenv("KEYWORD_BOOST", "1.05")),
         "TITLE_BOOST": float(os.getenv("TITLE_BOOST", "1.08")),
 
-        "ENABLE_HYDE": os.getenv("ENABLE_HYDE", "true").lower() == "true",
+        "ENABLE_HYDE": os.getenv("ENABLE_HYDE", "false").lower() == "true",
         "HYBRID_FILE_CONTEXT_BUDGET": int(os.getenv("HYBRID_FILE_CONTEXT_BUDGET", "1500")),
         "HEALTHCHECK_TIMEOUT": float(os.getenv("HEALTHCHECK_TIMEOUT", "3")),
         "RUNTIME_RETRY_INTERVAL": float(os.getenv("RUNTIME_RETRY_INTERVAL", "30")),
@@ -919,7 +927,7 @@ def clean_retrieval_display_text(text: str) -> str:
         return ""
 
     raw = text
-    has_markdown_structure = bool(re.search(r"(?m)^\s*(?:#{1,6}\s+|\|.*\|\s*$|[-*+]\s+|```)", text))
+    has_markdown_structure = bool(re.search(r"(?m)^\s*(?:#{1,6}\s+|\|.*\|\s*$|[-*+]\s+|```)", text) or markdown_tables(text))
     if has_markdown_structure:
         # 表格、标题和列表必须保留换行，否则单元格关系会再次退化为扁平文本。
         text = strip_structured_prefix(text)
@@ -1092,26 +1100,6 @@ def route_query(llm, question: str) -> dict:
 # =========================
 # 查询改写
 # =========================
-def is_notation_format_question(question: str) -> bool:
-    """识别论文变量/矩阵/向量排版规范问题。"""
-    has_object = any(term in question for term in ("矩阵", "向量", "标量", "变量", "符号"))
-    has_format = any(term in question for term in ("表示", "格式", "怎么写", "如何写", "正体", "斜体", "粗体", "字体"))
-    return has_object and has_format and any(term in question for term in ("论文", "报告", "矩阵", "向量"))
-
-
-def build_notation_retrieval_plan() -> Dict[str, object]:
-    """使用资料中的精确术语检索排版规范，避免 HyDE 引入通信论文惯例。"""
-    return {
-        "rewritten_question": "论文变量格式规范中矩阵和向量的正体、斜体、粗体及大小写要求",
-        "keywords": ["变量格式", "向量、矩阵", "正体", "粗体", "斜体", "英文字母", "罗马字母"],
-        "queries": [
-            "变量格式 变量类型 英文字母 罗马字母 标量 集合 向量、矩阵",
-            "论文格式规范 向量、矩阵 正体+粗体",
-            "矩阵 向量 正体 粗体 斜体 大小写",
-        ],
-    }
-
-
 def should_skip_rewrite(question: str) -> bool:
     """判断是否可以跳过LLM改写，直接使用原始问题检索"""
     # 仅纯关键词短语跳过改写；“是什么/怎么/如何”等短问句仍需扩展检索表达。
@@ -1142,27 +1130,36 @@ def rewrite_question(llm, question: str, cfg: dict = None) -> dict:
 【输出格式】严格JSON：
 {{
   "standalone_question": "补全代词和省略后的完整独立问题",
+  "keywords": ["原问题中的检索关键词"],
   "expanded_queries": [
     "原问题的精准改写（保留专业术语）",
-    "更宽泛的上位概念查询",
-    "关键术语的同义词/缩写展开查询"
+    "保留目标对象和内容意图的同义表达",
+    "不引入新事实的补充检索表达"
   ],
-  "hypothetical_docs": "生成2-3个可能包含答案的学术文献摘要片段，每个50-80字，模拟真实文献内容，用'|||'分隔"
+  "hypothetical_docs": "仅在下面明确启用时生成，否则为空字符串"
 }}
 
 【规则】
 1. 保留所有专业术语、设备型号、参数名、英文缩写
-2. 补全代词（这个/那个/它）为具体指代对象
+2. 未提供指代对象时保留代词，不得猜测对象或擅自展开缩写
 3. expanded_queries 必须多样化，覆盖不同检索角度
 4. 不要解释问题，仅做改写
 5. 若问题已清晰完整，standalone_question保持原意
-6. hypothetical_docs: 假设你已经知道答案，写2-3个简短的模拟文献摘要片段（每个50-80字），用"|||"分隔
+6. 假设文档策略：{hyde_instruction}
+7. 禁止把猜测的设备配置、操作步骤、标准或答案写入 expanded_queries
 
 用户问题：{question}""")
 
     try:
         with Timer("rewrite_question_llm"):
-            result = (prompt | llm).invoke({"question": question})
+            result = (prompt | llm).invoke({
+                "question": question,
+                "hyde_instruction": (
+                    "已启用，可生成简短假设文档，仅用于召回，不是事实证据。"
+                    if cfg and cfg.get("ENABLE_HYDE", False)
+                    else "未启用，hypothetical_docs 必须为空字符串。"
+                ),
+            })
         debug_log("REWRITE_RAW_OUTPUT:", repr(result.content))
 
         data = safe_parse_json(result.content)
@@ -1186,7 +1183,7 @@ def rewrite_question(llm, question: str, cfg: dict = None) -> dict:
         # [HyDE] 提取假设性文档片段，作为额外检索 query 增强召回
         hyde_text = ""
         try:
-            if cfg and cfg.get("ENABLE_HYDE", True):
+            if cfg and cfg.get("ENABLE_HYDE", False):
                 # 优先使用新格式 hypothetical_docs（多个假设文档，|||分隔）
                 if data.get("hypothetical_docs"):
                     hyde_text = data["hypothetical_docs"]
@@ -1224,7 +1221,29 @@ def rewrite_question(llm, question: str, cfg: dict = None) -> dict:
 # =========================
 # 检索与重排
 # =========================
-def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_workers: int = 4):
+def retrieval_doc_key(doc):
+    """以完整正文和来源路径去重，避免同名文件和长文本前缀碰撞。"""
+    metadata = doc.metadata or {}
+    return (metadata.get("rel_path") or metadata.get("source") or metadata.get("file_name", ""),
+            doc.page_content or "")
+
+
+def fuse_ranked_lists(ranked_lists, weights, k):
+    """仅为实际召回的排名加分；同分保持输入顺序，不依赖线程完成顺序。"""
+    scores, documents = {}, {}
+    for docs, weight in zip(ranked_lists, weights):
+        seen = set()
+        for doc in docs:
+            key = retrieval_doc_key(doc)
+            if key in seen:
+                continue
+            seen.add(key)
+            documents.setdefault(key, doc)
+            scores[key] = scores.get(key, 0.0) + weight / (k + len(seen))
+    return [documents[key] for key in sorted(scores, key=scores.get, reverse=True)]
+
+
+def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_workers: int = 4, rrf_k: int = 60):
     """
     🔥 升级版（并行化）：
     - 不再均分K
@@ -1232,7 +1251,7 @@ def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_w
     - 使用 ThreadPoolExecutor 并行执行多路检索
     - 后面再统一裁剪
     """
-    all_docs = []
+    ranked_lists = []
 
     # [FIX] 修正 Top-K 计算逻辑：每个 query 使用固定大 K 召回，后续由去重和重排裁剪
     # 旧逻辑 num_queries 越多 K 越小（反了），现在每个 query 统一使用 INITIAL_RETRIEVAL_K
@@ -1250,11 +1269,13 @@ def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_w
             return []
 
     executor = ThreadPoolExecutor(max_workers=max_workers)
-    futures = {executor.submit(search_one, q): q for q in queries}
+    futures = {executor.submit(search_one, q): q for q in dict.fromkeys(queries)}
     done, pending = wait(futures, timeout=30)
-    for future in done:
+    for future in futures:
+        if future not in done:
+            continue
         try:
-            all_docs.extend(future.result())
+            ranked_lists.append(future.result())
         except Exception as e:
             debug_log(f"[WARNING] 检索失败: {e}")
     for future in pending:
@@ -1263,166 +1284,52 @@ def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_w
         debug_log(f"[WARNING] {len(pending)} 个检索任务超过 30 秒，已取消等待")
     executor.shutdown(wait=False, cancel_futures=True)
 
-    debug_log(f"[RECALL TOTAL] before merge = {len(all_docs)}")
-    return all_docs
+    merged = fuse_ranked_lists(ranked_lists, [1.0] * len(ranked_lists), rrf_k)
+    debug_log(f"[RECALL TOTAL] fused = {len(merged)}")
+    return merged
 
 
-def retrieve_sparse(client, collection_name: str, query: str, keywords: List[str], top_k: int) -> List[Document]:
-    """
-    基于 Qdrant 全文搜索的稀疏检索。
-    利用 FieldCondition + MatchText 对 page_content 进行关键词匹配。
-    """
+def retrieve_sparse(client, collection_name: str, query: str, keywords: List[str], top_k: int,
+                    cfg: dict = None) -> List[Document]:
+    """有界多路全文召回，排序后再参与 RRF；不加载额外模型或修改索引。"""
+    config = cfg if cfg is not None else load_config()
+
+    def scroll(search_filter, limit, timeout):
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=rest.Filter(**search_filter),
+            limit=limit, with_payload=True, with_vectors=False,
+            timeout=max(1, int(timeout)),
+        )
+        return [{"id": str(point.id), "payload": point.payload} for point in points]
+
     try:
-        with Timer(f"retrieve_sparse query={repr(query[:50])} keywords={keywords[:10]}"):
-            # 构建搜索词列表：query 分词 + keywords（限制最多10个关键词）
-            keywords = keywords[:10]
-            search_terms = list(set([t.strip() for t in keywords if t.strip()] + [query.strip()]))
-            if not search_terms:
-                return []
-
-            # 构建 should 条件：对多个字段做 MatchText
-            should_conditions = []
-            for term in search_terms:
-                if not term:
-                    continue
-                should_conditions.append(
-                    rest.FieldCondition(key="page_content", match=rest.MatchText(text=term))
-                )
-                should_conditions.append(
-                    rest.FieldCondition(key="metadata.doc_title", match=rest.MatchText(text=term))
-                )
-                should_conditions.append(
-                    rest.FieldCondition(key="metadata.section_title", match=rest.MatchText(text=term))
-                )
-                should_conditions.append(
-                    rest.FieldCondition(key="metadata.file_name", match=rest.MatchText(text=term))
-                )
-                should_conditions.append(
-                    rest.FieldCondition(key="metadata.rel_path", match=rest.MatchText(text=term))
-                )
-
-            # 限制 MatchText 条件数量，防止条件过多导致超时
-            should_conditions = should_conditions[:30]
-
-            if not should_conditions:
-                return []
-
-            search_filter = rest.Filter(should=should_conditions)
-
-            # 设置超时保护，防止大量条件导致 Qdrant 查询过慢
-            try:
-                results, _ = client.scroll(
-                    collection_name=collection_name,
-                    scroll_filter=search_filter,
-                    limit=top_k,
-                    with_payload=True,
-                    timeout=10,  # 稀疏检索超时保护
-                )
-            except Exception as timeout_err:
-                debug_log(f"[WARN] retrieve_sparse scroll 超时或失败: {timeout_err}")
-                return []
-
-            docs = []
-            for hit in results:
-                payload = hit.payload or {}
-                md = payload.get("metadata", {})
-
-                # 提取 page_content
-                content = payload.get("page_content", "") or md.get("page_content", "")
-                if not content:
-                    continue
-
-                # 构建 Document 对象
-                doc = Document(
-                    page_content=content,
-                    metadata={
-                        "file_name": md.get("file_name", ""),
-                        "doc_title": md.get("doc_title", ""),
-                        "rel_path": md.get("rel_path", ""),
-                        "section_title": md.get("section_title", ""),
-                        "parent_id": md.get("parent_id", ""),
-                        "parent_content": md.get("parent_content", ""),
-                    }
-                )
-                docs.append(doc)
-
-            debug_log(f"retrieve_sparse results={len(docs)}")
-            return docs
-
-    except Exception as e:
-        debug_log(f"retrieve_sparse error: {repr(e)}")
+        points = search_lexical_candidates(
+            scroll, query, keywords, top_k,
+            candidate_limit=int(config.get("SPARSE_CANDIDATE_LIMIT", 256)),
+            max_terms=int(config.get("SPARSE_MAX_TERMS", 8)),
+            timeout=float(config.get("SPARSE_TIMEOUT", 10)),
+            log=debug_log,
+        )
+        docs = []
+        for point in points:
+            payload = point.get("payload") or {}
+            metadata = dict(payload.get("metadata") or {})
+            content = payload.get("page_content") or metadata.get("page_content", "")
+            if content:
+                # 保留 header_path/source 等原始字段，不能在全文通道丢失来源范围。
+                docs.append(Document(page_content=content, metadata=metadata))
+        return docs
+    except Exception as exc:
+        debug_log(f"[SPARSE] 候选检索失败: {type(exc).__name__}")
         return []
 
 
 def reciprocal_rank_fusion(dense_docs: List[Document], sparse_docs: List[Document],
                            dense_weight: float = 0.7, sparse_weight: float = 0.3,
                            k: int = 60) -> List[Document]:
-    """
-    Reciprocal Rank Fusion (RRF) 融合两路检索结果。
-    score = dense_weight * 1/(k+rank_dense) + sparse_weight * 1/(k+rank_sparse)
-    """
-    try:
-        def doc_key(doc: Document) -> str:
-            """以 page_content 前1000字符 + file_name 作为去重 key"""
-            content_prefix = (doc.page_content or "")[:1000]
-            file_name = doc.metadata.get("file_name", "") if doc.metadata else ""
-            return f"{file_name}||{content_prefix}"
-
-        # 构建 dense 排名映射
-        dense_rank = {}
-        for rank, doc in enumerate(dense_docs, start=1):
-            key = doc_key(doc)
-            if key not in dense_rank:
-                dense_rank[key] = rank
-
-        # 构建 sparse 排名映射
-        sparse_rank = {}
-        for rank, doc in enumerate(sparse_docs, start=1):
-            key = doc_key(doc)
-            if key not in sparse_rank:
-                sparse_rank[key] = rank
-
-        # 收集所有唯一文档
-        all_keys = set(dense_rank.keys()) | set(sparse_rank.keys())
-
-        # 建立 key -> doc 的映射
-        key_to_doc = {}
-        for doc in dense_docs:
-            key = doc_key(doc)
-            if key not in key_to_doc:
-                key_to_doc[key] = doc
-        for doc in sparse_docs:
-            key = doc_key(doc)
-            if key not in key_to_doc:
-                key_to_doc[key] = doc
-
-        # 计算 RRF 融合分数
-        # 对于只在单路出现的文档，使用固定默认排名，避免因两路返回数量不同导致不对称降权
-        default_rank = int(os.getenv("INITIAL_RETRIEVAL_K", "64")) + 1
-        scored = []
-        for key in all_keys:
-            d_rank = dense_rank.get(key, default_rank)
-            s_rank = sparse_rank.get(key, default_rank)
-            rrf_score = dense_weight * (1.0 / (k + d_rank)) + sparse_weight * (1.0 / (k + s_rank))
-            scored.append((key, rrf_score))
-
-        # 按融合得分降序排列
-        scored.sort(key=lambda x: x[1], reverse=True)
-
-        # 返回排序后的文档列表
-        fused_docs = []
-        for key, score in scored:
-            doc = key_to_doc.get(key)
-            if doc:
-                fused_docs.append(doc)
-
-        debug_log(f"reciprocal_rank_fusion: dense={len(dense_docs)} sparse={len(sparse_docs)} fused={len(fused_docs)}")
-        return fused_docs
-
-    except Exception as e:
-        debug_log(f"reciprocal_rank_fusion error: {repr(e)}")
-        # 出错时回退为只返回 dense_docs
-        return dense_docs
+    """RRF 只计算文档实际出现的检索通道，不为缺失通道虚构排名。"""
+    return fuse_ranked_lists([dense_docs, sparse_docs], [dense_weight, sparse_weight], k)
 
 
 def dedup_docs(docs):
@@ -1435,10 +1342,7 @@ def dedup_docs(docs):
         seen = set()
 
         for doc in docs:
-            file_name = doc.metadata.get("file_name", "")
-            content = clean_retrieval_display_text(doc.page_content)
-
-            exact_key = (file_name, content[:1000])
+            exact_key = retrieval_doc_key(doc)
             if exact_key in seen:
                 continue
 
@@ -1460,7 +1364,13 @@ def rerank_docs(reranker, query: str, docs, cfg: dict, top_k: int = None):
     score_threshold = cfg.get("RERANKER_SCORE_THRESHOLD", 0.3)
 
     try:
-        pairs = [(query, clean_retrieval_display_text(d.page_content)) for d in docs]
+        # 同名章节在不同设备/组会资料中含义不同；路径和标题参与语义重排，不按具体主题提分。
+        pairs = [(query, "\n".join([
+            f"[文档] {d.metadata.get('doc_title', '')}",
+            f"[路径] {d.metadata.get('rel_path', '')}",
+            f"[章节] {d.metadata.get('header_path') or d.metadata.get('section_title', '')}",
+            clean_retrieval_display_text(d.page_content),
+        ])) for d in docs]
         # [FIX] Reranker 分批推理，防止高并发显存溢出
         batch_size = 64
         all_scores = []
@@ -1502,10 +1412,6 @@ def rerank_docs(reranker, query: str, docs, cfg: dict, top_k: int = None):
         # 分数阈值过滤
         filtered = [(d, s) for d, s in boosted if s >= score_threshold]
 
-        if not filtered:
-            # 如果全部低于阈值，至少保留最高分的一个
-            filtered = boosted[:1]
-
         final_docs = [d for d, _ in filtered[:top_k]]
 
         debug_log(f"Rerank: {len(docs)} → {len(final_docs)} (threshold={score_threshold})")
@@ -1513,53 +1419,39 @@ def rerank_docs(reranker, query: str, docs, cfg: dict, top_k: int = None):
 
     except Exception as e:
         debug_log(f"Rerank error: {repr(e)}")
-        return docs[:top_k]
+        # 重排失败不能把未经验证的召回当成可靠证据。
+        return []
 
 
 def build_context(docs, max_chars: int = 12000) -> tuple:
-    """
-    构建带引用编号的上下文，返回 (context_str, source_map)。
-    source_map: {1: {"doc_title": "...", "rel_path": "...", "section_title": "..."}, ...}
-    """
-    parts = []
-    source_map = {}
+    """严格限制证据字符数；source_map 仅包含实际送入模型的正文片段。"""
+    parts, source_map = [], {}
     current_length = 0
-
+    separator = "\n\n====================\n\n"
     for idx, doc in enumerate(docs, start=1):
-        doc_title = doc.metadata.get('doc_title', '未知标题')
-        rel_path = doc.metadata.get('rel_path', '未知路径')
-        section_title = doc.metadata.get('section_title', '')
-
-        section_line = f"[章节] {section_title}\n" if section_title else ""
-        # 如果有父块摘要，展示给 LLM 帮助理解宏观上下文
-        parent_summary = sanitize_summary(doc.metadata.get("parent_summary", ""))
-        summary_line = f"[段落摘要] {parent_summary}\n" if parent_summary else ""
-        content = (
-            f"[来源{idx}] [文档标题] {doc_title}\n"
-            f"[路径] {rel_path}\n"
-            f"{section_line}"
-            f"{summary_line}"
-            f"{clean_retrieval_display_text(doc.page_content)}"
-        )
-
-        doc_len = len(content)
-
-        # 长度校验：如果加入当前块会严重超标，则丢弃排名靠后的父块
-        if current_length + doc_len > max_chars and current_length > 0:
-            debug_log(f"上下文已达 {current_length} 字符，截断后续 {len(docs) - len(parts)} 个排名较低的文档以防爆炸。")
+        title = doc.metadata.get("doc_title", "未知标题")
+        path = doc.metadata.get("rel_path", "未知路径")
+        section = doc.metadata.get("section_title", "")
+        header = f"[来源{idx}] [文档标题] {title}\n[路径] {path}\n"
+        if section:
+            header += f"[章节] {section}\n"
+        # 模型生成的摘要只用于召回，不得作为原文事实再次提供给回答模型。
+        body = clean_retrieval_display_text(doc.page_content)
+        prefix = separator if parts else ""
+        available = max_chars - current_length - len(prefix) - len(header)
+        if available <= 0:
             break
-
-        parts.append(content)
+        anchor = clean_retrieval_display_text(doc.metadata.get("matched_child_content", ""))
+        excerpt = evidence_window(body, anchor, available)
+        if not excerpt.strip():
+            continue
+        parts.append(header + excerpt)
         source_map[idx] = {
-            "doc_title": doc_title,
-            "rel_path": rel_path,
-            "section_title": section_title,
+            "doc_title": title, "rel_path": path, "section_title": section,
+            "content": excerpt,
         }
-        current_length += doc_len
-
-    debug_log(f"build_context: source_map size={len(source_map)}")
-    context_str = "\n\n====================\n\n".join(parts)
-    return context_str, source_map
+        current_length += len(prefix) + len(header) + len(excerpt)
+    return separator.join(parts), source_map
 
 
 # =========================
@@ -1570,7 +1462,7 @@ def assess_coverage(reranked_docs: list, config: dict) -> dict:
     if not reranked_docs:
         return {
             "level": "none",
-            "hint": "⚠️ 知识库中未找到相关内容，本次回答基于模型通用知识，仅供参考。"
+            "hint": "⚠️ 未找到通过相关性筛选的知识库证据，不能据此确认答案。"
         }
 
     # 综合评估指标
@@ -1614,7 +1506,7 @@ def build_citations(used_docs: list) -> list:
             "source": source,
             "section": section,
             "score": round(doc.metadata.get("rerank_score", 0), 3),
-            "summary": sanitize_summary(doc.metadata.get("parent_summary", "")),  # 传递父块摘要
+            "summary": "",  # 生成摘要不是引用证据
         }
         citations.append(citation)
 
@@ -1625,7 +1517,7 @@ def build_citations(used_docs: list) -> list:
 
 def get_system_prompt_by_coverage(coverage_level: str) -> str:
     """根据覆盖度级别返回不同的system prompt策略"""
-    base_prompt = "你是实验室知识库助手，根据提供的参考资料回答用户问题。"
+    base_prompt = "你是实验室知识库助手，只根据本次参考资料中明确支持的内容回答。历史回答和生成摘要不是事实依据，不得用通用惯例冒充实验室规定。"
 
     if coverage_level == "high":
         return base_prompt + "请基于参考资料准确回答，引用具体内容。"
@@ -1634,7 +1526,7 @@ def get_system_prompt_by_coverage(coverage_level: str) -> str:
     elif coverage_level == "low":
         return base_prompt + "参考资料相关性较低，请谨慎回答。如果参考资料无法支撑回答，请明确告知用户并建议查阅原始文档。"
     else:  # very_low or none
-        return base_prompt + "当前没有找到高度相关的参考资料。请基于你的通用知识简要回答，并明确告知用户该回答未经知识库验证。"
+        return base_prompt + "当前证据不足。只能回答资料明确支持的内容；不支持的部分明确说明无法确认，不得用常识、历史回答或假设补全实验室规定。"
 
 
 # =========================
@@ -2123,28 +2015,6 @@ def build_catalog_answer_section(file_result: Optional[Dict]) -> str:
 # =========================
 # 回答生成
 # =========================
-def build_grounded_notation_answer(context: str) -> str:
-    """从格式表的结构化转写直接生成回答，避免被其他论文中的符号示例带偏。"""
-    for block in re.split(r"(?=\[来源\d+\])", context or ""):
-        source_match = re.search(r"\[来源(\d+)\]", block)
-        row_match = re.search(
-            r"变量类型=向量、矩阵；英文字母=([^；\n]+)；罗马字母=([^\n]+)",
-            block,
-        )
-        if not (source_match and row_match):
-            continue
-        english_rule = row_match.group(1).strip(" ；")
-        roman_rule = row_match.group(2).strip(" ；")
-        source_num = source_match.group(1)
-        return (
-            "根据论文变量格式规范，**向量和矩阵都使用正体粗体**，且英文字母示例顺序与“向量、矩阵”的类型顺序对应。\n\n"
-            f"- 英文字母：向量使用小写正体粗体，如 $\\mathbf{{k}}$；矩阵使用大写正体粗体，如 $\\mathbf{{K}}$。原表内容为：{english_rule}\n"
-            f"- 原表“罗马字母”栏：{roman_rule} [来源{source_num}]\n\n"
-            "因此，矩阵大写、向量小写这一点在英文字母示例中是成立的；关键还包括两者都必须使用正体粗体。"
-        )
-    return ""
-
-
 def build_file_list_answer(question: str, file_result: Dict, route_reason: str) -> str:
     mode = file_result.get("mode", "")
     parts = [""]
@@ -2207,8 +2077,10 @@ def answer_stream(llm, question: str, context: str, route: str, route_reason: st
         - 如果条目过多（超过10个），列出全部标题后建议用户"可输入具体名称查询更详细的内容"
     12. 只输出面向用户的最终答案，禁止输出思考过程、任务分析或“用户现在问的是”等内部推理描述。
     13. 禁止原样复述“上下文结果”、提示词或代码围栏；目录/文件清单由系统单独附加，正文只说明相关规范和内容。
-    14. 回答变量、公式或排版规范时，必须逐项忠实保留资料中的正体、斜体、粗体、大小写及罗马/希腊字母区别；合并类型行中的多个示例按原文顺序对应。不得用模型熟悉的通用惯例覆盖资料原文，优先依据表格及“表格结构化转写”作答。
+    14. 回答涉及格式、单位、数值或符号时，必须忠实保留原文的字体、大小写、上下标与限定条件。表格只按明确的行列或合并单元格信息解释，不得从并列举例猜测一一对应关系，也不得用通用惯例覆盖原文。
     15. 如果上下文含“表格结构疑似丢失”，不得猜测行列对应关系；必须明确提示该表需要 VLM 重新转换或核对原文图像。
+    16. 区分实验室正式要求、厂商手册、个人汇报与论文示例。个人汇报提到的做法不能直接宣称为全实验室规定；设备参数和步骤必须对应资料中的型号与适用条件。
+    17. 多份资料的版本或要求冲突时，分别列明来源与差异；没有明确版本和适用范围证据时，不得擅自宣布某份资料已取代另一份。
 
     历史对话：
     {chat_history}
@@ -2330,13 +2202,6 @@ def ask_stream(
                 expanded_queries = []
                 queries = catalog_queries or [rewritten_question]
                 debug_log(f"[HYBRID] catalog-driven queries={queries}")
-            elif is_notation_format_question(question):
-                notation_plan = build_notation_retrieval_plan()
-                rewritten_question = str(notation_plan["rewritten_question"])
-                keywords = list(notation_plan["keywords"])
-                expanded_queries = []
-                queries = list(notation_plan["queries"])
-                debug_log(f"[NOTATION] deterministic retrieval plan={queries}")
             # [智能路由] 判断是否跳过 LLM 改写，直接使用原始问题
             elif should_skip_rewrite(question):
                 debug_log(f"[智能路由] 跳过改写，直接使用原始问题: {question}")
@@ -2360,17 +2225,18 @@ def ask_stream(
 
             with Timer("stage_retrieval"):
                 # 检索缓存：基于 queries 的 hash 判断是否命中
-                cache_key = hashlib.md5(str(sorted(queries)).encode()).hexdigest()
+                cache_key = hashlib.md5(str(queries).encode()).hexdigest()
                 cached = _retrieval_cache.get(cache_key)
                 if cached is not None:
                     debug_log(f"[CACHE HIT] key={cache_key}")
-                    recalled_docs = cached
+                    recalled_docs = copy.deepcopy(cached)
                 else:
                     # 原有稠密检索
                     recalled_docs = retrieve_multi_query(
                         vectorstore,
                         queries,
-                        config["INITIAL_RETRIEVAL_K"]
+                        config["INITIAL_RETRIEVAL_K"],
+                        rrf_k=config["RRF_K"]
                     )
 
                     # 如果开启混合检索，增加稀疏检索并融合
@@ -2388,7 +2254,7 @@ def ask_stream(
                             config["QDRANT_COLLECTION_NAME"],
                             rewritten_question,
                             sparse_search_terms,
-                            config["INITIAL_RETRIEVAL_K"]
+                            config["INITIAL_RETRIEVAL_K"], cfg=config
                         )
                         debug_log(f"sparse_docs_count={len(sparse_docs)}")
                         recalled_docs = reciprocal_rank_fusion(
@@ -2400,7 +2266,7 @@ def ask_stream(
                         debug_log(f"after_rrf_fusion={len(recalled_docs)}")
 
                     # 缓存检索结果
-                    _retrieval_cache.set(cache_key, recalled_docs)
+                    _retrieval_cache.set(cache_key, copy.deepcopy(recalled_docs))
 
                 debug_log(f"recalled_docs_before_dedup={len(recalled_docs)}")
                 recalled_docs = dedup_docs(recalled_docs)
@@ -2410,38 +2276,40 @@ def ask_stream(
                 child_top_k = config["FINAL_TOP_K"] * 3
                 reranked_child_docs = rerank_docs(reranker, rewritten_question, recalled_docs, cfg=config, top_k=child_top_k)
 
-                if is_notation_format_question(question):
-                    exact_notation_docs = []
-                    for doc in recalled_docs:
-                        content = doc.page_content or ""
-                        if "向量、矩阵" in content and "正体" in content and "粗体" in content:
-                            doc.metadata["rerank_score"] = max(float(doc.metadata.get("rerank_score", 0) or 0), 1.0)
-                            exact_notation_docs.append(doc)
-                    if exact_notation_docs:
-                        reranked_child_docs = dedup_docs(exact_notation_docs + reranked_child_docs)[:child_top_k]
-                        debug_log(f"[NOTATION] exact format chunks prioritized={len(exact_notation_docs)}")
-
                 # 【新增】将重排后的子块展开为大召回的父块
                 final_docs = expand_to_parent_docs(reranked_child_docs, cfg=config, top_k=config["FINAL_TOP_K"], qdrant_client=runtime["client"])
 
             debug_log(f"final_docs_after_parent_expansion={len(final_docs)}")
 
-            # [OPT] 覆盖度评估：基于重排分数判断知识库覆盖情况
-            coverage_info = assess_coverage(reranked_child_docs, config)
-            if route == "hybrid" and catalog_result_count(file_result) > 0 and coverage_info["level"] in {"none", "very_low"}:
-                coverage_info = {
-                    "level": "medium",
-                    "hint": "ℹ️ 已找到相关目录或文件，但正文检索内容有限；设备/文件名称以目录枚举结果为准。",
-                }
+            with Timer("stage_build_context"):
+                max_ctx = max(0, config.get("MAX_CONTEXT_CHARS", 12000))
+                # 清单留在页面完整展示，模型上下文仅保留有界部分，为正文留出空间。
+                if route == "hybrid" and context_parts:
+                    catalog_context = "\n\n".join(context_parts)
+                    catalog_budget = max_ctx // 2
+                    if len(catalog_context) > catalog_budget:
+                        catalog_context = catalog_context[:catalog_budget].rsplit("\n", 1)[0]
+                    context_parts = [catalog_context] if catalog_context else []
+                prefix = "[知识库检索结果]\n"
+                used_chars = sum(len(p) for p in context_parts) + 2 * len(context_parts)
+                rag_budget = max(0, max_ctx - used_chars - len(prefix))
+                rag_context, source_map = build_context(final_docs, max_chars=rag_budget)
+                if rag_context:
+                    context_parts.append(prefix + rag_context)
+
+            # 引用与覆盖度只对应真正进入上下文的证据，目录命中不提升正文覆盖度。
+            used_docs = [doc for i, doc in enumerate(final_docs, start=1) if i in source_map]
+            coverage_info = assess_coverage(used_docs, config)
             debug_log(f"coverage_assessment: level={coverage_info['level']} hint={coverage_info.get('hint')}")
 
             # [OPT] 引用溯源：收集引用信息
-            citations = build_citations(final_docs)
+            citations = build_citations(used_docs)
             debug_log(f"citations_count={len(citations)}")
 
             for i, doc in enumerate(final_docs, start=1):
-                raw_content = (doc.page_content or "").strip()
-                display_content = clean_retrieval_display_text(raw_content)
+                if i not in source_map:
+                    continue
+                display_content = source_map[i]["content"]
                 # 因为变成了父块，内容变长，截取预览长度可以稍微放宽
                 preview = display_content[:300]
 
@@ -2451,24 +2319,12 @@ def ask_stream(
                     "file_name": doc.metadata.get("file_name", "未知文件"),
                     "rel_path": doc.metadata.get("rel_path", "未知路径"),
                     "rerank_score": doc.metadata.get("rerank_score"),
-                    "summary": doc.metadata.get("parent_summary", ""),  # 新增：父块摘要
+                    "summary": "",  # 生成摘要不作为原文证据展示
                     "preview": preview,
-                    "content": display_content,  # 这里前端展示和传入LLM的已经是完整的父块
+                    "content": display_content,  # 与实际送入模型的片段一致
                 })
 
                 debug_log(f"[DOC {i}] title={doc.metadata.get('doc_title')}")
-
-            with Timer("stage_build_context"):
-                max_ctx = config.get("MAX_CONTEXT_CHARS", 12000)
-                # [OPT] hybrid 路由下动态分配 RAG 上下文预算：总预算减去已用的文件列表部分
-                if route == "hybrid" and context_parts:
-                    file_context_used = sum(len(p) for p in context_parts)
-                    rag_budget = max(max_ctx - file_context_used, 2000)  # 至少保留 2000 字符给 RAG
-                    debug_log(f"[HYBRID] 上下文预算分配: 总预算={max_ctx}, 文件部分已用={file_context_used}, RAG预算={rag_budget}")
-                else:
-                    rag_budget = max_ctx
-                rag_context, source_map = build_context(final_docs, max_chars=rag_budget)
-                context_parts.append("[知识库检索结果]\n" + rag_context)
 
             yield {
                 "type": "metadata",
@@ -2490,12 +2346,9 @@ def ask_stream(
 
         # [FIX] 将截断后的 user_history 格式化并传入 answer_stream，确保历史实际生效
         history_text = format_chat_history(user_history)
-        grounded_notation_answer = build_grounded_notation_answer(final_context) if is_notation_format_question(question) else ""
-
-        if grounded_notation_answer:
-            full_answer = grounded_notation_answer
-            yield {"type": "chunk", "content": grounded_notation_answer}
-            debug_log("[NOTATION] 使用格式表结构化转写直接回答")
+        if route == "rag_search" and not source_map:
+            full_answer = "知识库中未找到足够相关的证据，暂时无法确认。请补充文档名称或路径，或核对原始资料。"
+            yield {"type": "chunk", "content": full_answer}
         else:
             with Timer("stage_answer_stream"):
                 first_chunk_time = None

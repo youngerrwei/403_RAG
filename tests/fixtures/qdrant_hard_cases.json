@@ -1,0 +1,30 @@
+[
+  {
+    "question": "LETO-3 软件怎样单独重置一个调整框？",
+    "query": "LETO-3 Reset Adjustments",
+    "keywords": ["LETO-3", "Reset Adjustments"],
+    "point_id": "7f35d08a-3514-5192-aa2f-2a7f803c4726",
+    "expected_body": "each box can be reset separately"
+  },
+  {
+    "question": "PROPSIM 设置信道组带宽的命令语法是什么？",
+    "query": "PROPSIM GROup:BANDWidth:SET",
+    "keywords": ["PROPSIM", "GROup:BANDWidth:SET"],
+    "point_id": "b79011d5-c5be-511d-809f-815d36f39c69",
+    "expected_body": "GROup:BANDWidth:SET &lt;group number&gt;"
+  },
+  {
+    "question": "APD210 在低温运输后安装前如何防止凝露？",
+    "query": "APD210 INSTALLATION OPERATION",
+    "keywords": ["APD210", "INSTALLATION OPERATION"],
+    "point_id": "c189fdce-5445-5ce0-af77-b0430ba83fb1",
+    "expected_body": "let the system packed for warm-up to room temperature"
+  },
+  {
+    "question": "EDU36311A 怎么查询过压保护是否发生，如何清除这个状态？",
+    "query": "EDU36311A overvoltage protection",
+    "keywords": ["EDU36311A", "overvoltage protection"],
+    "point_id": "e8e30fe9-f9ba-5e0f-875f-9d99ed78275c",
+    "expected_body": "This is reset to 0 by VOLTage:PROTection:CLEar"
+  }
+]
