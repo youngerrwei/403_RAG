@@ -6,6 +6,54 @@
 
 ---
 
+## [3.4.1] 召回兜底与 Agent 多轮检索
+
+### Added
+
+- `ENABLE_ADAPTIVE_LEXICAL_RECALL`（默认 `true`）：问题含长纯数字词元（日期戳/编号）
+  时，自动启用 `lexical_retrieval` 本地词边界匹配补召回。Qdrant MatchText 对纯数字
+  分词不可靠，触发判据只依据词元形态，不含任何测试集语义或具体文档名。
+- 配置项 `ADAPTIVE_LEXICAL_MIN_DIGITS`(6)、`ADAPTIVE_LEXICAL_TOP_K`(16)；
+  `merge_adaptive_lexical_docs` 把身份字段精确命中词元的候选前置，保证其进入
+  `rerank_docs` 的候选窗口（原先追加到末尾会被 `docs[:FINAL_TOP_K*3]` 截断）。
+- ReAct Agent 配置项 `AGENT_MAX_STEPS`(4)、`AGENT_LEGACY_MAX_STEPS`(5)、
+  `AGENT_REPEAT_ACTION_GUARD`(true)，取代硬编码步数。
+
+### Changed
+
+- 主 agent 入口提示词依据 `README.md`（目录驱动规则 / Agent 边界）、
+  `ARCHITECTURE.md`（文档 > 路径(小组/设备/Manuals) > 章节 > 段落摘要）、
+  `LAB_DOCUMENT_AUDIT.md`（中英文手册 / 深层 SDK 目录 / 会议资料混合内容）
+  重写，新增「多轮检索决策规则」：按子问判断信息充分性、清单+内容必须再读正文、
+  跨小组/多实体分别检索、未命中时换检索角度、预算将尽时说明未检索到的依据。
+- 编排层抑制「同工具 + 完全相同参数」的重复调用，避免多轮搜索空转耗尽预算。
+
+### Tests
+
+- 新增 `tests/test_adaptive_lexical_recall.py`（16 项）与
+  `tests/test_agent_multistep.py`（14 项）；后者用 mock LLM 覆盖复合意图、
+  跨小组分别检索、目录未命中换角度、重复调用抑制、步数预算与提示词契约。
+- 全量离线回归 **95 项通过**（3 项按标注跳过）。
+
+### 实测（同一 live 实例，零重建）
+
+- 完整复测 `logs/rag_perf_round8.json`（主集 131 + 留出 24，对比 `rag_perf_round7.json`）：
+  主集严格命中率 **0.959**（持平），留出 0.864、泛化差距 0.095（均持平）。
+- **G02 由 MISS 转 HIT**：`20230106期末组会_许健鹏.md` 稳定进入 final（单条重复 3/3 命中），
+  修复的是「纯数字日期戳无法被 MatchText 召回」这一类索引层缺陷，可泛化到日期/批次号/编号。
+- round8 报告另有 1 条 L08「退化」与 3 条 Top-1 波动：单条重复实验显示
+  L08 / E01 / B07 均 **3/3 命中**，且三者都不含长数字词元、未触发兜底，
+  属 LLM 改写与重排的非确定性波动（temperature=0.1），非代码回归；
+  `regressions` 门槛因此为偶发误报。
+
+### 升级注意
+
+- 零重建：未改动 `page_content` / metadata / `RETRIEVAL_INDEX_VERSION`(2)，无需全量重建索引。
+- 自适应兜底只在含长数字词元时触发，补召回为有界 Qdrant scroll（本地词边界匹配），
+  稳态时延影响很小；`ENABLE_ADAPTIVE_LEXICAL_RECALL=false` 可完全关闭。
+
+---
+
 ## 合并说明 — origin/main 汇入 v3.4.0（三处历史统一）
 
 ### Changed
