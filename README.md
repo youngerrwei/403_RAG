@@ -613,6 +613,9 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照 + TTL 缓存，消除两次全盘 `os.walk` 的网络盘 IO |
 | `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒），缓存键含根目录与索引版本 |
 | `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免版本控制噪声被误当成设备目录 |
+| `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）零命中时自动补充本地词边界召回，修复 MatchText 对纯数字失效 |
+| `ADAPTIVE_LEXICAL_MIN_DIGITS` | `6` | 触发自适应兜底的纯数字词元最小长度 |
+| `ADAPTIVE_LEXICAL_TOP_K` | `16` | 自适应兜底补充候选数上限 |
 | `CATALOG_MAX_TRAVERSAL` | `200000` | 目录树快照遍历上限（目录数）；默认覆盖完整语料目录树，避免靠后目录缺失导致 file_list/hybrid 目录枚举错配 |
 | `MAX_HYBRID_QUERIES` | `8` | hybrid 目录驱动查询归一化去重后的最大 Dense 路数；完整设备清单仍由目录枚举答案区块提供 |
 | `MAX_DENSE_QUERIES` | `4` | Dense 查询最大路数（hybrid 由 `MAX_HYBRID_QUERIES` 单独限流） |

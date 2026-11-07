@@ -800,6 +800,9 @@ class RagPipelineQualityTests(unittest.TestCase):
                 # 检索侧优化（A 类：catalog 快照/hybrid 去重；B 类：拒答与父块多样性）
                 "ENABLE_CATALOG_SNAPSHOT_CACHE", "CATALOG_SNAPSHOT_TTL",
                 "CATALOG_EXCLUDE_HIDDEN_DIRS", "CATALOG_MAX_TRAVERSAL",
+                "ENABLE_LEXICAL_RETRIEVAL", "LEXICAL_CANDIDATE_LIMIT",
+                "ENABLE_ADAPTIVE_LEXICAL_RECALL", "ADAPTIVE_LEXICAL_MIN_DIGITS",
+                "ADAPTIVE_LEXICAL_TOP_K",
                 "MAX_HYBRID_QUERIES",
                 "RERANKER_RELATIVE_RATIO", "RERANKER_MIN_KEEP",
                 "ENABLE_ANSWERABILITY_GATE", "ANSWERABILITY_TOP_SCORE_FLOOR",

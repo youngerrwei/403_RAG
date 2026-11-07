@@ -714,6 +714,12 @@ def load_config() -> dict:
         "LEXICAL_CANDIDATE_LIMIT": int(os.getenv("LEXICAL_CANDIDATE_LIMIT", "256")),
         "LEXICAL_MAX_TERMS": int(os.getenv("LEXICAL_MAX_TERMS", "8")),
         "LEXICAL_TIMEOUT": float(os.getenv("LEXICAL_TIMEOUT", "10")),
+        # 词元形态驱动的自适应兜底：Qdrant MatchText 对纯数字日期戳/编号常无法命中，
+        # 当且仅当问题含此类词元、且首轮召回身份字段零命中时，启用本地词边界匹配补召回。
+        # 按「词元形态」判定，不依赖任何测试集语义或具体文档名。
+        "ENABLE_ADAPTIVE_LEXICAL_RECALL": _env_bool("ENABLE_ADAPTIVE_LEXICAL_RECALL", "true"),
+        "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),
+        "ADAPTIVE_LEXICAL_TOP_K": int(os.getenv("ADAPTIVE_LEXICAL_TOP_K", "16")),
 
     }
     # 配置验证
@@ -1642,15 +1648,64 @@ def retrieve_sparse(client, collection_name: str, query: str, keywords: List[str
         return []
 
 
-def retrieve_lexical_candidates(client, collection_name: str, query: str, keywords: List[str],
-                                top_k: int, cfg: dict = None) -> List[Document]:
-    """可选增强：有界全文候选召回（origin lexical_retrieval 通道）。
+def _adaptive_lexical_tokens(question: str, keywords: List[str], cfg: dict) -> List[str]:
+    """提取「Qdrant MatchText 难以命中」的高辨识度词元：长纯数字日期戳/编号。
 
-    默认关闭（ENABLE_LEXICAL_RETRIEVAL=false）；开启后作为稀疏检索之外的补充
-    候选来源，不替换 3.4.0 的 MatchText 主通道，避免破坏既有召回排序。
+    只依据词元形态（长度≥ADAPTIVE_LEXICAL_MIN_DIGITS 的纯数字），不含任何用例语义，
+    因此可泛化到新语料中的日期、批次号、版本号、仪器编号等。
+    """
+    min_digits = max(1, int((cfg or {}).get("ADAPTIVE_LEXICAL_MIN_DIGITS", 6)))
+    text = " ".join([str(question or "")] + [str(k) for k in (keywords or [])])
+    return list(dict.fromkeys(re.findall(rf"\d{{{min_digits},}}", text)))
+
+
+def _identity_coverage_text(docs: List[Document]) -> str:
+    """拼接候选文档的身份字段，用于判断高辨识度词元是否已进入候选池。"""
+    fields = ("source", "rel_path", "file_name", "doc_title",
+              "header_path", "section_title", "parent_source_label")
+    return " ".join(
+        " ".join(str((d.metadata or {}).get(f, "") or "") for f in fields)
+        for d in (docs or [])
+    )
+
+
+def needs_adaptive_lexical_recall(question: str, keywords: List[str],
+                                  recalled_docs: List[Document], cfg: dict) -> bool:
+    """首轮召回缺少问题中的长数字词元时，判定需要本地词边界补召回。
+
+    触发条件全部来自「问题词元形态 + 候选池覆盖」，与具体问句、文档名无关：
+    - 存在长纯数字词元（日期戳/编号）；
+    - 该词元在首轮召回候选的身份字段中零命中；
+    - 自适应开关开启。
     """
     cfg = cfg or {}
-    if not cfg.get("ENABLE_LEXICAL_RETRIEVAL") or _search_lexical_candidates is None:
+    if not cfg.get("ENABLE_ADAPTIVE_LEXICAL_RECALL", True):
+        return False
+    if _search_lexical_candidates is None:
+        return False
+    tokens = _adaptive_lexical_tokens(question, keywords, cfg)
+    if not tokens:
+        return False
+    evidence = _identity_coverage_text(recalled_docs)
+    missing = [t for t in tokens if t not in evidence]
+    if missing:
+        debug_log(f"[ADAPTIVE-LEXICAL] 触发: 长数字词元零命中={missing[:5]}")
+        return True
+    return False
+
+
+def retrieve_lexical_candidates(client, collection_name: str, query: str, keywords: List[str],
+                                top_k: int, cfg: dict = None,
+                                force: bool = False) -> List[Document]:
+    """可选增强：有界全文候选召回（origin lexical_retrieval 通道）。
+
+    两种启用方式：
+    - 全局开关 ENABLE_LEXICAL_RETRIEVAL（默认 false）：每个查询都补充候选；
+    - force=True：由 needs_adaptive_lexical_recall 按词元形态按需触发。
+    两者都只把候选并回主召回池，不替换 3.4.0 的 MatchText 主通道。
+    """
+    cfg = cfg or {}
+    if (not force and not cfg.get("ENABLE_LEXICAL_RETRIEVAL")) or _search_lexical_candidates is None:
         return []
 
     def scroll(search_filter, limit, timeout):
@@ -3038,18 +3093,22 @@ def ask_stream(
                         )
                         debug_log(f"after_rrf_fusion={len(recalled_docs)}")
 
-                    # 可选增强：有界全文候选召回（默认关闭，开启才生效）
+                    # 可选增强：有界全文候选召回（全局开关，或长数字词元零命中时按需触发）
+                    adaptive = needs_adaptive_lexical_recall(
+                        question, keywords, recalled_docs, config)
                     lexical_docs = retrieve_lexical_candidates(
                         runtime["client"],
                         config["QDRANT_COLLECTION_NAME"],
                         rewritten_question,
                         list(dict.fromkeys((keywords or []) + queries))[:10],
-                        config["INITIAL_RETRIEVAL_K"],
+                        int(config.get("ADAPTIVE_LEXICAL_TOP_K", 16)) if adaptive
+                        else config["INITIAL_RETRIEVAL_K"],
                         cfg=config,
+                        force=adaptive,
                     )
                     if lexical_docs:
                         recalled_docs = list(recalled_docs) + lexical_docs
-                        debug_log(f"[LEXICAL] extra_candidates={len(lexical_docs)}")
+                        debug_log(f"[LEXICAL] extra_candidates={len(lexical_docs)} adaptive={adaptive}")
 
                     # 缓存检索结果
                     _retrieval_cache.set(cache_key, recalled_docs)
