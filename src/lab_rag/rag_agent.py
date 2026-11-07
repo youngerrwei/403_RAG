@@ -1675,12 +1675,12 @@ def _identity_coverage_text(docs: List[Document]) -> str:
 
 def needs_adaptive_lexical_recall(question: str, keywords: List[str],
                                   recalled_docs: List[Document], cfg: dict) -> bool:
-    """首轮召回缺少问题中的长数字词元时，判定需要本地词边界补召回。
+    """问题含长纯数字词元时，判定需要本地词边界补召回。
 
-    触发条件全部来自「问题词元形态 + 候选池覆盖」，与具体问句、文档名无关：
-    - 存在长纯数字词元（日期戳/编号）；
-    - 该词元在首轮召回候选的身份字段中零命中；
-    - 自适应开关开启。
+    Qdrant MatchText 对纯数字日期戳/编号的分词不可靠，这是索引层特性而非
+    单条用例问题；同日期的其他文档出现在候选池里也不代表目标文档已被召回，
+    因此触发只依据「问题词元形态」，不依赖候选覆盖情况。
+    补召回候选最终是否入选仍由既有语义重排决定。
     """
     cfg = cfg or {}
     if not cfg.get("ENABLE_ADAPTIVE_LEXICAL_RECALL", True):
@@ -1690,12 +1690,30 @@ def needs_adaptive_lexical_recall(question: str, keywords: List[str],
     tokens = _adaptive_lexical_tokens(question, keywords, cfg)
     if not tokens:
         return False
-    evidence = _identity_coverage_text(recalled_docs)
-    missing = [t for t in tokens if t not in evidence]
-    if missing:
-        debug_log(f"[ADAPTIVE-LEXICAL] 触发: 长数字词元零命中={missing[:5]}")
-        return True
-    return False
+    debug_log(f"[ADAPTIVE-LEXICAL] 触发: 长数字词元={tokens[:5]} 候选数={len(recalled_docs or [])}")
+    return True
+
+
+def merge_adaptive_lexical_docs(recalled_docs: List[Document],
+                                lexical_docs: List[Document],
+                                question: str, keywords: List[str],
+                                cfg: dict) -> List[Document]:
+    """把补召回候选中「身份字段精确命中长数字词元」的部分前置。
+
+    rerank_docs 只取前 FINAL_TOP_K*3 条候选；追加到末尾的补召回会被截断而
+    永远无法参与重排。前置仅保证精确匹配候选进入重排窗口，不改变打分逻辑，
+    是否最终入选仍由语义重排与阈值过滤决定；其余候选仍追加在末尾。
+    """
+    tokens = _adaptive_lexical_tokens(question, keywords, cfg)
+    if not tokens or not lexical_docs:
+        return list(recalled_docs) + list(lexical_docs or [])
+    exact, rest = [], []
+    for doc in lexical_docs:
+        text = _identity_coverage_text([doc])
+        (exact if any(t in text for t in tokens) else rest).append(doc)
+    if exact:
+        debug_log(f"[ADAPTIVE-LEXICAL] 前置精确匹配候选={len(exact)} 追加={len(rest)}")
+    return exact + list(recalled_docs) + rest
 
 
 def retrieve_lexical_candidates(client, collection_name: str, query: str, keywords: List[str],
@@ -3111,7 +3129,11 @@ def ask_stream(
                         force=adaptive,
                     )
                     if lexical_docs:
-                        recalled_docs = list(recalled_docs) + lexical_docs
+                        if adaptive:
+                            recalled_docs = merge_adaptive_lexical_docs(
+                                recalled_docs, lexical_docs, question, keywords, config)
+                        else:
+                            recalled_docs = list(recalled_docs) + lexical_docs
                         debug_log(f"[LEXICAL] extra_candidates={len(lexical_docs)} adaptive={adaptive}")
 
                     # 缓存检索结果

@@ -40,14 +40,15 @@ class AdaptiveLexicalDecisionTests(unittest.TestCase):
 
     cfg = {"ENABLE_ADAPTIVE_LEXICAL_RECALL": True, "ADAPTIVE_LEXICAL_MIN_DIGITS": 6}
 
-    def test_triggers_when_digit_token_missing_from_candidates(self):
+    def test_triggers_when_digit_token_present(self):
         docs = [_doc("组会资料/20220121期末组会/小组期末总结/WAI-总结会分享_v1.md")]
         self.assertTrue(rag_agent.needs_adaptive_lexical_recall(
             "20230106 期末组会中 VLC小组 汇报了什么？", ["20230106"], docs, self.cfg))
 
-    def test_does_not_trigger_when_token_already_recalled(self):
-        docs = [_doc("组会资料/20230106期末组会/20230106期末组会_许健鹏.md")]
-        self.assertFalse(rag_agent.needs_adaptive_lexical_recall(
+    def test_still_triggers_when_sibling_document_recalled(self):
+        """同日期但非目标文档在候选池里，不代表目标文档已召回；仍须补召回。"""
+        docs = [_doc("组会资料/20230106期末组会/组会分享-张楚元.md")]
+        self.assertTrue(rag_agent.needs_adaptive_lexical_recall(
             "20230106 期末组会中 VLC小组 汇报了什么？", ["20230106"], docs, self.cfg))
 
     def test_does_not_trigger_without_digit_token(self):
@@ -70,6 +71,45 @@ class AdaptiveLexicalDecisionTests(unittest.TestCase):
             "source": "a", "rel_path": "b", "file_name": "c", "doc_title": "d",
             "header_path": "e", "section_title": "f", "parent_source_label": "g"})
         self.assertEqual(rag_agent._identity_coverage_text([d]), "a b c d e f g")
+
+
+class AdaptiveLexicalMergeTests(unittest.TestCase):
+
+    cfg = {"ADAPTIVE_LEXICAL_MIN_DIGITS": 6}
+
+    def test_exact_match_candidates_are_prepended(self):
+        recalled = [_doc("参考书/水下可见光通信关键技术.md")]
+        lexical = [
+            _doc("组会资料/20230106期末组会/组会分享-张楚元.md"),
+            _doc("组会资料/20230106期末组会/20230106期末组会_许健鹏.md"),
+        ]
+        merged = rag_agent.merge_adaptive_lexical_docs(
+            recalled, lexical, "20230106 期末组会汇报了什么？", [], self.cfg)
+        self.assertEqual(len(merged), 3)
+        self.assertTrue(all("20230106" in (d.metadata or {}).get("rel_path", "")
+                            for d in merged[:2]))
+
+    def test_non_matching_candidates_are_appended(self):
+        recalled = [_doc("参考书/水下可见光通信关键技术.md")]
+        lexical = [_doc("组会资料/20220121期末组会/小组期末总结/WAI-总结会分享_v1.md")]
+        merged = rag_agent.merge_adaptive_lexical_docs(
+            recalled, lexical, "20230106 期末组会汇报了什么？", [], self.cfg)
+        self.assertEqual(merged[0].metadata["rel_path"], "参考书/水下可见光通信关键技术.md")
+        self.assertEqual(merged[-1].metadata["rel_path"], lexical[0].metadata["rel_path"])
+
+    def test_no_digit_token_falls_back_to_append(self):
+        recalled = [_doc("参考书/A.md")]
+        lexical = [_doc("参考书/B.md")]
+        merged = rag_agent.merge_adaptive_lexical_docs(
+            recalled, lexical, "论文写作方法有哪些建议？", [], self.cfg)
+        self.assertEqual([d.metadata["rel_path"] for d in merged],
+                         ["参考书/A.md", "参考书/B.md"])
+
+    def test_empty_lexical_keeps_recalled_intact(self):
+        recalled = [_doc("参考书/A.md")]
+        merged = rag_agent.merge_adaptive_lexical_docs(
+            recalled, [], "20230106 期末组会", [], self.cfg)
+        self.assertEqual(len(merged), 1)
 
 
 class LexicalChannelForceTests(unittest.TestCase):
