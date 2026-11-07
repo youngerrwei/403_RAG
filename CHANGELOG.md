@@ -6,7 +6,7 @@
 
 ---
 
-## [3.4.1] 合并 origin/main（三处历史统一）
+## 合并说明 — origin/main 汇入 v3.4.0（三处历史统一）
 
 ### Changed
 
