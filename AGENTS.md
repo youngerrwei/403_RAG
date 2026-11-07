@@ -262,6 +262,9 @@ data: [DONE]
 | `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照，消除重复全盘遍历 |
 | `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒）；键含索引版本 |
 | `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免噪声路径误命中 |
+| `AGENT_MAX_STEPS` | `4` | ReAct 流式入口的多轮检索步数预算 |
+| `AGENT_LEGACY_MAX_STEPS` | `5` | ReAct 非流式入口的步数预算 |
+| `AGENT_REPEAT_ACTION_GUARD` | `true` | 抑制「同工具+完全相同参数」重复调用，避免多轮搜索空转 |
 | `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）在首轮召回身份字段零命中时，自动启用本地词边界匹配补召回（按词元形态判定，无用例语义） |
 | `ADAPTIVE_LEXICAL_MIN_DIGITS` | `6` | 触发自适应兜底的纯数字词元最小长度 |
 | `ADAPTIVE_LEXICAL_TOP_K` | `16` | 自适应兜底补充候选数上限 |

@@ -718,6 +718,10 @@ def load_config() -> dict:
         # 当且仅当问题含此类词元、且首轮召回身份字段零命中时，启用本地词边界匹配补召回。
         # 按「词元形态」判定，不依赖任何测试集语义或具体文档名。
         "ENABLE_ADAPTIVE_LEXICAL_RECALL": _env_bool("ENABLE_ADAPTIVE_LEXICAL_RECALL", "true"),
+        # ReAct Agent 编排层：步数预算与重复调用抑制（不硬编码可调参数）
+        "AGENT_MAX_STEPS": int(os.getenv("AGENT_MAX_STEPS", "4")),
+        "AGENT_LEGACY_MAX_STEPS": int(os.getenv("AGENT_LEGACY_MAX_STEPS", "5")),
+        "AGENT_REPEAT_ACTION_GUARD": _env_bool("AGENT_REPEAT_ACTION_GUARD", "true"),
         "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),
         "ADAPTIVE_LEXICAL_TOP_K": int(os.getenv("ADAPTIVE_LEXICAL_TOP_K", "16")),
 

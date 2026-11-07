@@ -18,6 +18,7 @@ from .rag_agent import (
     build_file_context,
     get_runtime,
     list_catalog_entries,
+    load_config,
     rule_based_route,
     sanitize_generated_answer,
 )
@@ -46,47 +47,83 @@ TOOLS = {
 
 REACT_SYSTEM_PROMPT = """你是实验室内部知识库助手，采用 ReAct 思维链 + 工具调用方式工作。
 
-你可以使用以下工具：
+## 知识库的实际结构（据此判断信息是否充分）
+语料按「文档 > 路径（小组/设备/Manuals）> 章节 > 段落摘要」组织，检索结果会带
+【文档：文件名 > 路径：小组 > 设备 > Manuals > 章节：标题层级 > 段落摘要：…】这类前缀。
+- `设备操作指南/<小组>/<设备名>/Manuals` 下是中英文手册、软件安装包与较深的 SDK 子目录；
+  文件名/标题常含设备型号（如 MSO-X 3054A）与英文手册名。
+- `组会资料/<日期>期末组会/小组期末总结/` 是按日期与小组归档的总结与分享，
+  会议资料混合个人收获、论文写作经验与研究内容，标题未必含小组名。
+- `参考书/` 是主题书籍；另有团队文档要求、论文格式规范等主题文档。
+目录枚举只列目标目录的直接子级，不会自动展开更深层的 `Manuals` / SDK 子目录；
+要定位这类子目录，需用「设备名 + 子目录名」组合关键词再次枚举。
+构造检索词时保留原文中的小组名、设备型号、日期戳（如 20230106），不要翻译或改写。
+
+## 你可以使用以下工具
 
 1) rag_qa(query: str) -> str
-   - 通用问答工具：基于实验室知识库进行 RAG 检索并回答问题。
-   - 当用户提出具体技术问题、操作步骤、名词定义、原理说明、设备用法等时，应优先调用此工具。
-   - 你也可以在拿到某些文件列表后，构造针对这些文件的具体问题，并用 rag_qa 进一步深入阅读和总结。
+   - 通用问答工具：基于知识库正文进行检索并回答问题。
+   - 用于具体技术问题、操作步骤、名词定义、原理说明、格式/要求/规范/步骤/方法、内容总结与对比。
+   - 可在拿到文件清单后，针对其中具体文件或设备构造更聚焦的问题再次调用。
 
 2) list_group_files(keyword: str) -> str
-   - 通用“文件/目录搜索”工具：根据任意关键词列出相关的文件信息。
-   - 关键词可以是：小组名称（如“VLC小组”）、设备/仪器名称（如“LETO-3”）、项目名称、实验名称、文档类型（如“设备操作指南”）等。
-   - 返回内容中包含 file_name、doc_title、rel_path、chunks 数量，可用于了解有哪些相关文档、它们大致位于哪个目录/小组/项目下。
-   - 当用户的问题属于“有哪些文档/有哪些设备/有哪些资料/某个主题下有哪些文件”等清单或目录类查询时，应优先调用本工具。
+   - 文件/目录搜索工具：按关键词列出相关文件信息。
+   - 关键词可以是小组名、设备名或型号、文档类型、日期、章节名、`Manuals` 等子目录名。
+   - 返回 file_name、doc_title、rel_path、chunks 数量，用于了解有哪些文档及其所在目录层级。
+   - 仅用于用户明确要求列出或定位文件、目录、路径、设备清单的场景。
 
-使用规范（ReAct 格式）：
-- 你需要在回答前先“思考”(Thought)，再决定是否调用工具(Action)。
-- 如果需要调用工具，请严格按照以下格式单独输出一行：
-  Action: 工具名[参数值]
+## 输出格式（ReAct）
+- 回答前先 Thought，再决定是否 Action。
+- 需要调用工具时，严格单独输出一行：Action: 工具名[参数值]
+  例如：Action: list_group_files["VLC小组"]
+  或：Action: rag_qa["根据知识库说明 HOLOEYE LETO-3 空间光调制器的主要参数和用途"]
+- 工具返回以 "Observation:" 开头，你需要基于它继续 Thought/Action，或给出最终 Answer。
+- 信息足够时输出：Answer: 你的最终回答内容
 
-  例如：
-  Action: list_group_files["VLC小组"]
-  或：
-  Action: rag_qa["根据知识库说明 HOLOEYE LETO-3 空间光调制器的主要参数和用途"]
+## 多轮检索决策规则（重要）
+每次拿到 Observation 后，先判断信息是否**覆盖用户问题的每一个子问**：
+- 只有列出/定位类问题：目录结果已给出完整清单即算充分。
+- 同时要求清单与内容说明（如「有哪些设备及使用规范」）：目录结果只回答了清单部分，
+  **必须再调用 rag_qa 读正文**，且第二轮问题要保留用户原始意图，不能换成无关的固定话术。
+- 涉及多个小组、设备或文档的对比/分别说明：目录或正文只覆盖其中一个实体时，
+  **必须分别检索其余实体**，再综合，不能凭单一文档作答。
+- 正文检索结果与问题不相关、只命中同主题的其他文档、或目录未命中：信息仍不充分。
 
-- 工具执行完毕后，我会返回一段以 "Observation:" 开头的内容，包含工具的返回结果。
-  你需要基于 Observation 继续 Thought/Action，或在信息足够时给出最终 Answer。
+信息不充分时，继续调用工具，但必须**换一个检索角度**，禁止用完全相同的参数重复调用同一工具：
+- 目录未命中 → 改用更窄的「设备名 + 子目录名」或更宽的「仅小组名」关键词再枚举一次；
+- 目录命中但缺正文 → 用命中的具体设备/文件名或用户原始问题调用 rag_qa；
+- 正文答非所问 → 用原始问题、型号、日期戳、章节名等更具辨识度的词重新构造 query；
+- 跨实体问题 → 逐个实体分别检索。
+工具调用有步数预算；若已换过角度仍无依据，或预算即将用尽，就基于已获得的依据给出
+最完整的回答，并明确说明哪一部分未在知识库中检索到依据，不要反复重试同一角度。
 
-- 当你已经获得足够信息可以直接回答用户问题时，请输出：
-  Answer: 你的最终回答内容
+## 重要约束
+- 回答必须优先依据工具返回，不得凭空编造。
+- 「格式是什么/怎么写/要求/规范/步骤/方法」等是在查询文档内容，必须直接调用 rag_qa；
+  不能先调用 list_group_files 猜测模板文件。
+- 目录工具未找到结果不代表正文没有答案；应使用用户原始问题再调用 rag_qa，
+  禁止改为输出通用模板、通用规范或知识库外常识。
+- 未获得知识库依据时，不得输出「通用规范」「通用模板」或虚构「主要参考」。
+- 总结时请明确使用类似表述：「根据知识库内容可概括为」；尽量综合多个相关文件，
+  不要仅依据单一片段作答。
+- 回答末尾请给出主要参考的文档标题或路径（若 Observation 或 rag_qa 结果提供了）。"""
 
-重要约束：
-- 回答时必须优先依据工具返回结果，不要凭空编造。
-- “格式是什么/怎么写/要求/规范/步骤/方法”等是在查询文档内容，必须直接调用 rag_qa；不能先调用 list_group_files 猜测模板文件。
-- list_group_files 仅用于用户明确要求列出或定位文件、目录、路径、设备清单的情况。
-- 如果目录工具未找到结果，不代表知识库正文没有答案；应使用用户原始问题调用 rag_qa，禁止改为输出通用模板或知识库外常识。
-- 未获得工具返回的知识库依据时，不得输出“通用规范”“通用模板”或虚构“主要参考”。
-- 当你在使用工具后进行总结时，请明确使用类似表述：“根据知识库内容可概括为”。
-- 对于“有哪些/清单/列表”等问题：
-  * 应在 Observation 中提供的所有文件信息基础上，尽量汇总并去重相关实体（如设备名称、文档名称、工具名称）。
-  * 如用户还问“怎么用/如何使用/使用方法/内容是什么”，应在列出文档后，继续调用 rag_qa，基于相关文档总结，而不是停留在文件列表层面。
-  * 不要仅依据单一文档片段作答，而应综合多个相关文件。
-- 回答末尾请给出你主要参考的文档标题或路径（如果 Observation 或 rag_qa 结果中有相关信息）。"""
+
+def _agent_config() -> Dict[str, Any]:
+    """读取 Agent 编排层配置；配置不可用时回退到安全默认值。"""
+    try:
+        return load_config()
+    except Exception as e:
+        debug_log(f"[AGENT] 配置读取失败，使用默认值: {e!r}")
+        return {}
+
+
+_REPEAT_ACTION_HINT = (
+    "你刚刚用完全相同的参数调用过同一工具，重复调用不会带来新信息。"
+    "请换一个检索角度：改用更窄的「设备名+子目录名」或更宽的「仅小组名」关键词，"
+    "用命中的具体文件/设备名或用户原始问题调用 rag_qa，或逐个检索尚未覆盖的实体；"
+    "若信息已足够，直接输出 Answer 并说明哪一部分未检索到依据。"
+)
 
 
 def parse_action(text: str) -> Dict[str, Any]:
@@ -151,7 +188,7 @@ def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]
 def run_react_once(
     llm: ChatOpenAI,
     question: str,
-    max_steps: int = 5,
+    max_steps: Optional[int] = None,
     debug: bool = True,
     username: str = "legacy-agent",
     chat_history: Optional[List[Dict[str, str]]] = None,
@@ -163,6 +200,11 @@ def run_react_once(
     - 最多 max_steps 次工具调用
     """
     messages = _initial_messages(question, chat_history)
+    cfg = _agent_config()
+    if max_steps is None:
+        max_steps = max(1, int(cfg.get("AGENT_LEGACY_MAX_STEPS", 5)))
+    guard_repeat = bool(cfg.get("AGENT_REPEAT_ACTION_GUARD", True))
+    seen_actions = set()
 
     observation_text = ""
     for step in range(1, max_steps + 1):
@@ -207,6 +249,14 @@ def run_react_once(
 
         if debug:
             debug_log(f"解析到 Action: tool={tool_name}, arg={arg}")
+
+        action_key = (tool_name, arg)
+        if guard_repeat and action_key in seen_actions:
+            debug_log(f"[AGENT] 重复调用被抑制: tool={tool_name}, arg={arg}")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Observation: {_REPEAT_ACTION_HINT}"})
+            continue
+        seen_actions.add(action_key)
 
         tool = TOOLS.get(tool_name)
         if tool is None:
@@ -261,7 +311,6 @@ def ask_agent(
         answer = run_react_once(
             llm,
             question,
-            max_steps=5,
             debug=True,
             username=username,
             chat_history=chat_history,
@@ -290,6 +339,9 @@ def ask_agent_stream(
     used_list_tool = False
     used_rag_after_list = False
     latest_catalog_result = None
+    cfg = _agent_config()
+    guard_repeat = bool(cfg.get("AGENT_REPEAT_ACTION_GUARD", True))
+    seen_actions = set()
 
     def finalize_answer(value: str) -> str:
         answer = sanitize_generated_answer(value)
@@ -333,7 +385,7 @@ def ask_agent_stream(
 
         llm = build_qwen_llm()
         messages = _initial_messages(question, chat_history)
-        max_steps = 4
+        max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 4)))
 
         for step in range(1, max_steps + 1):
             # 1) 调 LLM
@@ -395,6 +447,14 @@ def ask_agent_stream(
 
             tool_name = action["tool_name"]
             arg = action["arg"]
+
+            action_key = (tool_name, arg)
+            if guard_repeat and action_key in seen_actions:
+                debug_log(f"[AGENT][stream] 重复调用被抑制: tool={tool_name}, arg={arg}")
+                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "user", "content": f"Observation: {_REPEAT_ACTION_HINT}"})
+                continue
+            seen_actions.add(action_key)
 
             tool = TOOLS.get(tool_name)
             catalog_result = None

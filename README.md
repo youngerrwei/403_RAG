@@ -613,6 +613,9 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照 + TTL 缓存，消除两次全盘 `os.walk` 的网络盘 IO |
 | `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒），缓存键含根目录与索引版本 |
 | `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免版本控制噪声被误当成设备目录 |
+| `AGENT_MAX_STEPS` | `4` | ReAct 流式入口多轮检索步数预算 |
+| `AGENT_LEGACY_MAX_STEPS` | `5` | ReAct 非流式入口步数预算 |
+| `AGENT_REPEAT_ACTION_GUARD` | `true` | 抑制相同参数的重复工具调用，避免预算空转 |
 | `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）零命中时自动补充本地词边界召回，修复 MatchText 对纯数字失效 |
 | `ADAPTIVE_LEXICAL_MIN_DIGITS` | `6` | 触发自适应兜底的纯数字词元最小长度 |
 | `ADAPTIVE_LEXICAL_TOP_K` | `16` | 自适应兜底补充候选数上限 |
