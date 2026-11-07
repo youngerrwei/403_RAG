@@ -1,11 +1,13 @@
 # LAB 403 RAG 知识库系统
 
 > Author：youngerrwei（韦子扬）<br>
-> 当前版本：v3.0.1
+> 当前版本：v3.4.0
 
 ## 项目概述
 
-实验室知识库 RAG 系统，支持论文、实验室规范、使用教程等文档的智能问答。基于 Small-to-Big 检索策略，结合混合检索（Dense + Sparse）与 CrossEncoder 重排序，提供高质量的知识检索与流式生成服务。
+实验室知识库 RAG 系统，支持论文、实验室规范、使用教程等文档的智能问答。基于 Small-to-Big 检索策略，结合混合检索（Dense + 全文词项匹配）与 CrossEncoder 重排序，提供高质量的知识检索与流式生成服务。
+
+> v3.1.0 对入库（清洗、切分、向量化、索引）与问答（改写、检索、重排、上下文、生成）做了全链路优化；v3.2.0 进一步以 63 条测试集为基准做了诊断驱动的检索优化（目录枚举单次遍历、hybrid 查询去重、纯英文型号词元化、拒答闸门、父块来源配额、OCR 噪声转写修复）。两版均涉及 `page_content`/metadata/索引变更，升级后必须按「重建知识库」执行一次全量入库。
 
 ## 系统架构
 
@@ -311,11 +313,11 @@ bash scripts/convert_to_md.sh --dry-run
 - **日志文件**：`logs/convert_to_md.log`
 - **失败语义**：输出先写同目录临时文件并校验，再原子替换；任一文件失败时脚本返回非零，已成功文件保留
 - **表格结构保真**：入库清洗保留 Markdown 表格、标题、列表和公式的换行，不再把表格压平成单行；所有标准 Markdown 表都会在配置上限内追加逐行结构化转写，供 Embedding、Reranker 和回答模型共同使用
-- **不补写原文事实**：入库不会按问题或关键词追加固定表格、规则或答案。已压平的表格必须核对原图或重新转换；结构化转写仅使用现有 Markdown 表中的单元格
+- **旧数据兼容**：对于已经被 OCR 或旧版清洗压平的“变量格式”表，入库阶段会补充明确的语义恢复表，确保“向量、矩阵使用正体粗体”等规则可被准确检索
 - **通用质量保护**：转换脚本检测到疑似扁平技术表时会自动用 MinerU VLM 重试；若仍无法可靠恢复，入库内容会标记“表格结构疑似丢失”，回答端必须提示核对原图，不能按常识猜测单元格关系
 - **公式渲染保护**：前端在调用 `marked` 前暂存 `$...$`、`$$...$$`、`\(...\)` 和 `\[...\]` 数学片段，避免 Markdown 将 `_` 误解析成强调符；进入 MathJax 前会把模型常见的 `\_` 恢复为下标 `_`
 
-表格保真逻辑属于入库内容变更。先核对转换后的 Markdown；对于已丢失行列关系的表格，应重新转换并核对原图，不能假设入库能还原丢失信息。需要全量重转时可使用 `bash scripts/convert_to_md.sh --full --engine mineru --backend vlm`，但不必为单份坏文档重转整个共享盘。确认文档完整、备份现有 Qdrant 数据并安排维护窗口后，再执行 `bash scripts/auto_ingest.sh --full` 重建索引。
+表格保真逻辑属于入库内容变更，升级后必须执行一次 `bash scripts/auto_ingest.sh --full`。如果其他复杂图表在原始 `.md` 文件中已经无法辨认，可先用 `bash scripts/convert_to_md.sh --full --engine mineru --backend vlm` 重新转换，再全量入库；仅本节变量格式表即使已经压平，也可由入库兼容逻辑恢复。
 
 转换脚本会在扫描和模型推理前实际创建一个隐藏探针文件验证 `OUTPUT_DIR` 可写，避免 MinerU 运行数分钟后才因 CIFS `Permission denied` 失败。大文件超时按 `max(CONVERT_TIMEOUT, 文件MB × CONVERT_TIMEOUT_PER_MB)` 计算，并受 `CONVERT_MAX_TIMEOUT` 限制。共享盘只读时可使用 `--output /本地可写目录`，随后把入库使用的 `DOCS_PATH` 指向该镜像目录。
 
@@ -352,7 +354,7 @@ bash scripts/convert_to_md.sh \
   --output /home/rag_official/lab_rag_converted
 ```
 
-使用本地镜像时，必须确保它包含计划入库的全部 Markdown，并同步修改 `.env` 的 `DOCS_PATH` 与 `KNOWLEDGE_BASE_ROOT`，不能把一个只含局部资料的目录误当成完整知识库。表格行列关系丢失时，应先修复对应 Markdown 再入库；直接重建索引不会自动修复源文档。
+使用本地镜像时，必须确保它包含计划入库的全部 Markdown，并同步修改 `.env` 的 `DOCS_PATH` 与 `KNOWLEDGE_BASE_ROOT`，不能把一个只含局部资料的目录误当成完整知识库。对于本次已知的“变量格式”扁平表，无需等待 92,718 个文件重转：新版入库兼容逻辑可从现有 Markdown 恢复它，直接执行 `bash scripts/auto_ingest.sh --full` 即可；其他无法从文本辨认的复杂表格才需要重新运行 MinerU VLM。
 
 ---
 
@@ -513,7 +515,7 @@ bash scripts/start_vllm.sh status
 
 MCP 旁路提供两个纯工具，不生成最终答案，也不写入用户对话历史：
 
-- `search_lab_knowledge`：完整复用现有路由、问题改写、Dense + Sparse、RRF、重排序和父块展开，在开始最终 LLM 回答前停止并返回有界原文证据。
+- `search_lab_knowledge`：完整复用现有路由、问题改写、Dense + 全文词项匹配、RRF、重排序和父块展开，在开始最终 LLM 回答前停止并返回有界原文证据。
 - `list_lab_catalog`：复用现有目录/文件浏览能力。
 
 桥接进程不导入 `src/lab_rag/rag_agent.py`，而是使用随机 Bearer Token 调用 Web 进程内仅接受真实 loopback 对端的私有 JSON API。因此 Embedding、Reranker、Qdrant 客户端仍只在原 Web 进程加载一份，原 `/ask_stream`、前端和 `scripts/start_rag.sh` 行为不变。
@@ -602,22 +604,64 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | `MCP_QUERY_MAX_CHARS` | `4000` | MCP 查询最大字符数 |
 | `MCP_RESULT_LIMIT` | `6` | MCP 检索默认返回条数 |
 | `MCP_RESULT_MAX_CHARS` | `1500` | 每条 MCP 证据各文本字段最大字符数 |
+| `ENABLE_MARKDOWN_STRUCTURE_GUARD` | `true` | 标题（含 `####`）、代码块、表格与公式按原子块保护，代码内 `#` 不判标题 |
+| `ENABLE_PATH_CONTEXT_PREFIX` | `true` | 向量化前缀注入小组/设备/Manuals 目录层级，区分同名手册 |
+| `CHUNK_FILTER_SPECIAL_CHAR_RATIO` | `0.25` | 质量过滤的特殊字符占比上限（Markdown/LaTeX 符号已排除） |
+| `ENABLE_TABLE_FILTER_EXEMPTION` | `true` | 表格转写与代码块豁免长度/字符占比过滤 |
+| `INGEST_MAX_FAILED_FILES` | `0` | 允许的文档加载失败数，超出即中止入库，避免静默缺文档 |
+| `QDRANT_INDEX_FAIL_FAST` | `true` | payload 索引缺失时中止入库，而非让 MatchText 运行时才报错 |
+| `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照 + TTL 缓存，消除两次全盘 `os.walk` 的网络盘 IO |
+| `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒），缓存键含根目录与索引版本 |
+| `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免版本控制噪声被误当成设备目录 |
+| `CATALOG_MAX_TRAVERSAL` | `200000` | 目录树快照遍历上限（目录数）；默认覆盖完整语料目录树，避免靠后目录缺失导致 file_list/hybrid 目录枚举错配 |
+| `MAX_HYBRID_QUERIES` | `8` | hybrid 目录驱动查询归一化去重后的最大 Dense 路数；完整设备清单仍由目录枚举答案区块提供 |
+| `MAX_DENSE_QUERIES` | `4` | Dense 查询最大路数（hybrid 由 `MAX_HYBRID_QUERIES` 单独限流） |
+| `MAX_HYDE_QUERIES` | `2` | HyDE 假设文档最大路数，与 Dense 分开计数 |
+| `MAX_SPARSE_CONDITIONS` | `30` | MatchText should 条件预算，按字段优先级分配 |
+| `ENABLE_HISTORY_AWARE_REWRITE` | `true` | 改写阶段使用最近对话历史消解代词 |
+| `RERANKER_RELATIVE_RATIO` | `0` | 重排相对 Top-1 比例阈值，0 表示仅用绝对阈值 |
+| `RERANKER_MIN_KEEP` | `0` | 重排最少保留条数，0 表示关闭保底 |
+| `ENABLE_ANSWERABILITY_GATE` | `true` | 最终父块关键词零命中且 Top-1 低分时判为知识库无答案，避免把无关文档包装成引用 |
+| `ANSWERABILITY_TOP_SCORE_FLOOR` | `0.90` | 拒答闸门 Top-1 分数下限；三线证据（改写关键词 / 语料词典实体 / 原问题 bigram 重合）全部缺失且低于此值才判无答案 |
+| `ANSWERABILITY_MIN_KEYWORD_HITS` | `1` | 判定可答所需的最少关键词命中数 |
+| `ANSWERABILITY_MIN_OVERLAP_HITS` | `2` | 原始问题与召回文档身份字段的中文 2-gram 最少重合数，避免抽象改写词误伤主题级问法 |
+| `MAX_SPARSE_TERMS` | `12` | MatchText 词元预算；型号词元化修复后略放大 |
+| `PARENT_EXPAND_MAX_CHARS` | `9000` | 父块展开累计预算，与最终上下文预算解耦，避免 2 个父块占满 |
+| `PARENT_MAX_SINGLE_CHARS` | `1500` | 单个父块最大字符数，按行边界截断避免腰斩表格 |
+| `PARENT_MAX_PER_SOURCE` | `3` | 同一来源文件的父块配额，避免单本长手册垄断候选榜 |
+| `LEXICON_PATH` | `config/retrieval_lexicon.json` | 结构化检索规则词典：notation 词表与答案模板、路由四张词表、目录意图词表、表格恢复模板，集中外置避免代码写死 |
+| `CORPUS_LEXICON_PATH` | `data/corpus_lexicon.json` | 由 `scripts/build_corpus_lexicon.py` 从语料 `rel_path` 离线生成的「小组 ↔ 设备型号 ↔ 手册类型」派生词典 |
+| `ENABLE_CORPUS_LEXICON` | `true` | 用语料派生词典替代静态小组别名；关闭或词典缺失时回退静态别名 |
+| `ENABLE_NOTATION_SPECIALIZATION` | `true` | 变量格式表特判能力开关；关闭后该类问题走通用检索 + LLM 回答 |
+| `ENABLE_EVIDENCE_RERANK` | `true` | 证据加权稳定重排，仅影响引用顺序，不改召回集合与上下文内容 |
+| `EVIDENCE_RERANK_WEIGHT` | `0.12` | 型号/路径精确命中在重排并列时的加分权重 |
+| `EVIDENCE_PRIOR_WEIGHT` | `0.12` | 强证据先验每命中一个（日期/文档标题词元/型号）的加性加分 |
+| `EVIDENCE_PRIOR_CAP` | `0.24` | 强证据先验加分上限，避免单文档被过度提升 |
+| `TABLE_SEMANTIC_MAX_REPLACEMENT_RATIO` | `0.15` | 表格语义转写跳过 U+FFFD 占比超阈值的行（OCR 残缺目录页点线），避免把噪声再复制一遍 |
+| `RETRIEVAL_INDEX_VERSION` | `2` | 检索缓存索引版本；入库逻辑变更后递增以失效旧缓存（v3.2.0 因 `page_content` 变更已递增） |
+| `COVERAGE_HIGH_THRESHOLD` | `0.7` | 高覆盖度阈值 |
+| `COVERAGE_MEDIUM_THRESHOLD` | `0.5` | 中覆盖度阈值 |
+| `COVERAGE_LOW_THRESHOLD` | `0.3` | 低覆盖度阈值 |
+| `RERANK_QUERY_MODE` | `both` | `both`=原始+改写问题共同重排；`rewritten`=仅改写问题 |
+| `RERANKER_ALLOW_LOW_SCORE_FALLBACK` | `false` | 全部候选低分时是否保底返回 1 条（关闭可避免假引用） |
+| `NOTATION_MATCH_BONUS` | `0.15` | 变量格式表命中块的加分上限（取代写死 1.0） |
+| `ENABLE_CONTEXT_NOISE_FILTER` | `true` | 上下文过滤超长链接与多余空行 |
 
-> **重要**：所有模型统一使用本地路径（`models/`），不要使用 HuggingFace 在线路径。
+> **重要**：所有模型统一使用本地路径（`models/`），不要使用 HuggingFace 在线路径。新增配置键必须同步 `.env.example` 与 `src/lab_rag/ingest.py`、`src/lab_rag/rag_agent.py` 两侧的 `load_config()`。
 
 ## 知识入库详解
 
 ### 入库流程说明
 
-系统采用 **Small-to-Big** 切分策略：
+系统采用 **Small-to-Big** 切分策略，并针对实验室语料（中文参考书、中英文设备手册、短规范与教程）做了结构保护：
 
-1. **文档加载**：递归扫描目录，多编码尝试读取 Markdown 文件
-2. **文本清洗**：移除 HTML 注释/标签、图片语法、零宽字符
-3. **标题结构切分**：按 Markdown 标题（#/##/###）拆分为逻辑段落
-4. **父块切分**：1500 字符父块，200 字符重叠
-5. **子块切分**：300 字符子块，50 字符重叠，metadata 中保存 parent_id
-6. **质量过滤**：过滤过短、无效字符不足、数字占比过高的块
-7. **向量化写入**：bge-m3 生成 1024 维向量，分批写入 Qdrant
+1. **文档加载**：递归扫描目录，BOM 嗅探 + 多编码解码置信度校验，拒绝乱码静默入库；加载失败数超过 `INGEST_MAX_FAILED_FILES` 时中止
+2. **文本清洗**：CJK 兼容字符归一（保留中文标点）、OCR 拆分的 LaTeX 命令还原；代码块/表格/公式/泛型按结构保护，图片占位保留 `[图片]` token；标准表格追加逐行语义转写并支持转义竖线与表头继承
+3. **标题结构切分**：按 Markdown 标题（`#`~`####`）拆分为逻辑段落，代码块内 `#` 不判标题；尺寸切分统一由父块切分器负责，不再两级叠加
+4. **父块切分**：1500 字符父块，200 字符重叠；父块序号参与确定性 ID，避免重复章节互相覆盖
+5. **子块切分**：300 字符子块，50 字符重叠；表格/代码块作为原子块不按行腰斩；metadata 保存 `parent_id`、`chunk_hash`、`summary_status` 与路径层级
+6. **质量过滤**：对剥离上下文前缀的原始正文判定，Markdown/LaTeX 符号纳入白名单，表格/代码块豁免；过滤后同步裁剪父块，避免「有父无子」孤儿点
+7. **向量化写入**：bge-m3 生成 1024 维 Dense 向量；前缀注入「文档 > 路径（小组/设备/Manuals）> 章节 > 段落摘要」；分批写入子块集合，父块写入独立集合并补齐路径/出处字段；创建后校验文本与 keyword 索引
 
 ### 增量入库 vs 全量入库
 
@@ -626,17 +670,25 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | 增量 | `bash scripts/auto_ingest.sh` | 日常新增/修改少量文档 |
 | 全量 | `bash scripts/auto_ingest.sh --full` | 首次部署、修改切块参数后 |
 
-日常命令是“变更触发式幂等覆盖”：脚本根据 mtime 与 manifest 判断是否需要运行；触发后 `src/lab_rag/ingest.py` 会重新扫描全部 Markdown，但不重建集合。入库使用确定性 UUID（基于 source + parent_id + chunk_index 的 UUID5）。新子块和父块全部写入成功后，系统清理同源但不再出现的旧 ID，避免文档修改后残留陈旧向量。
+日常命令是“变更触发式幂等覆盖”：脚本根据 mtime 与 manifest 判断是否需要运行；触发后 `src/lab_rag/ingest.py` 会重新扫描全部 Markdown，但不重建集合。入库使用确定性 UUID（基于 `source + parent_id + chunk_hash + chunk_index` 的 UUID5，父块 ID 另含父块序号）。新子块和父块全部写入成功后，系统清理同源但不再出现的旧 ID，避免文档修改后残留陈旧向量。
 
 ### 重建知识库
 
 修改以下任一项后，**必须全量重建**：
 - metadata 字段（新增/删除/重命名）
-- chunk 大小或前缀格式
+- chunk 大小、切分边界或向量化前缀格式
+- 清洗规则（会改变 `page_content`）
 - UUID 生成逻辑
+- payload 索引结构
 - Embedding 模型
 
+> **v3.2.0 升级必读**：v3.1.0 涉及清洗、结构保护、路径前缀、metadata 字段、父块序号化 ID 与索引结构；v3.2.0 又修改了表格转写规则（跳过 OCR 替换符噪声行，改变 `page_content`）。升级到任一版本都必须执行一次全量重建，并把 `RETRIEVAL_INDEX_VERSION` 递增到 `2` 以失效旧检索缓存。命令会销毁并重建子块与父块两个集合，属于破坏性维护操作，请先在维护窗口确认 `DOCS_PATH` 已挂载且包含真实语料；仓库不会自动执行该命令。
+
 ```bash
+# 1. 先确认共享盘确实包含语料，避免用空目录重建知识库
+timeout 30 find /mnt/cpu_share -type f -name '*.md' -print -quit
+
+# 2. 确认无误后再执行重建
 bash scripts/auto_ingest.sh --destroy --force && bash scripts/auto_ingest.sh --full
 ```
 
@@ -828,76 +880,13 @@ SSE 流式问答接口，需先登录获取 Session。
 
 ### 混合检索的目录驱动规则
 
-混合模式会先调用目录枚举工具。对于“VLC 小组有哪些设备及使用规范”这类问题，只展示小组目录的直接子级（设备目录），不会继续展开到 `Manuals/*.md`；随后把“设备目录 + 用户明确提出的使用方法/操作规范/注意事项”等意图作为 Dense/Sparse 检索词。原始问题不会交给模型自由扩写，从而避免出现与知识库无关的设备名或规范。若 `KNOWLEDGE_BASE_ROOT` 已存在但为空、挂载失效或未找到目录，系统会回退到 Qdrant 路径元数据，并先把深层文档路径折叠回设备层级。
+混合模式会先调用目录枚举工具。对于“VLC 小组有哪些设备及使用规范”这类问题，只展示小组目录的直接子级（设备目录），不会继续展开到 `Manuals/*.md`；随后把“设备目录 + 用户明确提出的使用方法/操作规范/注意事项”等意图作为 Dense/全文词项检索词。原始问题不会交给模型自由扩写，从而避免出现与知识库无关的设备名或规范。若 `KNOWLEDGE_BASE_ROOT` 已存在但为空、挂载失效或未找到目录，系统会回退到 Qdrant 路径元数据，并先把深层文档路径折叠回设备层级。
 
-`file_list` 只用于用户明确要求列出或定位目录、文件、路径、设备清单的场景。问题中出现“格式、要求、规范、步骤、怎么写”等词时按文档内容检索处理，不能因为答案可能位于某个模板文件中而路由成文件枚举。只有同时明确要求清单和内容说明（如“某小组有哪些设备及使用规范”）时才进入 `hybrid`。
+`file_list` 只用于用户明确要求列出或定位目录、文件、路径、设备清单的场景。问题中出现“格式、要求、规范、步骤、怎么写”等词时按文档内容检索处理；例如“周报格式是什么”固定进入 `rag_search`，不能因为答案可能位于某个模板文件中而路由成文件枚举。只有同时明确要求清单和内容说明（如“VLC 小组有哪些设备及使用规范”）时才进入 `hybrid`。
 
-Agent 模式遵循同一边界，但工具 `Action` 必须由模型实际输出，系统不会合成思考或伪造工具调用。通用状态机只校验下一步是否合法：`rag_search` 必须先调用 `rag_qa`，`file_list` 必须先调用 `list_group_files`，`hybrid` 按“目录枚举 → 正文检索”执行；模型选择错误或在取得依据前直接作答时，会收到通用纠正并自行重新选择。目录未命中不能作为生成知识库外“通用模板”的依据，后续检索必须保留原始意图，禁止使用“总结这些工具怎么用”等与问题无关的固定话术。
+Agent 模式遵循同一边界：明确的 `rag_search` 内容问题会确定性地直接调用 `rag_qa`，不允许 Agent 自行改成 `list_group_files`；目录未命中也不能据此生成知识库外的“通用模板”。只有 `hybrid` 问题才要求在目录枚举后继续调用 `rag_qa`，后续检索必须保留用户原始意图，禁止使用“总结这些工具怎么用”等与问题无关的固定话术。
 
 若历史摘要中存在 `<think>` 或整段问答污染，检索时会自动过滤；更新代码后建议执行一次 `bash scripts/auto_ingest.sh --full` 重新生成干净摘要。
-
-### 回答质量与证据边界（3.0.3）
-
-- 移除针对具体格式问题的固定检索词、强制提分和固定回答，以及入库时的固定表格恢复。所有问题使用通用检索链路。
-- 默认 `ENABLE_HYDE=false`：改写保留对象与问题意图，不要求模型编造答案后再用它检索。已有部署的 `.env` 不会自动覆盖，升级时请检查该值；显式开启仍支持假设文档召回，但假设不是证据。
-- 多查询先按每条查询自身排名做 RRF，再融合 Dense/文本匹配通道。未命中通道不加分，重复结果不重复投票，同分按稳定顺序处理。Sparse 通道使用 Qdrant `MatchText` 多路候选及本地词项覆盖排序，**不是 BM25 排名**；保留 `BM25_WEIGHT` 仅为配置兼容。
-- 重排低于 `RERANKER_SCORE_THRESHOLD` 的片段全部剔除，不再强留一条；重排异常也不拿未校验召回生成回答。可能因此出现更多“证据不足”，应检查日志、转换质量和真实命中，不要靠降低阈值掩盖问题。
-- `MAX_CONTEXT_CHARS` 对正文证据、来源头和分隔符实行硬限制；混合模式为正文保留预算。页面正文片段、来源编号和引用只保留实际进入上下文的资料。生成摘要不再作为正文证据；目录命中也不提升正文覆盖度。覆盖度是相关性启发式判断，不是事实正确率或概率。
-- Agent 首次必需调用完成后，可由模型发起不同参数的补充检索；重复成功调用被拦截，抛出异常的调用允许重试，仍受原有步数上限约束。
-
-升级顺序：核对并备份源 Markdown 与 Qdrant → 检查 `.env` → 在维护窗口用 `bash scripts/auto_ingest.sh --full` 清除旧索引中注入的固定内容 → `bash scripts/start_rag.sh restart` → 用多类实际问题验收。**仅重启不能清除历史索引污染；若污染已写入 Markdown，必须先核对原文修复 Markdown。** 不要对不完整挂载或局部镜像执行全量重建。
-
-离线行为回归：`python -m unittest discover -s tests -p test_evidence_pipeline.py -v`。测试从源码加载函数，隔离模型/GPU/平台依赖，检查排名融合、拒绝弱证据、上下文与引用一致性、通用表格处理及 Agent 补充调用；它不代替 Linux 上的真实转换、入库和问答验收。建议验收至少覆盖制度格式、设备操作、参数表、目录清单、证据缺失与多轮追问，并逐条打开原文核对回答依据。
-
-### 实验室文档结构保护（3.0.4）
-
-- HTML 表格先保留单元格关系再清洗。普通矩形表转 Markdown；没有明确 `th` 表头时使用“列1、列2”等位置标签，不把首行擅自当成规则。合并/不规则表保留原始单元格顺序和 `rowspan/colspan`；结构损坏时标记核对，不猜测空白内容。
-- 短操作条款和参数表不再一律按 `MIN_CHUNK_LENGTH=120` 丢弃。新增 `MIN_STRUCTURED_CHUNK_LENGTH=12` 只用于有结构证据的短内容；纯标题、图片占位和长路径不算正文证据。该参数同时在 `.env.example` 与入库 `load_config()` 中注册。
-- 支持一至六级标题，围栏代码里的 `#` 不会成为章节。标准表格的转义竖线不会被误拆列，重复清洗不重复追加结构化转写。
-- 重排输入包含标题、相对路径、章节及正文，不注入生成摘要。长父块/上下文截取围绕命中段落，避免召回了操作条款却只给模型看手册前言。
-- 回答要区分制度、厂商手册、个人汇报与论文示例；型号、适用条件或版本冲突不能靠模型常识补齐。
-
-本轮真实抽样与验证边界见 [实验室文档只读审计](docs/LAB_DOCUMENT_AUDIT.md)。这些是通用结构修复，不包含任何文件名或问句专用检索规则。**HTML 清洗和分节变化会改变入库文本及父块 ID，升级时必须按前述备份流程全量重建；仅重启不能生效。** 结构保留不等于 OCR 内容正确，已错位、缺字或公式图片未识别的源 Markdown 仍需核对原图。
-
-### 数据库难样本与全文召回（3.0.6）
-
-全文检索不再直接使用 `scroll` 返回的 ID 顺序作为相关性排名。完整查询、关键词交集和独立关键词各有候选额度，避免某设备的几千个片段挤掉具体操作章节；按原文、章节及路径的词项覆盖排序后参与 RRF，最后仍须通过语义重排及证据筛选。生成摘要不贡献本地排序分。中文分词命中但本地短语未匹配的候选保留在末尾，避免错误地用简单字符串匹配替代数据库分词器。
-
-| 配置 | 默认值 | 含义 |
-| --- | ---: | --- |
-| `SPARSE_CANDIDATE_LIMIT` | `256` | 所有全文通道合计最多读取的候选数（去重前），不是每路 256 |
-| `SPARSE_MAX_TERMS` | `8` | 包含原查询的词项上限，按输入顺序稳定去重 |
-| `SPARSE_TIMEOUT` | `10` | 全文通道总等待秒数；已发出的请求仍受自身超时约束 |
-
-最终全文候选最多返回 `INITIAL_RETRIEVAL_K` 条；日志 `[SPARSE]` 显示通道完成、超时、去重后候选和返回数量。交集没有结果时仍保留独立通道，不强制所有关键词同时出现。
-
-在数据库可达的 `rag` 环境，从项目根目录执行只读回放：
-
-```bash
-conda run -n rag python scripts/evaluate_lexical_retrieval.py
-python -m unittest discover -s tests -p test_lexical_retrieval.py -v
-```
-
-回放不加载模型、不调用生成接口、不写索引，先验证样本 ID 与正文证据，再比较旧 OR 首屏、新全文通道和同预算扩大的旧 OR 首屏。数据库重建后 ID/正文若变化会报错，需核对并重新标注，不能直接计为未召回。详情见 [数据库难样本记录](docs/QDRANT_HARD_CASE_AUDIT.md)。4 个固定查询词难样本的全文通道命中为 0/4 → 4/4；**这是定位问题的小样本，不是整体召回率或最终回答准确率，也未验证中文改写。** 测试问句、设备名和证据 ID 仅保存在评测夹具，不进入线上规则。
-
-仅本节检索变更不改变入库字段或切块，无需重建；核对远端未提交改动后同步源码（包括 `lexical_retrieval.py`、`document_structure.py`）及配置，在维护窗口重启 Web 才会生效。若同时部署前述 3.0.3–3.0.5 入库变更，仍需按对应章节备份并全量重建，不能用这条说明跳过。当前仅完成本地修改及远端内存只读回放，未覆盖生产源码或重启服务。
-
-### 表格跨块与上下文保真（3.0.5）
-
-规则 Markdown 表在章节预切、父块和子块三处都按整行切分，并重复原始表头；表格周围的正文不会丢弃，能容纳时与表格合并。纯正文保持既有切分及 overlap 行为，表格数据行不为 overlap 额外复制。不带外围竖线、空单元格、转义竖线与行内代码也纳入处理；不规则表不推断缺失列。
-
-继续使用 `PARENT_CHUNK_SIZE=1500`、`CHILD_CHUNK_SIZE=300` 等既有配置，未新增开关。**表头加单行超过切块目标时，完整保留该行并输出 `[WARNING]`，因此切块长度是结构优先的目标值，不是对长表行的硬上限。** 必须检查此类日志和 Embedding/Reranker 的输入上限，必要时核对原表并整理过长单元格；不能据此保证超长内容已被模型完整编码。
-
-生成上下文的 `MAX_CONTEXT_CHARS` 仍是硬上限。表格只提供原表头与完整数据行，优先保留实际命中行；装不下时跳过，不拿半个参数或半条限定条件作答。正文窗口碰到表格边界会收缩，不附带缺表头的残行。这不解决源 OCR 错位、复杂跨页合并或未识别图片中的内容。
-
-验证命令：
-
-```bash
-python -m unittest discover -s tests -p test_table_chunking.py -v
-python -m unittest discover -s tests -p test_evidence_pipeline.py -v
-```
-
-仓库 Markdown 样本的 25 个规则表、211 条数据行经两级切分后全部保留；其中 20 个表头加单行超过 300 字目标。这是结构完整性检查，不是线上问答正确率评估。测试中的普通文本切分器被隔离替代，真实依赖及向量检索仍需部署环境验收。**本次分块内容变化需要在备份、确认文档目录完整后全量重建；不要仅增量入库或只重启 Web。**
 
 混合回答会固定包含“目录 / 文件检索结果”区块，不依赖模型自行复述。若该区块为空，右侧面板会显示实际检索目标和已检查的根目录。部署时应确保 `.env` 中 `DOCS_PATH` 与 `KNOWLEDGE_BASE_ROOT` 都是 `/mnt/cpu_share`；`start_rag.sh start` 会在两者不一致、目录不存在或不可读时给出警告。
 
@@ -951,7 +940,7 @@ lab_rag/
 | `README.md` | 安装、迁移、启动、入库、配置、维护和逐文件说明 | 新部署与日常运维的首要入口 |
 | `AGENTS.md` | AI Agent 和开发者必须遵守的代码、配置、SSE、版本及验证规范 | 修改代码前必须阅读 |
 | `CHANGELOG.md` | 按版本记录功能、修复与不兼容变更 | 发布时与 `VERSION` 同步更新 |
-| `VERSION` | 当前语义化版本号 | 纯文本单行；以该文件内容为准 |
+| `VERSION` | 当前语义化版本号 | 纯文本单行；当前为 `3.4.0` |
 
 ### 核心 Python 包 `src/lab_rag/`
 
@@ -960,8 +949,7 @@ lab_rag/
 | `src/lab_rag/__init__.py` | 声明 `lab_rag` Python 包 | 使核心模块可以通过 `python -m lab_rag.<module>` 和包内相对导入运行 |
 | `src/lab_rag/paths.py` | 统一计算 `PROJECT_ROOT` 并解析项目相对路径 | 被日志、Web、入库、用户管理和 Agent 模块使用，避免目录迁移后依赖当前工作目录 |
 | `src/lab_rag/logger.py` | 创建控制台与按日轮转的文件 Logger | 从根目录 `.env` 读取 `LOG_*`，相对 `LOG_DIR` 固定解析到项目根目录 |
-| `src/lab_rag/rag_agent.py` | 主 RAG 引擎：路由、改写、HyDE、多查询、Dense/Sparse 检索、RRF、重排、父块展开、覆盖率、引用与流式生成 | 被 `web_app.py`、`rag_tool.py` 和 `tools.py` 调用；共享唯一 Embedding、Reranker、Qdrant 与 LLM 运行时 |
-| `src/lab_rag/lexical_retrieval.py` | 有界多路全文候选与稳定词项覆盖排序 | 不加载模型，通过注入的只读 scroll 调用访问数据库 |
+| `src/lab_rag/rag_agent.py` | 主 RAG 引擎：路由、改写、HyDE、多查询、Dense/全文词项检索、RRF、重排、父块展开、覆盖率、引用与流式生成 | 被 `web_app.py`、`rag_tool.py` 和 `tools.py` 调用；共享唯一 Embedding、Reranker、Qdrant 与 LLM 运行时 |
 | `src/lab_rag/web_app.py` | Flask 服务入口：认证、Session、限流、历史记录、SSE、健康检查与 MCP 内部 API | `scripts/start_rag.sh` 以 `python -m lab_rag.web_app` 启动；`use_agent=true` 时包内导入 `agent_entry.py` |
 | `src/lab_rag/ingest.py` | 知识入库：Markdown 加载、清洗、父子分块、摘要增强、Embedding、Qdrant 建集与幂等写入 | `scripts/auto_ingest.sh` 以 `python -m lab_rag.ingest` 调用；同时维护子块和父块集合 |
 | `src/lab_rag/create_user.py` | 交互式创建或更新 Web 登录用户，使用 PBKDF2 哈希和原子文件替换 | 通过 `PYTHONPATH=src python -m lab_rag.create_user` 执行；默认写入根目录 `config/users.json` |
@@ -992,8 +980,19 @@ lab_rag/
 
 | 文件 | 作用 | 使用方式 / 边界 |
 |------|------|-----------------|
-| `tests/test_reliability.py` | 可靠性契约回归 | 覆盖目录结构、Python/Shell 入口、包内导入、配置模板、健康检查、SSE 并发释放、入库一致性和 MCP；运行 `conda run -n rag python tests/test_reliability.py` |
+| `tests/test_reliability.py` | 可靠性契约回归 | 覆盖目录结构、Python/Shell 入口、包内导入、配置模板、健康检查、SSE 并发释放、入库一致性、检索优化与 MCP；运行 `conda run -n rag python tests/test_reliability.py` |
 | `tests/test_html.py` | 前端静态完整性检查 | 无需启动服务，检查 `index.html` 的 DOM、样式和脚本约定 |
+| `tests/rag_perf_queries.json` | RAG 链路主测试集 | 131 条，覆盖全部文档类型、多重路由与 22 类边界案例；设备手册占比 ≤40% |
+| `tests/rag_perf_holdout.json` | 独立留出集 | 24 条，query 与主集零重叠，全程不参与调优，仅用于泛化评估 |
+| `config/retrieval_lexicon.json` | 结构化检索规则词典 | notation 词表与答案模板、路由四张词表、目录意图词表、表格恢复模板；内容外置、代码只留通用逻辑 |
+| `config/iteration_criteria.json` | 机器可读量化门槛 | 每轮复测自动逐项判定达成/未达成，未达成项列入残留短板 |
+| `data/corpus_lexicon.json` | 语料派生词典 | 由 `scripts/build_corpus_lexicon.py` 从 86 份 md 的 `rel_path` 离线生成，含小组别名/型号/手册类型与语料指纹 |
+| `src/lab_rag/lexicon.py` | 词典统一加载/校验/缓存 | 启动期 schema fail-fast、进程内单例缓存、词典缺失降级 |
+| `scripts/build_rag_perf_queries.py` | 测试集构建与校验 | 以数据表生成主集+留出集 JSON，实测校验路由、落点真实性、分布均衡与留出集隔离 |
+| `scripts/build_corpus_lexicon.py` | 语料词典离线生成 | 只读 DOCS_PATH，支持 `--check` 校验指纹是否过期，不依赖 Qdrant/vLLM |
+| `scripts/check_page_content_hash.py` | 零重建判定 | 比较 86 份语料 `clean_text` 输出 SHA-256；完全一致即本轮零重建 |
+| `scripts/check_engineering_criteria.py` | 工程侧门槛采集 | 统计回归用例数、AST/lint 错误、新增第三方依赖、内联定制化点，输出 `logs/engineering_metrics.json` 供 runner 判定 |
+| `scripts/run_rag_perf.py` | RAG 链路性能评估 | 采集引用明细，统计命中率/Top-1/拒答率/分阶段时延/分布均衡/留出集泛化差距，支持 `--baseline`、`--holdout`、`--criteria`；依赖 live 实例，非系统压测 |
 | `tests/test_agent.py` | 交互式 ReAct Agent 冒烟测试 | 会调用真实 RAG/LLM 链路，不属于离线单元测试 |
 | `dev/mock_server.py` | 不依赖 Qdrant/vLLM 的前端 Mock 服务 | 运行 `python dev/mock_server.py`，复用生产模板并模拟登录、历史和 SSE 响应 |
 

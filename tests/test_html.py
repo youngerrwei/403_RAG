@@ -347,6 +347,18 @@ def main():
         "搜索 CSS 或内联 .source-link",
     )
 
+    # 新增可选 SSE 字段的容错读取（旧版事件没有这些字段时仍需正常工作）
+    T.check(
+        "引用来源编号容错 — c.index 需做类型判断后再展示",
+        bool(re.search(r"Number\.isInteger\(c\.index\)", js_text)),
+        "搜索 Number.isInteger(c.index)",
+    )
+    T.check(
+        "来源章节路径容错 — source_map.header_path 可选读取",
+        "src.header_path" in js_text,
+        "搜索 src.header_path",
+    )
+
     # ═══════════════════════════════════════════════
     # 汇总
     # ═══════════════════════════════════════════════

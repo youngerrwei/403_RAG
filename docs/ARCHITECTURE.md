@@ -14,7 +14,7 @@ flowchart LR
         A1["Markdown"] --> A2["文本清洗"] --> A3["标题分段"] --> A4["父子块切分"] --> A5["质量过滤"] --> A6["Embedding"] --> A7["Qdrant<br>(子块索引 + 父块独立存储)"]
     end
     subgraph qa ["知识问答"]
-        B1["用户问题"] --> B2["查询路由<br>(规则优先+LLM兜底)"] --> B3["问题改写"] --> B4["混合检索<br>(Dense+Sparse)"]
+        B1["用户问题"] --> B2["查询路由<br>(规则优先+LLM兜底)"] --> B3["问题改写"] --> B4["混合检索<br>(Dense+全文词项)"]
         B4 --> B5["RRF融合"] --> B6["去重"] --> B7["重排序"] --> B8["父块展开<br>(独立Collection查询)"] --> B9["LLM 流式生成"]
         B10(["TTL缓存 5min"]) -.-> B4
     end
@@ -41,7 +41,7 @@ flowchart TB
 - **Flask Web 服务** 作为入口层，处理用户认证、会话管理，将问答请求委托给 RAG 核心引擎，并通过 SSE 将流式结果推送至前端
 - **RAG 核心引擎** 编排完整的问答流程：先通过规则/LLM 路由判断意图，调用 Embedding 模型将查询向量化，再从 Qdrant 执行混合检索，用 Reranker 精排后展开父块上下文，最终调用 vLLM 生成流式回答
 - **vLLM 推理服务** 提供 OpenAI 兼容 API，负责查询改写和最终回答生成两个 LLM 调用阶段
-- **Qdrant 向量数据库** 存储子块向量索引和父块原文，支持 Dense + Sparse 混合检索
+- **Qdrant 向量数据库** 存储子块 Dense 向量索引、父块原文与 payload 索引，支持 Dense + 全文词项匹配（MatchText）混合检索
 - **Embedding / Reranker 模型** 在 RAG 引擎内部以本地推理方式运行，分别负责查询/文档向量化和精排打分
 - **MCP Bridge（可选）** 只做 stdio/JSON 协议转换；检索工具在 `retrieval` 元数据产生后关闭标准 RAG 生成器，不进入最终答案生成，也不写入历史
 
@@ -70,8 +70,8 @@ flowchart TB
 flowchart LR
     A["文档加载<br>(递归扫描 .md文件)"] --> B["文本清洗<br>(HTML/图片/空白)"] --> C["标题结构切分<br>(按 #/##/### 拆分段落)"] --> D["父子块切分<br>(Small-to-Big)<br>父块1500字/子块300字"]
     D --> E["质量过滤<br>· 过短过滤(小于120字符)<br>· 有效字符比例检查<br>· 数字/特殊字符占比"]
-    E --> F["Embedding 向量化<br>(bge-m3, 1024维)<br>· 批量处理(64)<br>· Dense+Sparse"]
-    F --> G["写入 Qdrant<br>· 子块→主集合<br>· 父块→父块集合<br>· 确定性UUID5"]
+    E --> F["Embedding 向量化<br>(bge-m3, 1024维 Dense)<br>· 批量处理(64)<br>· 路径/章节前缀"]
+    F --> G["写入 Qdrant<br>· 子块→主集合<br>· 父块→父块集合<br>· 确定性UUID5<br>· payload索引校验"]
 ```
 
 **各阶段详细说明：**
@@ -83,7 +83,7 @@ flowchart LR
    - 父块：使用 RecursiveCharacterTextSplitter 将逻辑段落切为 1500 字符的父块，注入标题/路径前缀增强语义
    - 子块：将每个父块继续切为 300 字符的子块，子块 metadata 中保存 `parent_id` 用于回溯
 5. **质量过滤**：过滤空内容、过短（<120字符）、有效字符不足、数字占比过高、特殊字符过多的块
-6. **Embedding 向量化**：使用 bge-m3 生成 1024 维向量，同时产出 Dense 和 Sparse 表示，批量大小为 64
+6. **Embedding 向量化**：使用 bge-m3 生成 1024 维 Dense 向量，批量大小为 64；向量化文本注入「文档 > 路径（小组/设备/Manuals）> 章节 > 段落摘要」前缀。Sparse 路是查询期基于 payload 文本索引的 MatchText 全文词项匹配，库内不写入稀疏向量
 7. **写入 Qdrant**：
    - 子块以确定性 UUID5（基于 `source|parent_id|chunk_index`）写入主集合 `lab_knowledge_base`
    - 父块写入独立集合 `lab_knowledge_base_parents`（4维零向量占位，不参与相似度计算）
@@ -93,9 +93,9 @@ flowchart LR
 ```mermaid
 flowchart LR
     A["用户提问"] --> B["查询路由<br>· 规则引擎优先<br>· LLM兜底判断<br>· 短问题跳过改写"]
-    B --> C["查询改写<br>· standalone<br>· expanded<br>· HyDE扩展"]
-    C --> D["混合检索<br>· Dense(0.7)<br>· Sparse(0.3)<br>· 并行多查询"]
-    D --> E["RRF 融合 + 去重 + 重排序<br>· RRF(k=60)融合两路结果<br>· 去重(source+parent_id)<br>· CrossEncoder精排<br>· boost(关键词5%/标题8%)"]
+    B --> C["查询改写<br>· standalone + keywords<br>· expanded / HyDE 独立路数<br>· 对话历史消解代词"]
+    C --> D["混合检索<br>· Dense(0.7) 分数归并<br>· 全文词项(0.3) 字段预算<br>· 并行多查询"]
+    D --> E["RRF 融合 + 去重 + 重排序<br>· RRF(k=60) 写入 rrf_score<br>· 去重(parent_id+chunk_hash)<br>· CrossEncoder 双 query 精排<br>· 中文 n-gram boost"]
     E --> F["父块展开<br>· 独立Collection<br>· scroll+Filter<br>· 上下文预算控制<br>· 超长截断"]
     F --> G["LLM 流式生成<br>· vLLM API<br>· SSE 推送<br>· 覆盖度评估<br>· 引用溯源"]
 ```
@@ -104,9 +104,9 @@ flowchart LR
 
 1. **查询路由**：规则引擎通过关键词匹配快速分流（rag_search / file_list / hybrid），未命中时调用 LLM 兜底判断意图
 2. **查询改写**：LLM 将用户问题改写为 `standalone_question`（独立化）+ `expanded_queries`（扩展查询），多查询并行检索
-3. **HyDE 查询扩展**：对复杂查询，LLM 先生成假设性回答文本作为额外检索 query，提升语义模糊查询的召回率
-4. **混合检索**：Dense 向量检索（权重 0.7）+ Sparse 关键词检索（权重 0.3，基于 Qdrant MatchText）
-5. **RRF 融合**：通过 Reciprocal Rank Fusion (k=60) 融合两路结果，提升专业术语和稀有词的召回能力
+3. **HyDE 查询扩展**：对复杂查询，LLM 先生成假设性回答文本，作为与 Dense 分开计数的独立 query 参与检索，不再被 `queries[:5]` 截断
+4. **混合检索**：Dense 向量检索（权重 0.7，按相似度分数归并排序）+ 全文词项匹配（权重 0.3，基于 Qdrant MatchText，词元化后按字段优先级分配条件预算）
+5. **RRF 融合**：通过 Reciprocal Rank Fusion (k=60) 融合两路结果并写入 `rrf_score`，与去重共用 `canonical_doc_key`（`parent_id + chunk_hash`），提升专业术语和设备型号的召回能力
 6. **去重**：基于 `source + parent_id` 去除冗余结果
 7. **CrossEncoder 重排序**：bge-reranker-v2-m3 精排（batch_size=64），应用 boost 系数，过滤低分文档（阈值 0.3）
 8. **父块展开**：从独立 Collection 通过 `scroll` + Filter 批量查询父块原文，累计字符数不超过 `MAX_CONTEXT_CHARS`（3000）
@@ -146,21 +146,21 @@ flowchart LR
 
 **设计考量：** 规则路由延迟极低（<1ms），可处理 80%+ 的常见查询模式；LLM 路由处理规则无法覆盖的复杂意图，减少不必要的 LLM 调用延迟。两级设计在速度和准确性之间取得平衡。
 
-### 3. 混合检索 (Dense + Sparse)
+### 3. 混合检索 (Dense + 全文词项匹配)
 
-Dense 向量检索（权重 0.7）+ Sparse 关键词检索（权重 0.3，基于 Qdrant MatchText），通过 Reciprocal Rank Fusion (RRF, k=60) 融合两路结果。
+Dense 向量检索（权重 0.7）+ Qdrant MatchText 全文词项匹配（权重 0.3），通过 Reciprocal Rank Fusion (RRF, k=60) 融合。库内只写入 1024 维 Dense 向量，**不写入稀疏向量**；`BM25_WEIGHT` 实际是 RRF 融合权重，并非 BM25 打分。词元化优先提取设备型号与英文术语，中文按标点切成短片段；`should` 条件按 `rel_path → file_name → doc_title → section_title → header_path → parent_summary → page_content` 的优先级分配预算，保证路径字段不被无序截断。
 
-**设计考量：** Dense 检索擅长语义理解，Sparse 检索擅长精确术语匹配。融合两者提升对专业术语和稀有词的召回能力，尤其在学术论文场景中专有名词频繁出现时效果显著。
+**设计考量：** 实验室语料中「VLC 小组有哪些设备」「MSO-X 3054A 触发设置」这类问题同时依赖语义理解与精确型号/路径命中。全文词项匹配无需新增依赖或变更集合 schema，配合 `source`/`rel_path`/`parent_id` keyword 索引与 `header_path`/`parent_summary` 文本索引即可覆盖；真正的 BM25/SPLADE 稀疏向量列为后续方向。
 
 ### 4. 多查询改写 + 并行检索
 
-LLM 将用户问题改写为 `standalone_question` + `expanded_queries`，多个查询通过 `ThreadPoolExecutor` 并行检索后合并。检索结果带 TTL 缓存（5 分钟），相同查询可命中缓存避免重复检索。
+LLM 将用户问题改写为 `standalone_question` + `keywords` + `expanded_queries` + 独立的 `hyde_queries`，并结合最近对话历史消解代词。Dense 与 HyDE 分别由 `MAX_DENSE_QUERIES` / `MAX_HYDE_QUERIES` 限流，多个查询通过 `ThreadPoolExecutor` 并行检索后按相似度分数归并。检索结果带 TTL 缓存（5 分钟），缓存键含用户、路由与 `RETRIEVAL_INDEX_VERSION`，相同查询可命中缓存避免重复检索。
 
 **设计考量：** 多角度查询扩展提升召回率，并行执行不增加额外延迟。TTL 缓存应对用户短时间内的重复/相似提问，有效降低 Qdrant 负载。
 
 ### 5. CrossEncoder 重排序
 
-使用 bge-reranker-v2-m3 精排（分批推理 batch_size=64 防止显存溢出），应用乘法 boost（关键词匹配 5%、标题匹配 8%），低于分数阈值（0.3）的文档被过滤，至少保留最高分的一个结果。
+使用 bge-reranker-v2-m3 精排（分批推理 batch_size=64 防止显存溢出），query 由原始问题与改写问题拼接（`RERANK_QUERY_MODE=both`），中文按 2/3 字 n-gram 计算乘法 boost（关键词 5%、标题 8%），并以 `rrf_score` 作为并列时的次级排序依据。低于分数阈值（0.3）的文档默认全部过滤（`RERANKER_ALLOW_LOW_SCORE_FALLBACK=false`），避免把低相关内容包装成假引用；需要保底时可显式打开开关。
 
 **设计考量：** CrossEncoder 的交叉注意力机制比 Bi-Encoder 有更强的相关性判断能力，作为精排阶段使用可显著提升最终结果质量。分批推理策略防止大量候选文档导致 GPU OOM。
 
@@ -188,7 +188,9 @@ context ≈ 2000 tokens + history 1500 tokens + prompt 250 tokens + question 100
 
 ### 9. HyDE 查询扩展
 
-对于复杂或模糊的查询，LLM 先生成一段假设性回答文本，将该文本作为额外的检索 query 参与 Dense 检索。假设文档与真实文档在向量空间中更接近，有效提升语义模糊查询的召回率（+5-8%）。通过配置 `ENABLE_HYDE` 开关控制。
+对于复杂或模糊的查询，LLM 先生成一段假设性回答文本，将该文本作为额外的检索 query 参与 Dense 检索。假设文档与真实文档在向量空间中更接近，有效提升语义模糊查询的召回率。通过 `ENABLE_HYDE` 与 `MAX_HYDE_QUERIES` 控制。
+
+**v3.1.0 修正：** 旧实现把 HyDE 片段追加到 `queries` 后又执行 `queries[:5]`，假设文档实际从未参与检索；现在 `hyde_queries` 作为独立返回字段与 `expanded_queries` 分开计数，由 `MAX_DENSE_QUERIES` / `MAX_HYDE_QUERIES` 分别限流。
 
 **设计考量：** 当用户查询过于抽象或口语化时，直接向量化的查询与文档向量可能距离较远。HyDE 通过 LLM 生成的假设文档作为"桥梁"，拉近查询与目标文档在向量空间中的距离。
 
@@ -204,10 +206,12 @@ context ≈ 2000 tokens + history 1500 tokens + prompt 250 tokens + question 100
 
 ### Contextual Retrieval（上下文增强检索）
 
-子块在 Embedding 之前自动注入文档标题和所属章节路径作为上下文前缀，增强向量的语义丰富度，提升跨文档检索的区分能力。
+子块在 Embedding 之前自动注入文档标题、目录层级、章节路径与段落摘要作为上下文前缀，增强向量的语义丰富度，尤其用于区分不同设备目录下的同名手册。
 
 **实现细节：**
-- 每个子块在向量化前自动拼接前缀：`[文档标题] > [章节路径] | [子块原文]`
+- 每个子块在向量化前自动拼接前缀：`【文档：文件名 > 路径：小组 > 设备 > Manuals > 章节：标题层级 > 段落摘要：按句截断】\n[子块原文]`，由 `ENABLE_PATH_CONTEXT_PREFIX` 控制路径段
+- 无章节路径的短规范文档才单独写 `标题：`，避免与 `header_path` 重复
+- `summary_status` 写入 payload，便于判别摘要降级状态；前缀不参与质量过滤判定
 - HNSW 索引参数优化为 `m=32, ef_construct=200`（Qdrant 默认 16/100），提升近邻搜索精度
 - 上下文前缀不参与文本展示，仅用于向量化阶段，保证检索精度的同时不影响最终呈现
 
@@ -309,16 +313,51 @@ context ≈ 2000 tokens + history 1500 tokens + prompt 250 tokens + question 100
 ### 当前限制
 
 - **文档格式受限**：仅支持 Markdown 格式文档入库，PDF/Word/PPT 需先通过 `scripts/convert_to_md.sh` 转换
-- **稀疏检索实现**：基于 Qdrant MatchText（需确保字段有文本索引），非标准 BM25 实现，对长文档的词频统计不够精确
+- **全文词项匹配非 BM25**：基于 Qdrant MatchText 布尔匹配 + scroll 顺序，无词频/IDF 打分；RRF 中该路排名不等于相关性排序
 - **单机部署**：未做高可用，vLLM / Qdrant / Flask 均为单实例部署
-- **查询路由准确性**：依赖规则 + LLM 两级判断，复杂意图（如混合知识检索+文件浏览）可能误判
-- **历史对话利用有限**：历史对话仅参与 LLM 生成阶段的 prompt 构建，未参与检索阶段的查询改写
+- **查询路由准确性**：依赖规则 + LLM 两级判断；A2X/VLC/VLP 小组缩写已做别名归一，但设备型号别名未建静态词典（由关键词词元化检索兜底）
+- **检索缓存范围**：缓存键已含用户、路由与 `RETRIEVAL_INDEX_VERSION`，覆盖 Dense + 全文词项 + RRF 结果；重排与父块展开仍每次执行，以保证分数与当前问题一致
+- **增量入库的挂载点依赖**：`source` 仍使用绝对路径，挂载点或目录重命名会让 ID 整体变化；重建前必须确认 `DOCS_PATH` 已挂载且包含真实语料
+
+### 本版（v3.3.0）配置化与语料驱动匹配
+
+上一版把「论文变量格式表」这一具体问题的识别词表、固定检索计划、整段答案模板、加分条件，以及路由四张词表、目录意图词表、表格恢复模板、静态小组别名全部内联在 `rag_agent.py`/`ingest.py` 里。这类定制化一旦语料变化就要改代码，也无法泛化到新设备/新小组。本轮按「配置化保留」重构：
+
+- **规则与语料解耦**：`config/retrieval_lexicon.json` 是可版本控制的规则（词表/模板/正则/答案模板），`data/corpus_lexicon.json` 是由 `scripts/build_corpus_lexicon.py` 从 86 份 md 的 `rel_path` 离线生成的派生数据（小组别名、设备型号、手册类型、语料指纹）。二者分别加载，避免把语料路径写进规则文件。
+- **统一词典层**：`src/lab_rag/lexicon.py` 提供单次加载、进程内缓存、启动期 schema fail-fast 与缺失降级。能力由 `ENABLE_NOTATION_SPECIALIZATION` / `ENABLE_CORPUS_LEXICON` 开关控制，可关闭特判以验证通用检索 + LLM 的兜底能力。
+- **输出等价性保障**：外置后 `is_notation_format_question`、`build_notation_retrieval_plan`、`build_grounded_notation_answer`、`extract_catalog_content_intent`、`rule_based_route`、表格恢复与过滤豁免逐值等价；`scripts/check_page_content_hash.py` 比对 86 份语料 `clean_text` 的 SHA-256，证实 `page_content` 逐字一致，因此**本轮零重建**（`RETRIEVAL_INDEX_VERSION` 维持 2）。
+- **泛化匹配**：小组别名改由语料词典查询（按长度降序，词典缺失回退静态别名）；`_evidence_terms` 覆盖复合型号、数字带字母后缀（843-R）与纯英文术语；新增 `reorder_final_docs_by_evidence`，仅在 rerank 分数差 ≤ `EVIDENCE_RERANK_WEIGHT` 的并列组内用型号/路径精确命中打破并列。诊断依据是 Top-1 与 Top-2 分数差 p50 仅 0.005（48/52 ≤0.12），同设备等价手册几乎同分，排序实由并列规则决定。该重排**不改文档集合与内容**，只在组内稳定换序，`build_context` 的 `[来源N]` 与 `build_citations` 的 `index` 仍严格对齐。
+- **评估口径不放松**：主集扩到 131 条、独立留出集 24 条；新增 `equivalent_hit` 仅作诊断次指标，主命中率仍用严格口径以维持与基线可比；分布均衡、留出集泛化差距、逐 id 退化清单与机器可读门槛 `config/iteration_criteria.json` 均写入每轮报告。
+
+**设计取舍**：不去删除特判能力（用户要求配置化保留），也不把测试语义耦合进 `ask_stream`；答案模板用无冲突 token 占位符渲染，避免 LaTeX 花括号与 `str.format` 冲突；`scripts/auto_ingest.sh` 本轮不改动，重建只在 `page_content` 哈希变化时才触发。
+
+### 本版（v3.2.0）已解决：诊断驱动的检索优化
+
+以 63 条测试集（`tests/rag_perf_queries.json`）与 `scripts/run_rag_perf.py` 建立质量可观测性后，按证据分层修复：
+
+- **覆盖率不是命中率**：旧评估只输出 `coverage=high`（基于 rerank 分数 max/avg）与路由准确率，36 条全 high 无法证明引用命中真实来源。新增 grounding 命中、Top-1 命中、召回父块数、拒答正确率与引用来源明细。
+- **目录枚举重复 IO 与噪声**：`find_best_matching_dirs` 与 `list_fs_entries_by_keyword` 各自对网络盘全盘 `os.walk`，是 file_list 25.9s / hybrid 32.3s 的主因；且 `.svn/pristine/a2` 会被 `A2X小组` 误命中。改为单次遍历快照 + TTL 缓存并排除版本控制目录，离线回归验证返回结构与排序严格等价。实测 file_list -67%、hybrid -52%。
+- **hybrid 16 路同义 Dense 往返**：目录驱动查询为「同一 intent + 不同设备路径」，信息增量低。改为归一化去重、按问题相关性排序并由 `MAX_HYBRID_QUERIES` 限流；完整设备清单仍由目录枚举答案区块直接注入，可追溯性不变。
+- **单一长手册垄断父块**：`843-R-USB-User-Manual` 一份文档曾贡献 17/20 个子块、占据父块榜前 14 名，叠加 3000 字符预算使正确文档（排 35 名后）永远无法入 prompt。改为父块展开预算与上下文预算解耦 + `PARENT_MAX_PER_SOURCE` 来源配额，召回父块数由 2 提升到 7~13。
+- **纯英文型号词元化缺陷**：`N9322C` 被旧正则整个丢弃、`EDU36311A` 截成 `EDU36311`。补齐复合型号、字母数字混合型号与数字带字母后缀三类形态。
+- **域外问题假引用**：reranker 对天气/K8s/Django 也给出 0.75~0.8 分，`assess_coverage` 判 high 并生成引用。新增可答性闸门，仅用文档身份类字段（排除生成式摘要）判断关键词是否有证据，配合 Top-1 分数下限；拒答正确率 2/5 → 5/5，基线 52 个有答案案例零误伤。
+- **OCR 噪声放大**：OCR 残缺目录页的 U+FFFD 点线被表格语义转写逐行复制，替换符 1967 → 6031。跳过高替换符占比的行，正常表格转写不变（此项改变 `page_content`，需全量重建并把 `RETRIEVAL_INDEX_VERSION` 递增到 2）。
+
+**设计取舍**：质量诊断放在评估脚本而非生产代码，避免把测试语义耦合进 `ask_stream`；A 类时延优化要求回答语义等价，故仅消除重复 IO 与冗余往返；B/C 类改动均有配置开关与离线回归；所有优化不改 SSE 事件字段、`/api/health` 结构与 `[DONE]` 唯一注入。
+
+### 本版（v3.1.0）已解决
+
+- HyDE 假设文档从未参与检索、`keywords` 恒为空导致全文词项检索只用整句、表格配置项读入 cfg 却被函数直接 `os.getenv` 绕过
+- Dense 排名依赖并发完成顺序、RRF 分数被重排完全丢弃、去重键两处不一致
+- 相同父文本导致子块 ID 冲突、索引创建失败被静默吞掉、加载异常被吞导致静默缺文档
+- 过滤用带前缀文本误杀表格/型号块、父块纯字符截断腰斩表格、代码块内 `#` 被误判标题
+- 路径层级未进入向量化前缀（不同设备同名手册不可区分）、覆盖度与引用脱节、低分保底造成假引用、降级路径无组件标记
 
 ### 后续优化方向
 
-- **更多文档格式支持**：优化 `scripts/convert_to_md.sh` 转换质量，或支持 PDF/Word 直接入库（结合 layout 解析）
-- **真正的稀疏向量**：引入 BM25 或 SPLADE 稀疏向量替代 MatchText，提升关键词检索精度
-- **多轮对话感知改写**：将历史对话引入查询改写阶段，解决代词指代和上下文依赖问题
+- **真正的稀疏向量**：引入 BM25 / SPLADE 或 bge-m3 lexical weights 替代 MatchText（需新增依赖并变更集合 schema）
+- **路由词典动态化**：从 `rel_path` 离线生成「小组 ↔ 设备型号 ↔ 手册类型」词典，替代静态小组别名
+- **缓存重排结果**：在保证 metadata 不被就地修改的前提下缓存 rerank + 父块展开结果，进一步降低 GPU 与 Qdrant 开销
+- **source 相对化**：改用 `rel_path` 作为确定性 ID 种子，避免挂载点变化产生整批孤儿数据
 - **用户反馈机制**：引入点赞/点踩反馈，收集用户评价数据持续优化检索和生成质量
 - **高可用部署**：多节点部署方案，vLLM 多副本 + 负载均衡，Qdrant 集群模式
-- **增量索引优化**：支持文档级别的增量更新（删除旧块+写入新块），而非仅追加模式

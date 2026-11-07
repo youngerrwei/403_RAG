@@ -6,12 +6,12 @@ import time
 import fcntl
 import shutil
 import hashlib
-import copy
 import threading
 import traceback
 import tempfile
 import urllib.error
 import urllib.request
+import unicodedata
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
@@ -30,8 +30,13 @@ from sentence_transformers import CrossEncoder
 
 from .logger import get_logger
 from .paths import PROJECT_ROOT
-from .document_structure import evidence_window, strip_ingest_prefix, markdown_tables
-from .lexical_retrieval import search_lexical_candidates
+from . import lexicon
+
+try:
+    # origin/main 带入的可选增强通道；模块不可用时不影响 3.4.0 主检索
+    from .lexical_retrieval import search_lexical_candidates as _search_lexical_candidates
+except Exception:  # pragma: no cover
+    _search_lexical_candidates = None
 
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -302,55 +307,80 @@ def batch_get_parents(client, collection_name: str, parent_ids: list) -> dict:
             pid = payload.get("parent_id")
             content = payload.get("parent_content", "")
             if pid and content:
-                # 返回包含 content 和 summary 的字典
+                # 返回内容、摘要与路径层级，供上下文组装标注来源
                 result[pid] = {
                     "content": content,
                     "summary": sanitize_summary(payload.get("parent_summary", "")),
+                    "header_path": payload.get("header_path", ""),
+                    "source_label": payload.get("parent_source_label", ""),
+                    "rel_path": payload.get("rel_path", ""),
                 }
     except Exception as e:
-        debug_log(f"[WARN] 批量获取父块失败: {e}")
+        debug_log(f"[DEGRADED][parent-collection] 批量获取父块失败: {e}")
     return result
 
 
-def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = None, qdrant_client=None) -> List[Document]:
-    """子块展开为父块，带长度控制"""
-    if top_k is None:
-        top_k = int(cfg.get("FINAL_TOP_K", "16"))
-    max_context_chars = int(cfg.get("MAX_CONTEXT_CHARS", 12000))
+def _truncate_at_boundary(text: str, limit: int) -> str:
+    """按段落/换行边界截断，避免把表格行或型号参数从中间切断。"""
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    boundary = max(window.rfind("\n\n"), window.rfind("\n"))
+    if boundary >= limit // 2:
+        return window[:boundary].rstrip()
+    return window.rstrip()
 
-    # 收集需要的 parent_ids
+
+def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = None, qdrant_client=None) -> List[Document]:
+    """子块展开为父块，按行/表格边界截断并保留命中子块的分数证据。"""
+    cfg = cfg or {}
+    if top_k is None:
+        top_k = int(cfg.get("FINAL_TOP_K", 16))
+    # 父块展开预算与最终上下文预算分离：前者需容纳多个来源的候选，
+    # 后者由 build_context 控制入 prompt 的字符数，两者不必相同。
+    max_context_chars = int(cfg.get("PARENT_EXPAND_MAX_CHARS", 9000))
+    # 同一来源文件最多保留的父块数，避免单一长手册垄断候选榜
+    max_per_source = max(1, int(cfg.get("PARENT_MAX_PER_SOURCE", 3)))
+
+    # 收集 parent_id、最佳子块，以及同一父块下所有命中子块的分数
     needed_parent_ids = set()
     best_children = {}
+    child_scores_by_parent = {}
     for child in child_docs:
         pid = child.metadata.get("parent_id")
-        score = child.metadata.get("rerank_score", 0)
-        key = (child.metadata.get("rel_path") or child.metadata.get("source", ""), pid) if pid else retrieval_doc_key(child)
-        if key not in best_children or score > best_children[key][1]:
-            best_children[key] = (child, score)
-            if pid:
-                needed_parent_ids.add(pid)
+        if not pid:
+            continue
+        score = float(child.metadata.get("rerank_score", 0) or 0)
+        child_scores_by_parent.setdefault(pid, []).append(score)
+        if pid not in best_children or score > best_children[pid][1]:
+            best_children[pid] = (child, score)
+            needed_parent_ids.add(pid)
 
-    # 批量从 parent collection 获取父块内容及摘要（带降级策略）
+    # 批量从 parent collection 获取父块内容、摘要与路径层级（带降级策略）
     parent_contents = {}
     parent_summaries = {}
+    parent_extras = {}
     if qdrant_client and needed_parent_ids:
         parent_collection = cfg.get("QDRANT_PARENT_COLLECTION", "lab_knowledge_base_parents")
         try:
             parent_data = batch_get_parents(qdrant_client, parent_collection, list(needed_parent_ids))
-            # 解析新的返回结构，分别获取 content 和 summary
             for pid, data in parent_data.items():
                 if isinstance(data, dict):
                     parent_contents[pid] = data.get("content", "")
                     parent_summaries[pid] = sanitize_summary(data.get("summary", ""))
+                    parent_extras[pid] = {
+                        "header_path": data.get("header_path", ""),
+                        "parent_source_label": data.get("source_label", ""),
+                        "rel_path": data.get("rel_path", ""),
+                    }
                 else:
                     # 向后兼容旧格式（直接是字符串）
                     parent_contents[pid] = data
             debug_log(f"从 parent collection 获取到 {len(parent_contents)}/{len(needed_parent_ids)} 个父块")
         except Exception as e:
-            debug_log(f"[WARNING] parent collection 查询失败: {e}，降级使用子块")
+            debug_log(f"[DEGRADED][parent-collection] 查询失败，降级使用子块 metadata: {e}")
             parent_contents = {}
             parent_summaries = {}
-            # 降级：使用 child metadata 中的 parent_content 和 parent_summary
             for child in child_docs:
                 pid = child.metadata.get("parent_id")
                 if pid:
@@ -358,60 +388,67 @@ def expand_to_parent_docs(child_docs: List[Document], cfg: dict, top_k: int = No
                         parent_contents[pid] = child.metadata.get("parent_content", "")
                     parent_summaries[pid] = sanitize_summary(child.metadata.get("parent_summary", ""))
 
-    # 按 rerank_score 排序
     sorted_children = sorted(best_children.values(), key=lambda x: x[1], reverse=True)
 
     parent_docs = []
+    seen_parent_ids = set()
+    source_counts = {}
     accumulated_length = 0
 
     for child, score in sorted_children:
         parent_id = child.metadata.get("parent_id")
-
-        # 优先从 parent collection 获取，降级从子块 metadata 读取（向后兼容）
-        parent_content = parent_contents.get(parent_id, "") or child.metadata.get("parent_content", "")
-        # 获取父块摘要
-        parent_summary = parent_summaries.get(parent_id, "") or sanitize_summary(child.metadata.get("parent_summary", ""))
-
-        # 最终降级：如果父块内容仍为空（旧数据无 parent_content），使用子块内容兜底
-        if not parent_content:
-            parent_content = child.page_content
-            debug_log(f"[WARN] parent_id={parent_id} 无父块内容，降级使用子块内容兜底")
-
-        # [FIX] 单个 parent_content 字段级截断，防止异常大文档占用整个 context 预算
-        max_single_content = max_context_chars // 2  # 单个文档最多占一半预算
-        if len(parent_content) > max_single_content:
-            parent_content = evidence_window(parent_content, child.page_content, max_single_content)
-            debug_log(f"[WARN] parent_content 过大，已截断至 {max_single_content} 字符")
-
-        if not parent_content.strip():
-            debug_log("[WARN] 命中结构无法在上下文预算内完整呈现，跳过该父块")
+        if not parent_id or parent_id in seen_parent_ids:
+            continue
+        # 来源配额：同一文件的父块已被优先高分块占满时，把名额让给其他文档
+        source_key = (child.metadata.get("source") or child.metadata.get("rel_path")
+                      or child.metadata.get("file_name") or "").lower()
+        if source_key and source_counts.get(source_key, 0) >= max_per_source:
             continue
 
-        # 长度控制：预估加入该父块后是否超限
+        parent_content = parent_contents.get(parent_id, "") or child.metadata.get("parent_content", "")
+        parent_summary = parent_summaries.get(parent_id, "") or sanitize_summary(
+            child.metadata.get("parent_summary", "")
+        )
+
+        # 最终降级：旧数据无 parent_content 时使用子块内容兜底
+        if not parent_content:
+            parent_content = child.page_content
+            debug_log(f"[DEGRADED][parent-collection] parent_id={parent_id} 无父块内容，使用子块兜底")
+
+        # 单个父块独立限长（不再随总预算折半放大）；按行边界截断，避免腰斩表格行与参数表
+        max_single_content = int(cfg.get("PARENT_MAX_SINGLE_CHARS", 1500))
+        if len(parent_content) > max_single_content:
+            parent_content = _truncate_at_boundary(parent_content, max_single_content)
+            debug_log(f"[WARN] parent_content 过大，已按行边界截断至 {len(parent_content)} 字符")
+
         content_length = len(parent_content)
         if accumulated_length + content_length > max_context_chars and parent_docs:
             debug_log(f"上下文长度控制: 已达 {accumulated_length} 字符, 停止展开")
             break
 
-        # 构建父文档，确保 parent_summary 被正确设置到 metadata
         parent_meta = {k: v for k, v in child.metadata.items() if k != "parent_content"}
         parent_meta["is_parent"] = True
-        parent_meta["matched_child_content"] = strip_ingest_prefix(child.page_content)
         if parent_summary:
             parent_meta["parent_summary"] = parent_summary
+        # 父集合的章节路径/出处优先于子块 metadata，保证引用准确
+        for key, value in parent_extras.get(parent_id, {}).items():
+            if value:
+                parent_meta[key] = value
+        parent_meta["child_scores"] = sorted(
+            child_scores_by_parent.get(parent_id, []), reverse=True
+        )[:5]
 
-        parent_doc = Document(
-            page_content=parent_content,
-            metadata=parent_meta
-        )
-
-        parent_docs.append(parent_doc)
+        parent_docs.append(Document(page_content=parent_content, metadata=parent_meta))
+        seen_parent_ids.add(parent_id)
+        if source_key:
+            source_counts[source_key] = source_counts.get(source_key, 0) + 1
         accumulated_length += content_length
 
         if len(parent_docs) >= top_k:
             break
 
-    debug_log(f"父块展开: {len(child_docs)} 子块 → {len(parent_docs)} 父块 (总长={accumulated_length})")
+    debug_log(f"父块展开: {len(child_docs)} 子块 → {len(parent_docs)} 父块 "
+              f"(来源数={len(source_counts)} 总长={accumulated_length} 配额={max_per_source})")
     return parent_docs
 
 
@@ -491,6 +528,74 @@ class TTLCache:
 
 # 模块级缓存实例
 _retrieval_cache = TTLCache(maxsize=128, ttl=300)
+# 目录树快照缓存：value 为 (timestamp, snapshot)，实际 TTL 由 CATALOG_SNAPSHOT_TTL 在读取时判定
+_catalog_snapshot_cache = TTLCache(maxsize=8, ttl=86400)
+
+# 目录树快照的遍历上限（目录数）；配置化后默认大幅提高以覆盖完整语料目录树，
+# 否则大共享盘下靠后的目录（如 设备操作指南/VLP小组）不会被纳入快照，
+# 导致 file_list / hybrid 的目录枚举错配到名称子串相近的噪声路径。
+_CATALOG_MAX_TRAVERSAL = 200000
+_CATALOG_EXCLUDED_DIRS = {".svn", ".git", ".hg", ".bzr", "__pycache__", "node_modules"}
+
+
+def _is_excluded_catalog_dir(name: str) -> bool:
+    return name in _CATALOG_EXCLUDED_DIRS or name.startswith(".")
+
+
+def _build_catalog_snapshot(root_dir: str, exclude_hidden: bool = True, cfg: dict = None) -> list:
+    """单次 os.walk 产出目录树快照。
+
+    元素为 (kind, name, rel_path)，顺序与原先两次独立遍历一致：每个目录下先子目录后文件。
+    排除 .svn/.git 等版本控制目录后不再递归，既消除噪声也大幅减少网络盘 IO。
+    traversal 上限由 `CATALOG_MAX_TRAVERSAL` 控制（默认大幅提高以覆盖完整语料目录树）。
+    """
+    max_traversal = int((cfg or {}).get("CATALOG_MAX_TRAVERSAL", _CATALOG_MAX_TRAVERSAL))
+    entries = []
+    traversal_count = 0
+    for current_root, dirs, files in os.walk(root_dir, followlinks=False):
+        traversal_count += 1
+        if traversal_count > max_traversal:
+            debug_log(f"[WARN] 目录遍历超过 {max_traversal} 限制，停止遍历（请调大 CATALOG_MAX_TRAVERSAL）")
+            break
+        if exclude_hidden:
+            dirs[:] = [d for d in dirs if not _is_excluded_catalog_dir(d)]
+        rel_current = os.path.relpath(current_root, root_dir)
+        if rel_current == ".":
+            rel_current = ""
+        for d in dirs:
+            rel_path = path_to_unix(os.path.join(rel_current, d) if rel_current else d)
+            entries.append(("directory", d, rel_path))
+        for f in files:
+            if exclude_hidden and f.startswith("."):
+                continue
+            rel_path = path_to_unix(os.path.join(rel_current, f) if rel_current else f)
+            entries.append(("file", f, rel_path))
+    debug_log(f"[CATALOG] snapshot built entries={len(entries)} traversal={traversal_count}")
+    return entries
+
+
+def _get_catalog_snapshot(root_dir: str, cfg: dict = None) -> list:
+    """取目录树快照；缓存键纳入根目录、索引版本与排除开关，TTL 由配置控制。"""
+    cfg = cfg or {}
+    enabled = bool(cfg.get("ENABLE_CATALOG_SNAPSHOT_CACHE", True))
+    ttl = max(0, int(cfg.get("CATALOG_SNAPSHOT_TTL", 300)))
+    exclude = bool(cfg.get("CATALOG_EXCLUDE_HIDDEN_DIRS", True))
+    version = str(cfg.get("RETRIEVAL_INDEX_VERSION", "1"))
+    key = hashlib.md5(f"{root_dir}|{version}|{exclude}".encode()).hexdigest()
+
+    if enabled:
+        cached = _catalog_snapshot_cache.get(key)
+        if cached is not None:
+            ts, snapshot = cached
+            if time.time() - ts < ttl:
+                debug_log(f"[CATALOG][CACHE HIT] root={root_dir} entries={len(snapshot)}")
+                return snapshot
+
+    with Timer("build_catalog_snapshot"):
+        snapshot = _build_catalog_snapshot(root_dir, exclude, cfg=cfg)
+    if enabled:
+        _catalog_snapshot_cache.set(key, (time.time(), snapshot))
+    return snapshot
 
 
 def load_config() -> dict:
@@ -525,12 +630,19 @@ def load_config() -> dict:
         "FILE_SEARCH_LIMIT": int(os.getenv("FILE_SEARCH_LIMIT", "200")),
         "CATALOG_SCAN_LIMIT": int(os.getenv("CATALOG_SCAN_LIMIT", "20000")),
         "DIRECTORY_CHILD_LIMIT": int(os.getenv("DIRECTORY_CHILD_LIMIT", "200")),
+        # 目录树单次遍历快照：消除 catalog 每次请求两次全盘 os.walk 的 IO
+        "ENABLE_CATALOG_SNAPSHOT_CACHE": os.getenv("ENABLE_CATALOG_SNAPSHOT_CACHE", "true").lower() == "true",
+        "CATALOG_SNAPSHOT_TTL": int(os.getenv("CATALOG_SNAPSHOT_TTL", "300")),
+        # 排除 .svn/.git 等版本控制与隐藏目录，避免路径匹配把噪声目录当成设备
+        "CATALOG_EXCLUDE_HIDDEN_DIRS": os.getenv("CATALOG_EXCLUDE_HIDDEN_DIRS", "true").lower() == "true",
+        # 目录树快照遍历上限（目录数）；默认大幅提高以覆盖完整语料目录树，避免靠后
+        # 目录（如 设备操作指南/VLP小组）缺失导致 file_list / hybrid 目录枚举错配
+        "CATALOG_MAX_TRAVERSAL": int(os.getenv("CATALOG_MAX_TRAVERSAL", "200000")),
+        # hybrid 目录驱动查询去重后的最大路数（完整设备清单仍由目录枚举结果提供）
+        "MAX_HYBRID_QUERIES": int(os.getenv("MAX_HYBRID_QUERIES", "8")),
 
         "ENABLE_HYBRID_SEARCH": os.getenv("ENABLE_HYBRID_SEARCH", "true").lower() == "true",
         "BM25_WEIGHT": float(os.getenv("BM25_WEIGHT", "0.3")),
-        "SPARSE_CANDIDATE_LIMIT": int(os.getenv("SPARSE_CANDIDATE_LIMIT", "256")),
-        "SPARSE_MAX_TERMS": int(os.getenv("SPARSE_MAX_TERMS", "8")),
-        "SPARSE_TIMEOUT": float(os.getenv("SPARSE_TIMEOUT", "10")),
         "DENSE_WEIGHT": float(os.getenv("DENSE_WEIGHT", "0.7")),
 
         "MAX_CONTEXT_CHARS": int(os.getenv("MAX_CONTEXT_CHARS", "3000")),
@@ -543,10 +655,50 @@ def load_config() -> dict:
         "KEYWORD_BOOST": float(os.getenv("KEYWORD_BOOST", "1.05")),
         "TITLE_BOOST": float(os.getenv("TITLE_BOOST", "1.08")),
 
-        "ENABLE_HYDE": os.getenv("ENABLE_HYDE", "false").lower() == "true",
+        "ENABLE_HYDE": os.getenv("ENABLE_HYDE", "true").lower() == "true",
         "HYBRID_FILE_CONTEXT_BUDGET": int(os.getenv("HYBRID_FILE_CONTEXT_BUDGET", "1500")),
         "HEALTHCHECK_TIMEOUT": float(os.getenv("HEALTHCHECK_TIMEOUT", "3")),
         "RUNTIME_RETRY_INTERVAL": float(os.getenv("RUNTIME_RETRY_INTERVAL", "30")),
+
+        # 多路检索预算：Dense 与 HyDE 分开计数，避免 queries[:5] 截掉假设文档
+        "MAX_DENSE_QUERIES": int(os.getenv("MAX_DENSE_QUERIES", "4")),
+        "MAX_HYDE_QUERIES": int(os.getenv("MAX_HYDE_QUERIES", "2")),
+        "MAX_SPARSE_CONDITIONS": int(os.getenv("MAX_SPARSE_CONDITIONS", "30")),
+        "ENABLE_HISTORY_AWARE_REWRITE": os.getenv("ENABLE_HISTORY_AWARE_REWRITE", "true").lower() == "true",
+        # 索引版本参与缓存键；入库逻辑变更后递增即可失效旧缓存
+        "RETRIEVAL_INDEX_VERSION": os.getenv("RETRIEVAL_INDEX_VERSION", "2"),
+        # 覆盖度阈值与重排分数同口径，集中到配置避免散落硬编码
+        "COVERAGE_HIGH_THRESHOLD": float(os.getenv("COVERAGE_HIGH_THRESHOLD", "0.7")),
+        "COVERAGE_MEDIUM_THRESHOLD": float(os.getenv("COVERAGE_MEDIUM_THRESHOLD", "0.5")),
+        "COVERAGE_LOW_THRESHOLD": float(os.getenv("COVERAGE_LOW_THRESHOLD", "0.3")),
+        "RERANK_QUERY_MODE": os.getenv("RERANK_QUERY_MODE", "both"),
+        "RERANKER_ALLOW_LOW_SCORE_FALLBACK": os.getenv("RERANKER_ALLOW_LOW_SCORE_FALLBACK", "false").lower() == "true",
+        # 重排过滤策略：绝对阈值 + 相对 Top-1 比例 + 保底条数（后两项默认关闭，保持既有行为）
+        "RERANKER_RELATIVE_RATIO": float(os.getenv("RERANKER_RELATIVE_RATIO", "0")),
+        "RERANKER_MIN_KEEP": int(os.getenv("RERANKER_MIN_KEEP", "0")),
+        # 拒答闸门：最终父块中关键词零命中且 Top-1 分数偏低时判为知识库无答案
+        "ENABLE_ANSWERABILITY_GATE": os.getenv("ENABLE_ANSWERABILITY_GATE", "true").lower() == "true",
+        "ANSWERABILITY_TOP_SCORE_FLOOR": float(os.getenv("ANSWERABILITY_TOP_SCORE_FLOOR", "0.90")),
+        "ANSWERABILITY_MIN_KEYWORD_HITS": int(os.getenv("ANSWERABILITY_MIN_KEYWORD_HITS", "1")),
+        "ANSWERABILITY_MIN_OVERLAP_HITS": int(os.getenv("ANSWERABILITY_MIN_OVERLAP_HITS", "2")),
+        # 上下文前检索词元预算（型号词元化修复后需略放大）
+        "MAX_SPARSE_TERMS": int(os.getenv("MAX_SPARSE_TERMS", "12")),
+        # 父块展开：预算与最终上下文解耦，并限制单一来源垄断候选
+        "PARENT_EXPAND_MAX_CHARS": int(os.getenv("PARENT_EXPAND_MAX_CHARS", "9000")),
+        "PARENT_MAX_SINGLE_CHARS": int(os.getenv("PARENT_MAX_SINGLE_CHARS", "1500")),
+        "PARENT_MAX_PER_SOURCE": int(os.getenv("PARENT_MAX_PER_SOURCE", "3")),
+        "NOTATION_MATCH_BONUS": float(os.getenv("NOTATION_MATCH_BONUS", "0.15")),
+        "ENABLE_CONTEXT_NOISE_FILTER": os.getenv("ENABLE_CONTEXT_NOISE_FILTER", "true").lower() == "true",
+        # v3.3.0 配置化检索规则与语料驱动词典
+        "LEXICON_PATH": os.getenv("LEXICON_PATH", "config/retrieval_lexicon.json").strip(),
+        "CORPUS_LEXICON_PATH": os.getenv("CORPUS_LEXICON_PATH", "data/corpus_lexicon.json").strip(),
+        "ENABLE_CORPUS_LEXICON": os.getenv("ENABLE_CORPUS_LEXICON", "true").lower() == "true",
+        "ENABLE_NOTATION_SPECIALIZATION": os.getenv("ENABLE_NOTATION_SPECIALIZATION", "true").lower() == "true",
+        "ENABLE_EVIDENCE_RERANK": os.getenv("ENABLE_EVIDENCE_RERANK", "true").lower() == "true",
+        "EVIDENCE_RERANK_WEIGHT": float(os.getenv("EVIDENCE_RERANK_WEIGHT", "0.12")),
+        # 强证据先验：日期/文档标题词元/型号精确命中身份字段时的加性加分（封顶）
+        "EVIDENCE_PRIOR_WEIGHT": float(os.getenv("EVIDENCE_PRIOR_WEIGHT", "0.12")),
+        "EVIDENCE_PRIOR_CAP": float(os.getenv("EVIDENCE_PRIOR_CAP", "0.24")),
 
         # 本机 MCP 旁路配置；Token 为空表示内部接口禁用。
         "MCP_CONDA_ENV": os.getenv("MCP_CONDA_ENV", "rag-mcp"),
@@ -556,6 +708,12 @@ def load_config() -> dict:
         "MCP_QUERY_MAX_CHARS": int(os.getenv("MCP_QUERY_MAX_CHARS", "4000")),
         "MCP_RESULT_LIMIT": int(os.getenv("MCP_RESULT_LIMIT", "6")),
         "MCP_RESULT_MAX_CHARS": int(os.getenv("MCP_RESULT_MAX_CHARS", "1500")),
+
+        # 可选增强：有界全文候选召回（origin lexical_retrieval 通道），默认关闭
+        "ENABLE_LEXICAL_RETRIEVAL": _env_bool("ENABLE_LEXICAL_RETRIEVAL", "false"),
+        "LEXICAL_CANDIDATE_LIMIT": int(os.getenv("LEXICAL_CANDIDATE_LIMIT", "256")),
+        "LEXICAL_MAX_TERMS": int(os.getenv("LEXICAL_MAX_TERMS", "8")),
+        "LEXICAL_TIMEOUT": float(os.getenv("LEXICAL_TIMEOUT", "10")),
 
     }
     # 配置验证
@@ -927,7 +1085,7 @@ def clean_retrieval_display_text(text: str) -> str:
         return ""
 
     raw = text
-    has_markdown_structure = bool(re.search(r"(?m)^\s*(?:#{1,6}\s+|\|.*\|\s*$|[-*+]\s+|```)", text) or markdown_tables(text))
+    has_markdown_structure = bool(re.search(r"(?m)^\s*(?:#{1,6}\s+|\|.*\|\s*$|[-*+]\s+|```)", text))
     if has_markdown_structure:
         # 表格、标题和列表必须保留换行，否则单元格关系会再次退化为扁平文本。
         text = strip_structured_prefix(text)
@@ -944,8 +1102,15 @@ def clean_retrieval_display_text(text: str) -> str:
 # =========================
 # 查询路由
 # =========================
-def extract_catalog_target(question: str) -> str:
-    """从列举型问题中提取适合目录匹配的实体，避免把完整意图句当作路径关键词。"""
+# 小组缩写归一改由语料派生词典（data/corpus_lexicon.json）驱动，
+# 词典缺失时回退 config/retrieval_lexicon.json 的静态别名；不再在代码里写死三元组。
+
+
+def extract_catalog_target(question: str, cfg: dict = None) -> str:
+    """从列举型问题中提取适合目录匹配的实体，避免把完整意图句当作路径关键词。
+
+    cfg 为可选参数，仅用于读取 ENABLE_CORPUS_LEXICON 开关；不传时沿用运行时配置。
+    """
     text = normalize_retrieval_text(question).strip()
     patterns = (
         r"([A-Za-z][A-Za-z0-9._-]{0,31}\s*小组)",
@@ -958,8 +1123,20 @@ def extract_catalog_target(question: str) -> str:
             if target:
                 return target.strip()
 
+    # 「A2X 有哪些设备」这类不带"小组"的问法归一到真实目录名。
+    # 别名来自语料派生词典，按长度降序避免短别名抢先匹配长别名。
+    if "小组" not in text:
+        upper_text = text.upper()
+        aliases = lexicon.get_group_aliases(cfg)
+        for group in sorted(aliases, key=len, reverse=True):
+            if group.upper() in upper_text:
+                resolved = aliases[group]
+                return resolved if resolved.endswith("小组") else f"{resolved}小组"
+
     prefix = re.split(r"(?:的)?(?:设备|文件|目录|资料|清单|使用规范|操作规范)", text, maxsplit=1)[0]
     prefix = re.sub(r"^(?:请问|请|关于|查询|查找|列出|介绍|我想了解)+", "", prefix).strip(" ：:，,")
+    # 去掉列举型疑问词，避免把「有哪些」等残留当成路径关键词
+    prefix = re.sub(r"(?:有哪些|有什么|列出|共有|总共有|一共有|所有的|全部的)$", "", prefix).strip()
     return prefix if len(prefix) >= 2 else text
 
 
@@ -968,23 +1145,12 @@ def rule_based_route(question: str) -> Optional[dict]:
     基于规则的快速路由。
     如果能确定意图则返回路由结果 dict，否则返回 None 表示需要 LLM 判断。
     """
-    # 去重后的关键词列表（移除被短关键词覆盖的长关键词）
-    # 包含计数/列举类关键词，使"有多少篇论文"等查询能正确路由到 file_list 或 hybrid
-    file_list_keywords = [
-        "目录", "有哪些文件", "文件夹", "子目录", "文件列表", "清单", "有什么设备", "列出",
-        "设备", "有多少", "多少篇", "几篇", "统计", "数量", "一共有", "总共有", "共有", "全部", "所有",
-    ]
-    rag_search_keywords = [
-        "原理", "步骤", "参数", "格式", "要求", "怎么写", "如何写", "写法",
-        "如何", "什么是", "解释", "说明", "方法", "教程",
-        "操作", "区别", "对比", "优缺点",
-        "规范", "使用", "论文", "实验", "公式", "算法", "仿真", "测试", "性能",
-    ]
-
-    # 歧义词需要额外条件才触发
-    ambiguous_words = {"为什么", "怎么", "什么", "哪些", "几个", "几台"}
-    # 只有当歧义词与专业词共现时才触发 RAG
-    academic_context = {"论文", "实验", "系统", "方法", "技术", "原理", "参数", "算法", "结果", "数据", "研究", "设计", "方案", "通信", "信号", "光", "水下"}
+    # 四张词表统一来自检索词典，代码只保留通用判定逻辑
+    keywords = lexicon.load_lexicon()["route_keywords"]
+    file_list_keywords = keywords["file_list"]
+    rag_search_keywords = keywords["rag_search"]
+    ambiguous_words = keywords["ambiguous"]
+    academic_context = keywords["academic_context"]
 
     hit_file = any(kw in question for kw in file_list_keywords)
     hit_rag = any(kw in question for kw in rag_search_keywords)
@@ -1035,7 +1201,7 @@ def route_query(llm, question: str) -> dict:
     - hybrid：既要目录/文件清单，又要文档内容说明
 
     边界规则：
-    - 询问某项内容的格式、写法或提交要求是在查询正文，必须选择 rag_search。
+    - “周报格式是什么”“报告怎么写”“提交要求是什么”是在询问文档内容，必须选择 rag_search。
     - 不能因为答案可能存在某个文件或模板中，就选择 file_list；只有用户明确要求列出/定位文件、目录、路径或设备清单时才选择 file_list。
 
     输出格式必须严格如下：
@@ -1100,53 +1266,98 @@ def route_query(llm, question: str) -> dict:
 # =========================
 # 查询改写
 # =========================
-def should_skip_rewrite(question: str) -> bool:
-    """判断是否可以跳过LLM改写，直接使用原始问题检索"""
-    # 仅纯关键词短语跳过改写；“是什么/怎么/如何”等短问句仍需扩展检索表达。
-    pronouns = ("它", "这个", "那个", "上面", "之前", "它们", "那些", "其中", "后者", "前者", "刚才")
+def is_notation_format_question(question: str, cfg: dict = None) -> bool:
+    """识别排版规范问题；词表来自检索词典，能力由 ENABLE_NOTATION_SPECIALIZATION 控制。"""
+    cfg = cfg if cfg is not None else {}
+    if not bool(cfg.get("ENABLE_NOTATION_SPECIALIZATION", True)):
+        return False
+    notation = lexicon.load_lexicon()["notation"]
+    if not bool(notation.get("enabled", True)):
+        return False
+    has_object = any(term in question for term in notation["object_terms"])
+    has_format = any(term in question for term in notation["format_terms"])
+    return has_object and has_format and any(term in question for term in notation["context_terms"])
+
+
+def build_notation_retrieval_plan() -> Dict[str, object]:
+    """返回词典中的确定性检索计划，避免 HyDE 引入通用惯例污染。"""
+    return dict(lexicon.load_lexicon()["notation"]["retrieval_plan"])
+
+
+def should_skip_rewrite(question: str, chat_history: str = "") -> bool:
+    """判断是否可以跳过 LLM 改写；有对话历史时需要改写来消解代词指代。
+
+    合并原先分散在 should_skip_rewrite / rewrite_question 里的两套跳过规则，
+    保持单参数调用的既有行为不变。
+    """
+    history = (chat_history or "").strip()
+    if history and history != "无历史对话":
+        return False
+    pronouns = ("它", "这个", "那个", "上面", "之前", "它们", "那些", "其中", "后者", "前者", "刚才", "他们", "前面")
     question_markers = ("是什么", "怎么", "如何", "为什么", "哪些", "多少", "是否", "吗", "？", "?")
+    # 纯关键词短语跳过改写；“是什么/怎么/如何”等短问句仍需扩展检索表达
     if (
             len(question) <= 8
             and not any(word in question for word in pronouns)
             and not any(marker in question for marker in question_markers)
     ):
         return True
+    # 短主题短语（≤14 字、无疑问词/代词/标点）本就是明确的检索实体，
+    # 直接 Dense + 词项检索即可，省去一次 LLM 改写往返（通用规则，非用例专用）
+    max_topic_chars = 14
+    if (
+            len(question) <= max_topic_chars
+            and not any(word in question for word in pronouns)
+            and not any(marker in question for marker in question_markers)
+            and not any(ch in question for ch in ("？", "?", "。", "，", ","))
+    ):
+        return True
+    # 长问题已包含充分上下文，无代词指代时跳过改写
+    if len(question) > 80 and not any(word in question for word in pronouns):
+        return True
     return False
 
 
-def rewrite_question(llm, question: str, cfg: dict = None) -> dict:
-    # [P0优化] 长问题（>80字符）已包含充分上下文，无代词指代时跳过改写
-    pronoun_indicators = ["这个", "那个", "它", "他们", "上面", "之前", "刚才", "前面"]
-    if len(question) > 80 and not any(p in question for p in pronoun_indicators):
-        debug_log(f"[ROUTE] 长问题跳过改写: {question[:30]}...")
+def rewrite_question(llm, question: str, cfg: dict = None, chat_history: str = "") -> dict:
+    """把问题改写为独立问题、精确关键词、Dense 查询与独立的 HyDE 查询。"""
+    cfg = cfg or {}
+    max_dense = max(1, int(cfg.get("MAX_DENSE_QUERIES", 4)))
+    max_hyde = max(0, int(cfg.get("MAX_HYDE_QUERIES", 2)))
+
+    if should_skip_rewrite(question, chat_history):
+        debug_log(f"[ROUTE] 跳过改写，直接使用原始问题: {question[:30]}...")
         return {
             "standalone_question": question,
             "keywords": [],
             "expanded_queries": [question],
+            "hyde_queries": [],
         }
 
     prompt = ChatPromptTemplate.from_template("""你是实验室知识库的检索改写专家。将用户问题改写为最优检索形式。
 
+【最近对话历史】
+{chat_history}
+
 【输出格式】严格JSON：
 {{
   "standalone_question": "补全代词和省略后的完整独立问题",
-  "keywords": ["原问题中的检索关键词"],
+  "keywords": ["精确检索词：设备型号、参数名、英文缩写、专业术语，最多6个"],
   "expanded_queries": [
     "原问题的精准改写（保留专业术语）",
-    "保留目标对象和内容意图的同义表达",
-    "不引入新事实的补充检索表达"
+    "更宽泛的上位概念查询",
+    "关键术语的同义词/缩写展开查询"
   ],
-  "hypothetical_docs": "仅在下面明确启用时生成，否则为空字符串"
+  "hypothetical_docs": "生成2-3个可能包含答案的学术文献摘要片段，每个50-80字，模拟真实文献内容，用'|||'分隔"
 }}
 
 【规则】
 1. 保留所有专业术语、设备型号、参数名、英文缩写
-2. 未提供指代对象时保留代词，不得猜测对象或擅自展开缩写
+2. 结合对话历史补全代词（这个/那个/它）为具体指代对象；历史为空时不要臆造指代对象
 3. expanded_queries 必须多样化，覆盖不同检索角度
 4. 不要解释问题，仅做改写
 5. 若问题已清晰完整，standalone_question保持原意
-6. 假设文档策略：{hyde_instruction}
-7. 禁止把猜测的设备配置、操作步骤、标准或答案写入 expanded_queries
+6. hypothetical_docs: 假设你已经知道答案，写2-3个简短的模拟文献摘要片段（每个50-80字），用"|||"分隔
+7. keywords 必须是从问题中提取的精确短词（型号/参数名/术语），不要整句
 
 用户问题：{question}""")
 
@@ -1154,11 +1365,7 @@ def rewrite_question(llm, question: str, cfg: dict = None) -> dict:
         with Timer("rewrite_question_llm"):
             result = (prompt | llm).invoke({
                 "question": question,
-                "hyde_instruction": (
-                    "已启用，可生成简短假设文档，仅用于召回，不是事实证据。"
-                    if cfg and cfg.get("ENABLE_HYDE", False)
-                    else "未启用，hypothetical_docs 必须为空字符串。"
-                ),
+                "chat_history": chat_history or "无历史对话",
             })
         debug_log("REWRITE_RAW_OUTPUT:", repr(result.content))
 
@@ -1169,43 +1376,36 @@ def rewrite_question(llm, question: str, cfg: dict = None) -> dict:
         standalone_question = data.get("standalone_question", question)
         keywords = data.get("keywords", [])
         expanded_queries = data.get("expanded_queries", [])
-
         if not isinstance(keywords, list):
             keywords = []
         if not isinstance(expanded_queries, list):
             expanded_queries = []
 
-        queries = [question, standalone_question] + expanded_queries
-        # [FIX] 限制单个 query 最大长度，防止 LLM 返回超长改写
-        queries = [q[:200].strip() for q in queries if isinstance(q, str) and q.strip() and len(q.strip()) > 0]
-        queries = list(dict.fromkeys(queries))
+        # Dense 查询：原始问题 + 独立问题 + 扩展查询，去重保序并按配置限制路数
+        dense_queries = [question, standalone_question] + expanded_queries
+        dense_queries = [q[:200].strip() for q in dense_queries if isinstance(q, str) and q.strip()]
+        dense_queries = list(dict.fromkeys(dense_queries))[:max_dense]
 
-        # [HyDE] 提取假设性文档片段，作为额外检索 query 增强召回
-        hyde_text = ""
+        # HyDE 单独返回，不再与 Dense 争抢同一路数预算（旧实现被 queries[:5] 全部截掉）
+        hyde_queries = []
         try:
-            if cfg and cfg.get("ENABLE_HYDE", False):
-                # 优先使用新格式 hypothetical_docs（多个假设文档，|||分隔）
-                if data.get("hypothetical_docs"):
-                    hyde_text = data["hypothetical_docs"]
-                    hyde_docs = [d.strip() for d in hyde_text.split("|||") if d.strip()]
-                    for doc in hyde_docs[:3]:  # 最多取3个假设文档片段
-                        if len(doc) > 20:  # 过滤过短的无效片段
-                            queries.append(doc[:200])
-                    debug_log(f"[HyDE] 生成 {len(hyde_docs)} 个假设文档片段")
-                elif data.get("hypothetical_answer"):
-                    # 向后兼容：旧格式单个假设回答
-                    hypo = data["hypothetical_answer"].strip()[:200]
-                    if hypo:
-                        queries.append(hypo)
-                        debug_log(f"[HyDE] 已提取假设回答用于检索增强: {hypo[:80]}...")
+            if bool(cfg.get("ENABLE_HYDE", True)):
+                hyde_text = str(data.get("hypothetical_docs") or data.get("hypothetical_answer") or "")
+                hyde_queries = [
+                    part.strip()[:200]
+                    for part in hyde_text.split("|||")
+                    if len(part.strip()) > 20
+                ][:max_hyde]
+                debug_log(f"[HyDE] 独立假设文档片段={len(hyde_queries)}")
         except Exception as hyde_err:
             debug_log(f"[HyDE] 提取假设文档失败（静默跳过）: {hyde_err}")
 
         parsed = {
             "standalone_question": standalone_question if isinstance(standalone_question,
                                                                      str) and standalone_question.strip() else question,
-            "keywords": [str(k).strip() for k in keywords if str(k).strip()][:6],
-            "expanded_queries": queries[:5],
+            "keywords": [str(k).strip()[:40] for k in keywords if str(k).strip()][:6],
+            "expanded_queries": dense_queries,
+            "hyde_queries": hyde_queries,
         }
         debug_log("rewrite_question parsed:", parsed)
         return parsed
@@ -1215,52 +1415,46 @@ def rewrite_question(llm, question: str, cfg: dict = None) -> dict:
             "standalone_question": question,
             "keywords": [],
             "expanded_queries": [question],
+            "hyde_queries": [],
         }
 
 
 # =========================
 # 检索与重排
 # =========================
-def retrieval_doc_key(doc):
-    """以完整正文和来源路径去重，避免同名文件和长文本前缀碰撞。"""
+def canonical_doc_key(doc) -> str:
+    """统一去重键：优先用入库时的 parent_id + chunk_hash，缺失时回退文件名 + 规范化正文。"""
     metadata = doc.metadata or {}
-    return (metadata.get("rel_path") or metadata.get("source") or metadata.get("file_name", ""),
-            doc.page_content or "")
+    parent_id = metadata.get("parent_id", "")
+    chunk_hash = metadata.get("chunk_hash", "")
+    if parent_id and chunk_hash:
+        return f"{parent_id}:{chunk_hash}"
+    content = clean_retrieval_display_text(doc.page_content or "")
+    return f"{metadata.get('file_name', '')}||{content[:1000]}"
 
 
-def fuse_ranked_lists(ranked_lists, weights, k):
-    """仅为实际召回的排名加分；同分保持输入顺序，不依赖线程完成顺序。"""
-    scores, documents = {}, {}
-    for docs, weight in zip(ranked_lists, weights):
-        seen = set()
-        for doc in docs:
-            key = retrieval_doc_key(doc)
-            if key in seen:
-                continue
-            seen.add(key)
-            documents.setdefault(key, doc)
-            scores[key] = scores.get(key, 0.0) + weight / (k + len(seen))
-    return [documents[key] for key in sorted(scores, key=scores.get, reverse=True)]
-
-
-def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_workers: int = 4, rrf_k: int = 60):
+def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_workers: int = 4):
     """
-    🔥 升级版（并行化）：
-    - 不再均分K
-    - 每个query都拿大K（大召回）
-    - 使用 ThreadPoolExecutor 并行执行多路检索
-    - 后面再统一裁剪
-    """
-    ranked_lists = []
+    并行多路 Dense 检索，并按相似度分数归并排序。
 
-    # [FIX] 修正 Top-K 计算逻辑：每个 query 使用固定大 K 召回，后续由去重和重排裁剪
-    # 旧逻辑 num_queries 越多 K 越小（反了），现在每个 query 统一使用 INITIAL_RETRIEVAL_K
-    per_query_k = top_k_each  # 每个query使用完整K，后续统一去重裁剪
+    旧实现把并发完成顺序（set done 的遍历顺序）当作相关性顺序，
+    导致后续 RRF 的排名基础不可靠；这里改用 similarity_search_with_score
+    取每个文档在各路查询中的最高分，再按分数降序输出。
+    """
+    per_query_k = top_k_each
 
     def search_one(q):
         t0 = time.perf_counter()
         try:
-            docs = vectorstore.similarity_search(q, k=per_query_k)
+            if hasattr(vectorstore, "similarity_search_with_score"):
+                pairs = vectorstore.similarity_search_with_score(q, k=per_query_k)
+                docs = []
+                for doc, score in pairs:
+                    doc.metadata = dict(doc.metadata or {})
+                    doc.metadata["dense_score"] = float(score)
+                    docs.append(doc)
+            else:
+                docs = vectorstore.similarity_search(q, k=per_query_k)
             elapsed = time.perf_counter() - t0
             debug_log(f"[RECALL] q={repr(q)} k={per_query_k} docs={len(docs)} time={elapsed:.3f}s")
             return docs
@@ -1269,30 +1463,195 @@ def retrieve_multi_query(vectorstore, queries: List[str], top_k_each: int, max_w
             return []
 
     executor = ThreadPoolExecutor(max_workers=max_workers)
-    futures = {executor.submit(search_one, q): q for q in dict.fromkeys(queries)}
+    futures = {executor.submit(search_one, q): q for q in queries}
     done, pending = wait(futures, timeout=30)
-    for future in futures:
-        if future not in done:
-            continue
+
+    merged = {}
+    for future in done:
         try:
-            ranked_lists.append(future.result())
+            for doc in future.result():
+                key = canonical_doc_key(doc)
+                score = float((doc.metadata or {}).get("dense_score", 0.0))
+                previous = merged.get(key)
+                if previous is None or score > float((previous.metadata or {}).get("dense_score", 0.0)):
+                    merged[key] = doc
         except Exception as e:
-            debug_log(f"[WARNING] 检索失败: {e}")
+            debug_log(f"[WARNING] 检索归并失败: {e}")
     for future in pending:
         future.cancel()
     if pending:
         debug_log(f"[WARNING] {len(pending)} 个检索任务超过 30 秒，已取消等待")
     executor.shutdown(wait=False, cancel_futures=True)
 
-    merged = fuse_ranked_lists(ranked_lists, [1.0] * len(ranked_lists), rrf_k)
-    debug_log(f"[RECALL TOTAL] fused = {len(merged)}")
-    return merged
+    all_docs = sorted(
+        merged.values(),
+        key=lambda doc: float((doc.metadata or {}).get("dense_score", 0.0)),
+        reverse=True,
+    )
+    debug_log(f"[RECALL TOTAL] after score merge = {len(all_docs)}")
+    return all_docs
 
 
-def retrieve_sparse(client, collection_name: str, query: str, keywords: List[str], top_k: int,
-                    cfg: dict = None) -> List[Document]:
-    """有界多路全文召回，排序后再参与 RRF；不加载额外模型或修改索引。"""
-    config = cfg if cfg is not None else load_config()
+def _build_sparse_terms(query: str, keywords: List[str], cfg: dict = None) -> List[str]:
+    """产出 MatchText 词元：设备型号/英文术语优先，中文按标点切成短片段。
+
+    型号形态覆盖：连字符/下划线复合（MSO-X 3054A、USRP-2944）、字母数字混合
+    （N9322C、EDU36311A、SVA1000X）与纯数字型号带字母后缀（3054A）。
+    旧正则会把 N9322C 整个丢弃、把 EDU36311A 截成 EDU36311，导致纯英文手册漏召回。
+    此外补充两类通用词元以提升身份字段命中率：
+    - 纯数字日期戳（≥6 位，如 20230106 / 20220121），让「某日期组会」精确命中文件名；
+    - 中文片段的 2/3-gram 滑窗，让「论文写作方法」产出「论文写作」这类子串命中文件名。
+    """
+    cfg = cfg or {}
+    max_terms = max(1, int(cfg.get("MAX_SPARSE_TERMS", 12)))
+    # 优先级桶：型号 > 日期 > 英文 > 中文 n-gram；前者优先占用预算
+    models, dates, english, cjk_ngrams = [], [], [], []
+    sources = [str(k).strip() for k in (keywords or []) if str(k).strip()] + [str(query or "").strip()]
+    for source in sources:
+        # 复合型号（含 -/_）优先整体保留，避免拆出 MSO 这类无区分度前缀
+        compound = re.findall(r"[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+", source)
+        for token in compound:
+            token = token.strip()
+            if len(token) >= 2 and token not in models:
+                models.append(token)
+        # 从剩余文本提取字母数字混合型号、纯英文词与纯数字日期戳
+        residual = source
+        for token in compound:
+            residual = residual.replace(token, " ")
+        for token in re.findall(r"[A-Za-z]+\d+[A-Za-z0-9]*|\d+[A-Za-z][A-Za-z0-9]*|[A-Za-z]{2,}|\d{6,}", residual):
+            token = token.strip()
+            if not token or len(token) < 2:
+                continue
+            if token.isdigit():
+                if token not in dates:
+                    dates.append(token)  # 纯数字日期戳（20230106 等）
+            elif token not in english:
+                english.append(token)
+        # 中文片段：整段（≤10 字）作为精确词，并补充 2/3-gram 滑窗以命中文件名/标题
+        for part in re.split(r"[\s,，。；;、？?！!：:（）()\[\]【】/|]+", source):
+            part = part.strip()
+            if not part or not re.search(r"[\u4e00-\u9fff]", part):
+                continue
+            clean = re.sub(r"(的|了|如何|怎么|是什么|有哪些|请|？|\?)", "", part)[:12]
+            if clean and clean not in cjk_ngrams:
+                cjk_ngrams.append(clean)
+            for n in (3, 2):
+                for i in range(len(clean) - n + 1):
+                    g = clean[i:i + n]
+                    if g and g not in cjk_ngrams:
+                        cjk_ngrams.append(g)
+    # 按优先级组装，型号/日期/英文优先，中文 n-gram 填充剩余预算
+    ordered = []
+    for bucket in (models, dates, english, cjk_ngrams):
+        for token in sorted(bucket, key=len, reverse=True):
+            if token not in ordered:
+                ordered.append(token)
+    return ordered[:max_terms]
+
+
+# MatchText 字段优先级：路径/文件名对「某小组有哪些设备」最关键，正文放最后
+_SPARSE_FIELD_PRIORITY = (
+    "metadata.rel_path",
+    "metadata.file_name",
+    "metadata.doc_title",
+    "metadata.section_title",
+    "metadata.header_path",
+    "metadata.parent_summary",
+    "page_content",
+)
+
+
+def retrieve_sparse(client, collection_name: str, query: str, keywords: List[str],
+                    top_k: int, cfg: dict = None) -> List[Document]:
+    """
+    基于 Qdrant MatchText 的全文词项检索（非 BM25 打分，返回 point 顺序）。
+
+    条件预算按「词 × 字段优先级」分配，保证路径/文件名字段不会被无序截断；
+    词元化让设备型号与参数名能作为独立词命中，而非整句中文匹配。
+    """
+    cfg = cfg or {}
+    max_conditions = max(1, int(cfg.get("MAX_SPARSE_CONDITIONS", 30)))
+    try:
+        with Timer(f"retrieve_sparse query={repr(query[:50])} keywords={len(keywords or [])}"):
+            search_terms = _build_sparse_terms(query, keywords, cfg=cfg)
+            if not search_terms:
+                return []
+
+            should_conditions = []
+            for term in search_terms:
+                for field_name in _SPARSE_FIELD_PRIORITY:
+                    if len(should_conditions) >= max_conditions:
+                        break
+                    should_conditions.append(
+                        rest.FieldCondition(key=field_name, match=rest.MatchText(text=term))
+                    )
+                if len(should_conditions) >= max_conditions:
+                    break
+
+            if not should_conditions:
+                return []
+
+            search_filter = rest.Filter(should=should_conditions)
+
+            # 超时保护，防止大量条件导致 Qdrant 查询过慢
+            try:
+                results, _ = client.scroll(
+                    collection_name=collection_name,
+                    scroll_filter=search_filter,
+                    limit=top_k,
+                    with_payload=True,
+                    timeout=10,
+                )
+            except Exception as timeout_err:
+                debug_log(f"[DEGRADED][qdrant-sparse] scroll 超时或失败: {timeout_err}")
+                return []
+
+            docs = []
+            for hit in results:
+                payload = hit.payload or {}
+                md = payload.get("metadata", {})
+
+                content = payload.get("page_content", "") or md.get("page_content", "")
+                if not content:
+                    continue
+
+                # 补齐与 Dense 一致的 metadata，保证 canonical_doc_key 两路可对齐
+                doc = Document(
+                    page_content=content,
+                    metadata={
+                        "file_name": md.get("file_name", ""),
+                        "doc_title": md.get("doc_title", ""),
+                        "rel_path": md.get("rel_path", ""),
+                        "section_title": md.get("section_title", ""),
+                        "header_path": md.get("header_path", ""),
+                        "parent_id": md.get("parent_id", ""),
+                        "parent_content": md.get("parent_content", ""),
+                        "parent_summary": md.get("parent_summary", ""),
+                        "chunk_hash": md.get("chunk_hash", ""),
+                        "chunk_index": md.get("chunk_index", 0),
+                        "summary_status": md.get("summary_status", ""),
+                    }
+                )
+                docs.append(doc)
+
+            debug_log(f"retrieve_sparse results={len(docs)} conditions={len(should_conditions)}")
+            return docs
+
+    except Exception as e:
+        debug_log(f"[DEGRADED][qdrant-sparse] retrieve_sparse error: {repr(e)}")
+        return []
+
+
+def retrieve_lexical_candidates(client, collection_name: str, query: str, keywords: List[str],
+                                top_k: int, cfg: dict = None) -> List[Document]:
+    """可选增强：有界全文候选召回（origin lexical_retrieval 通道）。
+
+    默认关闭（ENABLE_LEXICAL_RETRIEVAL=false）；开启后作为稀疏检索之外的补充
+    候选来源，不替换 3.4.0 的 MatchText 主通道，避免破坏既有召回排序。
+    """
+    cfg = cfg or {}
+    if not cfg.get("ENABLE_LEXICAL_RETRIEVAL") or _search_lexical_candidates is None:
+        return []
 
     def scroll(search_filter, limit, timeout):
         points, _ = client.scroll(
@@ -1304,32 +1663,88 @@ def retrieve_sparse(client, collection_name: str, query: str, keywords: List[str
         return [{"id": str(point.id), "payload": point.payload} for point in points]
 
     try:
-        points = search_lexical_candidates(
-            scroll, query, keywords, top_k,
-            candidate_limit=int(config.get("SPARSE_CANDIDATE_LIMIT", 256)),
-            max_terms=int(config.get("SPARSE_MAX_TERMS", 8)),
-            timeout=float(config.get("SPARSE_TIMEOUT", 10)),
-            log=debug_log,
-        )
+        with Timer("retrieve_lexical_candidates"):
+            points = _search_lexical_candidates(
+                scroll, query, keywords or [], top_k,
+                candidate_limit=int(cfg.get("LEXICAL_CANDIDATE_LIMIT", 256)),
+                max_terms=int(cfg.get("LEXICAL_MAX_TERMS", 8)),
+                timeout=float(cfg.get("LEXICAL_TIMEOUT", 10)),
+                log=debug_log,
+            )
         docs = []
         for point in points:
             payload = point.get("payload") or {}
-            metadata = dict(payload.get("metadata") or {})
-            content = payload.get("page_content") or metadata.get("page_content", "")
+            md = dict(payload.get("metadata") or {})
+            content = payload.get("page_content") or md.get("page_content", "")
             if content:
-                # 保留 header_path/source 等原始字段，不能在全文通道丢失来源范围。
-                docs.append(Document(page_content=content, metadata=metadata))
+                docs.append(Document(page_content=content, metadata=md))
+        debug_log(f"[LEXICAL] candidates={len(docs)}")
         return docs
     except Exception as exc:
-        debug_log(f"[SPARSE] 候选检索失败: {type(exc).__name__}")
+        debug_log(f"[LEXICAL] 候选召回失败，回退主通道: {type(exc).__name__}")
         return []
 
 
 def reciprocal_rank_fusion(dense_docs: List[Document], sparse_docs: List[Document],
                            dense_weight: float = 0.7, sparse_weight: float = 0.3,
-                           k: int = 60) -> List[Document]:
-    """RRF 只计算文档实际出现的检索通道，不为缺失通道虚构排名。"""
-    return fuse_ranked_lists([dense_docs, sparse_docs], [dense_weight, sparse_weight], k)
+                           k: int = 60, cfg: dict = None) -> List[Document]:
+    """
+    Reciprocal Rank Fusion (RRF) 融合两路检索结果。
+    score = dense_weight * 1/(k+rank_dense) + sparse_weight * 1/(k+rank_sparse)
+
+    融合分数写入 metadata.rrf_score，作为重排前的先验与可观测信息；
+    去重键与 dedup_docs 统一为 canonical_doc_key，避免两处结论不一致。
+    """
+    try:
+        cfg = cfg or {}
+        # 构建 dense 排名映射
+        dense_rank = {}
+        for rank, doc in enumerate(dense_docs, start=1):
+            key = canonical_doc_key(doc)
+            if key not in dense_rank:
+                dense_rank[key] = rank
+
+        # 构建 sparse 排名映射
+        sparse_rank = {}
+        for rank, doc in enumerate(sparse_docs, start=1):
+            key = canonical_doc_key(doc)
+            if key not in sparse_rank:
+                sparse_rank[key] = rank
+
+        all_keys = set(dense_rank.keys()) | set(sparse_rank.keys())
+
+        # 建立 key -> doc 的映射（Dense 优先，保留 dense_score）
+        key_to_doc = {}
+        for doc in dense_docs + sparse_docs:
+            key = canonical_doc_key(doc)
+            if key not in key_to_doc:
+                key_to_doc[key] = doc
+
+        # 只在单路出现的文档使用固定默认排名，避免两路数量不同造成不对称降权
+        default_rank = int(cfg.get("INITIAL_RETRIEVAL_K", os.getenv("INITIAL_RETRIEVAL_K", "64"))) + 1
+        scored = []
+        for key in all_keys:
+            d_rank = dense_rank.get(key, default_rank)
+            s_rank = sparse_rank.get(key, default_rank)
+            rrf_score = dense_weight * (1.0 / (k + d_rank)) + sparse_weight * (1.0 / (k + s_rank))
+            scored.append((key, rrf_score))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        fused_docs = []
+        for key, score in scored:
+            doc = key_to_doc.get(key)
+            if doc:
+                doc.metadata = dict(doc.metadata or {})
+                doc.metadata["rrf_score"] = round(float(score), 6)
+                fused_docs.append(doc)
+
+        debug_log(f"reciprocal_rank_fusion: dense={len(dense_docs)} sparse={len(sparse_docs)} fused={len(fused_docs)}")
+        return fused_docs
+
+    except Exception as e:
+        debug_log(f"[DEGRADED][rrf] reciprocal_rank_fusion error: {repr(e)}")
+        return dense_docs
 
 
 def dedup_docs(docs):
@@ -1342,7 +1757,8 @@ def dedup_docs(docs):
         seen = set()
 
         for doc in docs:
-            exact_key = retrieval_doc_key(doc)
+            # 与 RRF / retrieve_multi_query 共用同一去重键，避免两处结论相反
+            exact_key = canonical_doc_key(doc)
             if exact_key in seen:
                 continue
 
@@ -1353,132 +1769,322 @@ def dedup_docs(docs):
         return unique_docs
 
 
-def rerank_docs(reranker, query: str, docs, cfg: dict, top_k: int = None):
-    """改进版重排：乘法 boost + 分数阈值过滤"""
-    if not docs:
+def _query_match_tokens(query: str) -> set:
+    """中文按 2/3 字 n-gram、英文按词切分，避免中文整句只产生 1 个 token。"""
+    lowered = (query or "").lower()
+    tokens = set(re.findall(r"[a-z0-9][a-z0-9\-]{1,}", lowered))
+    chinese = "".join(re.findall(r"[\u4e00-\u9fff]", lowered))
+    for size in (2, 3):
+        for index in range(len(chinese) - size + 1):
+            tokens.add(chinese[index:index + size])
+    return tokens
+
+
+def select_reranked(boosted: list, cfg: dict, top_k: int) -> list:
+    """重排过滤策略：绝对阈值 + 相对 Top-1 比例 + 保底条数。
+
+    boosted: [(Document, score)]，已按分数降序。返回过滤并截取后的 Document 列表。
+    - 绝对阈值 RERANKER_SCORE_THRESHOLD 始终是主判据；
+    - RERANKER_RELATIVE_RATIO>0 时额外放行 score >= top1*ratio 的近优候选；
+    - RERANKER_MIN_KEEP>0 时保证至少保留 N 条（仅在存在过阈值候选时生效）；
+    - 全部低分时的行为仍由 RERANKER_ALLOW_LOW_SCORE_FALLBACK 决定，语义不变。
+    """
+    if not boosted:
+        return []
+    cfg = cfg or {}
+    abs_threshold = float(cfg.get("RERANKER_SCORE_THRESHOLD", 0.3))
+    relative_ratio = max(0.0, float(cfg.get("RERANKER_RELATIVE_RATIO", 0)))
+    min_keep = max(0, int(cfg.get("RERANKER_MIN_KEEP", 0)))
+    allow_fallback = bool(cfg.get("RERANKER_ALLOW_LOW_SCORE_FALLBACK", False))
+
+    top_score = float(boosted[0][1])
+    relative_floor = top_score * relative_ratio if relative_ratio > 0 else None
+    effective = abs_threshold if relative_floor is None else min(abs_threshold, relative_floor)
+
+    filtered = [(d, s) for d, s in boosted if s >= effective]
+    absolute_hits = [(d, s) for d, s in filtered if s >= abs_threshold]
+
+    if not absolute_hits:
+        if allow_fallback:
+            debug_log("[DEGRADED][reranker] 全部候选低于绝对阈值，按配置保底返回 1 条")
+            return [boosted[0][0]]
+        debug_log("[DEGRADED][reranker] 全部候选低于绝对阈值，返回空结果走 none 覆盖度")
         return []
 
-    if top_k is None:
-        top_k = int(cfg.get("FINAL_TOP_K", "16"))
+    if min_keep > 0 and len(filtered) < min_keep:
+        filtered = boosted[:min_keep]
+        debug_log(f"[RERANK] 保底条数生效: 保留前 {len(filtered)} 条")
 
-    score_threshold = cfg.get("RERANKER_SCORE_THRESHOLD", 0.3)
+    return [d for d, _ in filtered[:top_k]]
+
+
+def _corpus_entity_hits(question: str) -> list:
+    """原始问题中的实体词是否出现在语料派生词典里（语料侧证据，非用例专用规则）。"""
+    if not question:
+        return []
+    corpus = None
+    try:
+        corpus = lexicon.load_corpus_lexicon()
+    except Exception as e:  # 词典缺失/损坏时降级为无语料侧证据
+        debug_log(f"[ANSWERABILITY] 语料词典不可用，跳过语料侧证据: {e!r}")
+        return []
+    if not corpus:
+        return []
+    doc_terms = [str(t).lower() for t in (corpus.get("document_terms") or []) if len(str(t)) >= 3]
+    models = [str(t).lower() for t in (corpus.get("device_models") or []) if len(str(t)) >= 3]
+    aliases = [str(k).lower() for k in (corpus.get("group_aliases") or {}) if len(str(k)) >= 2]
+    q = str(question).lower()
+    return [t for t in dict.fromkeys(doc_terms + models + aliases) if t in q]
+
+
+def evaluate_answerability(keywords: list, docs: list, cfg: dict = None,
+                           question: str = "") -> dict:
+    """判断知识库是否有能力回答：检索侧证据 + 语料侧证据 + Top-1 分数三线判定。
+
+    动机：bge-reranker 对域外问题也会给出高分；而改写产出的关键词常是抽象短语
+    （「照片画质」「数值规定」），在文档身份字段里零命中，单靠关键词会把正常的
+    主题级问法误判为无答案。因此补两条通用证据：
+    - 检索侧：改写关键词是否命中最终父块的身份类字段（排除生成式摘要）；
+    - 语料侧：原始问题是否包含语料派生词典中的文档实体/型号/小组别名。
+    只有两侧都零证据且 Top-1 分数低于下限时，才判为知识库无答案。
+    """
+    cfg = cfg or {}
+    details = {"enabled": bool(cfg.get("ENABLE_ANSWERABILITY_GATE", True)),
+               "answerable": True, "keyword_hits": 0, "corpus_hits": 0,
+               "top_score": None, "reason": ""}
+    if not details["enabled"] or not docs:
+        return details
+
+    scores = [float((d.metadata or {}).get("rerank_score", 0) or 0) for d in docs]
+    top_score = max(scores) if scores else 0.0
+    details["top_score"] = round(top_score, 4)
+
+    terms = []
+    for kw in (keywords or []):
+        for token in re.split(r"[\s/_\-]+", str(kw).strip().lower()):
+            if len(token) >= 2 and token not in terms:
+                terms.append(token)
+    # 只用文档身份类字段：parent_summary 是 LLM 生成文本，含「方法/信息」等通用词，
+    # 会让域外问题的关键词出现假命中，削弱拒答闸门
+    evidence = " ".join(
+        " ".join(str((d.metadata or {}).get(f, "") or "") for f in
+                 ("source", "rel_path", "file_name", "doc_title", "header_path",
+                  "section_title", "parent_source_label"))
+        for d in docs
+    ).lower()
+    hits = [t for t in terms if t in evidence]
+    corpus_hits = _corpus_entity_hits(question) if bool(cfg.get("ENABLE_CORPUS_LEXICON", True)) else []
+    # 第三条通用证据：原始问题与召回文档身份字段的中文 2-gram 重合数。
+    # 改写关键词常是抽象短语（「命名」「提交方式」），但原问题本身含真实实体
+    # （「团队文档要求」），bigram 重合能捕捉这种字面近似而无需列举任何词表。
+    q_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", unicodedata.normalize("NFKC", str(question or "")).lower()))
+    q_grams = {q_cjk[i:i + 2] for i in range(len(q_cjk) - 1)}
+    ev_cjk = "".join(re.findall(r"[\u4e00-\u9fff]", unicodedata.normalize("NFKC", evidence)))
+    ev_grams = {ev_cjk[i:i + 2] for i in range(len(ev_cjk) - 1)}
+    overlap_hits = sorted(q_grams & ev_grams)
+
+    details["keyword_hits"] = len(hits)
+    details["hit_terms"] = hits[:8]
+    details["corpus_hits"] = len(corpus_hits)
+    details["corpus_hit_terms"] = corpus_hits[:8]
+    details["overlap_hits"] = len(overlap_hits)
+    details["overlap_terms"] = overlap_hits[:8]
+
+    floor = float(cfg.get("ANSWERABILITY_TOP_SCORE_FLOOR", 0.90))
+    min_hits = max(0, int(cfg.get("ANSWERABILITY_MIN_KEYWORD_HITS", 1)))
+    min_overlap = max(1, int(cfg.get("ANSWERABILITY_MIN_OVERLAP_HITS", 2)))
+    # 关键词为空（跳过改写/notation/hybrid）时不启用闸门，避免误判
+    if not terms:
+        details["reason"] = "no_keywords_skip_gate"
+        return details
+    has_evidence = (len(hits) >= min_hits or bool(corpus_hits)
+                    or len(overlap_hits) >= min_overlap)
+    if not has_evidence and top_score < floor:
+        details["answerable"] = False
+        details["reason"] = (f"zero_evidence retrieval+corpus+overlap "
+                             f"top1={top_score:.3f}<{floor}")
+    return details
+
+
+def rerank_docs(reranker, query: str, docs, cfg: dict, top_k: int = None,
+                original_question: str = ""):
+    """重排：原始+改写双 query、中文 n-gram boost、阈值过滤与 RRF 先验并列打破。"""
+    if not docs:
+        return []
+    cfg = cfg or {}
+    if top_k is None:
+        top_k = int(cfg.get("FINAL_TOP_K", 16))
+    score_threshold = float(cfg.get("RERANKER_SCORE_THRESHOLD", 0.3))
+
+    # 候选上限：避免 dedup 后的全量 predict 推高显存与延迟
+    max_candidates = max(top_k, top_k * 3)
+    docs = docs[:max_candidates]
+
+    # both 模式拼接原始问题与改写问题，既保留用户原意又利用改写消歧
+    if cfg.get("RERANK_QUERY_MODE", "both") == "both" and original_question.strip():
+        rerank_query = f"{original_question.strip()} {query.strip()}"
+    else:
+        rerank_query = query
 
     try:
-        # 同名章节在不同设备/组会资料中含义不同；路径和标题参与语义重排，不按具体主题提分。
-        pairs = [(query, "\n".join([
-            f"[文档] {d.metadata.get('doc_title', '')}",
-            f"[路径] {d.metadata.get('rel_path', '')}",
-            f"[章节] {d.metadata.get('header_path') or d.metadata.get('section_title', '')}",
-            clean_retrieval_display_text(d.page_content),
-        ])) for d in docs]
-        # [FIX] Reranker 分批推理，防止高并发显存溢出
+        pairs = [(rerank_query, clean_retrieval_display_text(d.page_content)) for d in docs]
+        # Reranker 分批推理，防止高并发显存溢出
         batch_size = 64
         all_scores = []
         for i in range(0, len(pairs), batch_size):
-            batch_pairs = pairs[i:i + batch_size]
-            batch_scores = reranker.predict(batch_pairs)
+            batch_scores = reranker.predict(pairs[i:i + batch_size])
             all_scores.extend(batch_scores if hasattr(batch_scores, '__iter__') else [batch_scores])
         scores = all_scores
 
-        query_lower = query.lower()
-        query_tokens = set(query_lower.split())
-
+        query_tokens = _query_match_tokens(rerank_query)
         boosted = []
         for doc, score in zip(docs, scores):
             score = float(score)
-
-            # 乘法 Boost（而非加法）
             text_lower = doc.page_content.lower()
             doc_title_lower = (doc.metadata.get("doc_title", "") or "").lower()
             section_title_lower = (doc.metadata.get("section_title", "") or "").lower()
 
-            # Keyword boost: 至少 2 个有意义的词重合即触发
-            text_tokens = set(text_lower.split())
-            meaningful_overlap = query_tokens & text_tokens
-            if len(meaningful_overlap) >= 2:
-                score *= cfg.get("KEYWORD_BOOST", 1.05)
+            # Keyword boost：中文 n-gram / 英文词命中至少 2 个才触发
+            overlap = sum(1 for token in query_tokens if len(token) >= 2 and token in text_lower)
+            if overlap >= 2:
+                score *= float(cfg.get("KEYWORD_BOOST", 1.05))
 
-            # Title boost: 同时检查 doc_title 和 section_title
+            # Title boost：文档标题与章节标题合并判断
             combined_title = f"{doc_title_lower} {section_title_lower}"
-            if combined_title.strip() and any(t in combined_title for t in query_tokens if len(t) > 2):
-                score *= cfg.get("TITLE_BOOST", 1.08)
+            if combined_title.strip() and any(
+                    token in combined_title for token in query_tokens if len(token) >= 2
+            ):
+                score *= float(cfg.get("TITLE_BOOST", 1.08))
 
             doc.metadata["rerank_score"] = score
             boosted.append((doc, score))
 
-        # 按分数排序
-        boosted.sort(key=lambda x: x[1], reverse=True)
+        # RRF 分数作为并列时的次级排序依据，避免融合排序信息被完全丢弃
+        boosted.sort(
+            key=lambda item: (item[1], float((item[0].metadata or {}).get("rrf_score", 0) or 0)),
+            reverse=True,
+        )
 
-        # 分数阈值过滤
-        filtered = [(d, s) for d, s in boosted if s >= score_threshold]
+        # 强证据先验：日期/文档标题词元/型号精确命中身份字段时附加加分，让语义重排
+        #在长尾意图（具体日期、专名）失真时仍能回归正确文档。仅在用户原问题/关键词
+        #实际包含该实体时生效，不会因通用词误提升；加性且封顶，不改写入 metadata 的
+        #原始 rerank_score（覆盖度判定仍用原始分）。
+        prior_weight = float(cfg.get("EVIDENCE_PRIOR_WEIGHT", 0.12))
+        prior_cap = float(cfg.get("EVIDENCE_PRIOR_CAP", 0.24))
+        if prior_weight > 0 and original_question.strip():
+            ents = _strong_evidence_entities(original_question, [], cfg)
+            if ents:
+                identity_fields = ("rel_path", "file_name", "doc_title", "header_path",
+                                   "section_title", "parent_source_label", "source")
+                adjusted = []
+                for doc, score in boosted:
+                    id_text = " ".join(
+                        str((doc.metadata or {}).get(f, "") or "") for f in identity_fields
+                    ).lower()
+                    hits = sum(1 for e in ents if e and e in id_text)
+                    if hits:
+                        score = score + min(hits * prior_weight, prior_cap)
+                    adjusted.append((doc, score))
+                adjusted.sort(key=lambda item: -item[1])
+                boosted = adjusted
+                debug_log(f"[EVIDENCE_PRIOR] entities={sorted(ents)} applied to {len(adjusted)} candidates")
 
-        final_docs = [d for d, _ in filtered[:top_k]]
-
+        final_docs = select_reranked(boosted, cfg, top_k)
         debug_log(f"Rerank: {len(docs)} → {len(final_docs)} (threshold={score_threshold})")
         return final_docs
 
     except Exception as e:
-        debug_log(f"Rerank error: {repr(e)}")
-        # 重排失败不能把未经验证的召回当成可靠证据。
-        return []
+        debug_log(f"[DEGRADED][reranker] Rerank error: {repr(e)}")
+        return docs[:top_k]
 
 
-def build_context(docs, max_chars: int = 12000) -> tuple:
-    """严格限制证据字符数；source_map 仅包含实际送入模型的正文片段。"""
-    parts, source_map = [], {}
+def _filter_context_noise(text: str) -> str:
+    """移除超长链接与多余空行，避免 OCR 噪声白占上下文预算。"""
+    text = re.sub(r"https?://\S{80,}", "[长链接已省略，请查阅原文]", text)
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def build_context(docs, max_chars: int = 3000, cfg: dict = None) -> tuple:
+    """
+    构建带引用编号的上下文，返回 (context_str, source_map)。
+    source_map: {1: {"doc_title": "...", "rel_path": "...", "section_title": "...", "header_path": "..."}, ...}
+    """
+    cfg = cfg or {}
+    filter_noise = bool(cfg.get("ENABLE_CONTEXT_NOISE_FILTER", True))
+    parts = []
+    source_map = {}
     current_length = 0
-    separator = "\n\n====================\n\n"
+
     for idx, doc in enumerate(docs, start=1):
-        title = doc.metadata.get("doc_title", "未知标题")
-        path = doc.metadata.get("rel_path", "未知路径")
-        section = doc.metadata.get("section_title", "")
-        header = f"[来源{idx}] [文档标题] {title}\n[路径] {path}\n"
-        if section:
-            header += f"[章节] {section}\n"
-        # 模型生成的摘要只用于召回，不得作为原文事实再次提供给回答模型。
+        doc_title = doc.metadata.get('doc_title', '未知标题')
+        rel_path = doc.metadata.get('rel_path', '未知路径')
+        section_title = doc.metadata.get('section_title', '')
+        # 完整章节路径（组 > 设备 > Manuals > 小节）优先于单级 section_title
+        header_path = doc.metadata.get('header_path', '')
+
+        section_line = f"[章节] {header_path or section_title}\n" if (header_path or section_title) else ""
+        # 如果有父块摘要，展示给 LLM 帮助理解宏观上下文
+        parent_summary = sanitize_summary(doc.metadata.get("parent_summary", ""))
+        summary_line = f"[段落摘要] {parent_summary}\n" if parent_summary else ""
         body = clean_retrieval_display_text(doc.page_content)
-        prefix = separator if parts else ""
-        available = max_chars - current_length - len(prefix) - len(header)
-        if available <= 0:
+        if filter_noise:
+            body = _filter_context_noise(body)
+        content = (
+            f"[来源{idx}] [文档标题] {doc_title}\n"
+            f"[路径] {rel_path}\n"
+            f"{section_line}"
+            f"{summary_line}"
+            f"{body}"
+        )
+
+        doc_len = len(content)
+
+        # 长度校验：如果加入当前块会严重超标，则丢弃排名靠后的父块
+        if current_length + doc_len > max_chars and current_length > 0:
+            debug_log(f"上下文已达 {current_length} 字符，截断后续 {len(docs) - len(parts)} 个排名较低的文档以防爆炸。")
             break
-        anchor = clean_retrieval_display_text(doc.metadata.get("matched_child_content", ""))
-        excerpt = evidence_window(body, anchor, available)
-        if not excerpt.strip():
-            continue
-        parts.append(header + excerpt)
+
+        parts.append(content)
         source_map[idx] = {
-            "doc_title": title, "rel_path": path, "section_title": section,
-            "content": excerpt,
+            "doc_title": doc_title,
+            "rel_path": rel_path,
+            "section_title": section_title,
+            "header_path": header_path,
         }
-        current_length += len(prefix) + len(header) + len(excerpt)
-    return separator.join(parts), source_map
+        current_length += doc_len
+
+    debug_log(f"build_context: source_map size={len(source_map)}")
+    context_str = "\n\n====================\n\n".join(parts)
+    return context_str, source_map
 
 
 # =========================
 # 覆盖度评估与引用溯源
 # =========================
 def assess_coverage(reranked_docs: list, config: dict) -> dict:
-    """评估知识库对当前查询的覆盖度（综合 max_score + avg_score + doc_count）"""
+    """评估知识库覆盖度（max_score + avg_score + doc_count），阈值统一走配置。"""
+    config = config or {}
     if not reranked_docs:
         return {
             "level": "none",
-            "hint": "⚠️ 未找到通过相关性筛选的知识库证据，不能据此确认答案。"
+            "hint": "⚠️ 知识库中未找到相关内容，本次回答基于模型通用知识，仅供参考。"
         }
 
-    # 综合评估指标
-    scores = [doc.metadata.get("rerank_score", 0) for doc in reranked_docs]
+    scores = [float(doc.metadata.get("rerank_score", 0) or 0) for doc in reranked_docs]
     max_score = max(scores)
     avg_score = sum(scores) / len(scores)
     doc_count = len(reranked_docs)
+    high = float(config.get("COVERAGE_HIGH_THRESHOLD", 0.7))
+    medium = float(config.get("COVERAGE_MEDIUM_THRESHOLD", 0.5))
+    low = float(config.get("COVERAGE_LOW_THRESHOLD", 0.3))
 
     debug_log(f"[覆盖度评估] max_score={max_score:.3f} avg_score={avg_score:.3f} doc_count={doc_count}")
 
-    # 综合判断：max_score + avg_score + doc_count
-    if max_score >= 0.7 and avg_score >= 0.4:
+    if max_score >= high and avg_score >= high * 0.55:
         return {"level": "high", "hint": None}
-    elif max_score >= 0.5 or (avg_score >= 0.35 and doc_count >= 4):
+    elif max_score >= medium or (avg_score >= low and doc_count >= 4):
         return {"level": "medium", "hint": "ℹ️ 知识库中的相关内容有限，回答可能不够全面。"}
-    elif max_score >= 0.3:
+    elif max_score >= low:
         return {"level": "low", "hint": "⚠️ 知识库覆盖不足，回答可能不够准确，建议查阅原始文档。"}
     else:
         return {
@@ -1487,14 +2093,133 @@ def assess_coverage(reranked_docs: list, config: dict) -> dict:
         }
 
 
+def _strong_evidence_entities(question: str, keywords: list, cfg: dict) -> set:
+    """高特异性证据实体：日期、语料词典文档标题词元、型号。
+
+    仅当用户原问题/关键词**实际包含**该实体时才保留（调用方再做身份字段命中判定），
+    因此不会因通用词（小组/系统/设备…）误提升。用于把「精确命中文档身份字段」的
+    候选提到 Top，弥补语义重排在具体日期、专名等长尾意图上的失真。
+    """
+    ents = set()
+    sources = [str(k).strip() for k in (keywords or []) if str(k).strip()] + [str(question or "").strip()]
+    text = " ".join(sources)
+    # 1) 日期：6-8 位数字串（20230106）或「YYYY年」
+    for m in re.findall(r"\d{6,8}|\d{4}年", text):
+        ents.add(m)
+    # 2) 语料词典文档标题词元（排除过于通用的目录/类型词）
+    if bool(cfg.get("ENABLE_CORPUS_LEXICON", True)):
+        corpus = lexicon.load_corpus_lexicon()
+        if corpus:
+            low = text.lower()
+            generic = {"小组", "系统", "资料", "目录", "手册", "设备", "设备操作指南",
+                       "参考书", "组会资料", "论文", "报告"}
+            for t in corpus.get("document_terms", []):
+                t = str(t).lower()
+                if t in generic or len(t) < 3:
+                    continue
+                if t in low:
+                    ents.add(t)
+    # 3) 型号/英文术语（含数字或连字符，区别于普通中文片段）
+    for t in _evidence_terms(question, keywords):
+        if re.search(r"[\d\-_]", t):
+            ents.add(t)
+    return ents
+
+
+def _evidence_terms(question: str, keywords: list) -> list:
+    """抽取用于「精确命中」判定的词元：型号与英文术语优先，中文长片段次之。"""
+    terms = []
+    sources = [str(k).strip() for k in (keywords or []) if str(k).strip()] + [str(question or "").strip()]
+    # 型号形态：连字符/下划线复合、字母数字混合、数字带字母后缀（843-R）、纯英文术语
+    model_patterns = (
+        r"[A-Za-z][A-Za-z0-9]*(?:[-_][A-Za-z0-9]+)+",
+        r"[A-Za-z]+\d+[A-Za-z0-9]*|\d+[A-Za-z][A-Za-z0-9]*|\d+[-_][A-Za-z0-9]+",
+        r"[A-Za-z]{3,}",
+    )
+    stop = {"the", "and", "for", "with", "what", "how", "are", "does", "about",
+            "manual", "guide", "spec", "datasheet", "sheet", "user", "series"}
+    for source in sources:
+        for pattern in model_patterns:
+            for token in re.findall(pattern, source):
+                token = token.strip("-_ ").lower()
+                if len(token) >= 3 and token not in terms and token not in stop and not token.isdigit():
+                    terms.append(token)
+    for source in sources:
+        for part in re.split(r"[\s,，。；;、？?！!：:（）()\[\]【】/|]+", source):
+            part = part.strip()
+            if len(part) >= 3 and re.search(r"[\u4e00-\u9fff]", part) and part not in terms:
+                terms.append(part.lower())
+    return terms[:24]
+
+
+def reorder_final_docs_by_evidence(docs: list, question: str, keywords: list,
+                                   cfg: dict = None) -> list:
+    """仅在 rerank 分数并列时，用「型号/路径精确命中」稳定重排 final_docs。
+
+    动机：同设备多份等价手册的 rerank 分数差常在 0.005 内，谁排第一取决于
+    RRF 先验等次要因素；问题里的型号若能精确命中某文档的路径/标题，应优先。
+
+    严格约束（保证上下文内容、覆盖度、引用集合均不变）：
+    - 不改变文档集合与 page_content，只调整顺序；
+    - 只在分数差 <= EVIDENCE_RERANK_WEIGHT 的相邻组内换位；
+    - 组内按精确命中数降序，命中数相同保持原顺序（稳定排序）；
+    - 开关关闭或词典缺失时原样返回。
+    """
+    cfg = cfg or {}
+    if not bool(cfg.get("ENABLE_EVIDENCE_RERANK", True)) or len(docs) < 2:
+        return docs
+    epsilon = max(0.0, float(cfg.get("EVIDENCE_RERANK_WEIGHT", 0.12)))
+    terms = _evidence_terms(question, keywords)
+    if not terms:
+        return docs
+
+    # 语料词典里的型号也纳入证据词，增强纯英文/别名型号的泛化
+    if bool(cfg.get("ENABLE_CORPUS_LEXICON", True)):
+        corpus = lexicon.load_corpus_lexicon()
+        if corpus:
+            for model in corpus.get("device_models", []):
+                token = str(model).lower()
+                if len(token) >= 3 and token not in terms:
+                    terms.append(token)
+
+    identity_fields = ("rel_path", "file_name", "doc_title", "header_path",
+                       "section_title", "parent_source_label", "source")
+
+    def hit_count(doc) -> int:
+        md = doc.metadata or {}
+        text = " ".join(str(md.get(f, "") or "") for f in identity_fields).lower()
+        return sum(1 for t in terms if t in text)
+
+    scored = [(i, d, float((d.metadata or {}).get("rerank_score", 0) or 0), hit_count(d))
+              for i, d in enumerate(docs)]
+    # 已按 rerank 分数降序；在分数差 <= epsilon 的连续组内按命中数降序稳定重排
+    result = []
+    start = 0
+    while start < len(scored):
+        end = start + 1
+        while end < len(scored) and (scored[start][2] - scored[end][2]) <= epsilon:
+            end += 1
+        group = scored[start:end]
+        if len(group) > 1:
+            group.sort(key=lambda x: (-x[3], x[0]))
+        result.extend(group)
+        start = end
+    reordered = [d for _, d, _, _ in result]
+    if any(a is not b for a, b in zip(docs, reordered)):
+        debug_log(f"[EVIDENCE_RERANK] 并列组重排生效: n={len(docs)} "
+                  f"max_hits={max(x[3] for x in scored)}")
+    return reordered
+
+
 def build_citations(used_docs: list) -> list:
-    """从使用的文档中提取引用信息"""
+    """从实际入 prompt 的文档提取引用；index 与上下文 [来源N] 严格对齐。"""
     citations = []
     seen = set()
 
-    for doc in used_docs:
+    for idx, doc in enumerate(used_docs, start=1):
         source = doc.metadata.get("source", "") or doc.metadata.get("rel_path", "") or doc.metadata.get("file_name", "未知来源")
-        section = doc.metadata.get("section_title", "") or doc.metadata.get("header_path", "")
+        # 完整章节路径优先，sparse 构造的文档也带上了 header_path
+        section = doc.metadata.get("header_path", "") or doc.metadata.get("section_title", "")
 
         # 去重：同一文档同一章节只引用一次
         key = f"{source}|{section}"
@@ -1502,31 +2227,34 @@ def build_citations(used_docs: list) -> list:
             continue
         seen.add(key)
 
-        citation = {
+        citations.append({
+            "index": idx,
             "source": source,
             "section": section,
-            "score": round(doc.metadata.get("rerank_score", 0), 3),
-            "summary": "",  # 生成摘要不是引用证据
-        }
-        citations.append(citation)
+            "score": round(float(doc.metadata.get("rerank_score", 0) or 0), 3),
+            "summary": sanitize_summary(doc.metadata.get("parent_summary", "")),
+        })
 
-    # 按分数排序，最多保留5条引用
-    citations.sort(key=lambda x: x["score"], reverse=True)
+    # 保持与 source_map 相同的排名顺序，最多 5 条，避免引用到被预算丢弃的文档
     return citations[:5]
 
 
-def get_system_prompt_by_coverage(coverage_level: str) -> str:
-    """根据覆盖度级别返回不同的system prompt策略"""
-    base_prompt = "你是实验室知识库助手，只根据本次参考资料中明确支持的内容回答。历史回答和生成摘要不是事实依据，不得用通用惯例冒充实验室规定。"
+def get_system_prompt_by_coverage(coverage_level: str, hint: str = "") -> str:
+    """根据覆盖度级别返回 system prompt 策略，并把覆盖度提示注入给 LLM。"""
+    base_prompt = "你是实验室知识库助手，根据提供的参考资料回答用户问题。"
 
     if coverage_level == "high":
-        return base_prompt + "请基于参考资料准确回答，引用具体内容。"
+        prompt = base_prompt + "请基于参考资料准确回答，引用具体内容。"
     elif coverage_level == "medium":
-        return base_prompt + "参考资料可能不够全面，请基于已有内容尽可能回答，对不确定的部分请明确指出。"
+        prompt = base_prompt + "参考资料可能不够全面，请基于已有内容尽可能回答，对不确定的部分请明确指出。"
     elif coverage_level == "low":
-        return base_prompt + "参考资料相关性较低，请谨慎回答。如果参考资料无法支撑回答，请明确告知用户并建议查阅原始文档。"
+        prompt = base_prompt + "参考资料相关性较低，请谨慎回答。如果参考资料无法支撑回答，请明确告知用户并建议查阅原始文档。"
     else:  # very_low or none
-        return base_prompt + "当前证据不足。只能回答资料明确支持的内容；不支持的部分明确说明无法确认，不得用常识、历史回答或假设补全实验室规定。"
+        prompt = base_prompt + "当前没有找到高度相关的参考资料。请基于你的通用知识简要回答，并明确告知用户该回答未经知识库验证。"
+
+    if hint:
+        prompt += f" 当前覆盖度提示：{hint}"
+    return prompt
 
 
 # =========================
@@ -1571,36 +2299,24 @@ def path_match_score(query: str, candidate_path: str) -> float:
     return max(token_score * 0.9, seq_score * 0.8)
 
 
-def find_best_matching_dirs(keyword: str, root_dir: str, limit: int = 20) -> List[Dict]:
+def find_best_matching_dirs(keyword: str, root_dir: str, limit: int = 20,
+                            snapshot: list = None, cfg: dict = None) -> List[Dict]:
+    """从目录树快照筛出最佳匹配目录；snapshot 省略时自行构建（保持旧调用方式可用）。"""
     if not root_dir or not os.path.exists(root_dir):
         return []
-
-    MAX_DIR_TRAVERSAL = 10000
+    entries = snapshot if snapshot is not None else _get_catalog_snapshot(root_dir, cfg)
 
     with Timer(f"find_best_matching_dirs keyword={keyword}"):
         matches = []
-        count_dirs = 0
-        traversal_count = 0
-        for current_root, dirs, _ in os.walk(root_dir, followlinks=False):
-            traversal_count += 1
-            if traversal_count > MAX_DIR_TRAVERSAL:
-                debug_log(f"[WARN] 目录遍历超过 {MAX_DIR_TRAVERSAL} 限制，停止遍历")
-                break
-
-            rel_current = os.path.relpath(current_root, root_dir)
-            if rel_current == ".":
-                rel_current = ""
-
-            for d in dirs:
-                count_dirs += 1
-                rel_path = os.path.join(rel_current, d) if rel_current else d
-                rel_path = path_to_unix(rel_path)
-                score = path_match_score(keyword, rel_path)
-                if score >= 0.45:
-                    matches.append({"rel_path": rel_path, "score": round(score, 4)})
+        for kind, _name, rel_path in entries:
+            if kind != "directory":
+                continue
+            score = path_match_score(keyword, rel_path)
+            if score >= 0.45:
+                matches.append({"rel_path": rel_path, "score": round(score, 4)})
 
         matches.sort(key=lambda x: (-x["score"], len(x["rel_path"])))
-        debug_log(f"find_best_matching_dirs scanned_dirs={count_dirs} matched={len(matches)}")
+        debug_log(f"find_best_matching_dirs matched={len(matches)} from_snapshot={len(entries)}")
         return matches[:limit]
 
 
@@ -1628,54 +2344,26 @@ def list_immediate_children(root_dir: str, rel_dir: str, limit: int = 200) -> Di
         }
 
 
-def list_fs_entries_by_keyword(keyword: str, root_dir: str, limit: int = 200) -> List[Dict]:
+def list_fs_entries_by_keyword(keyword: str, root_dir: str, limit: int = 200,
+                              snapshot: list = None, cfg: dict = None) -> List[Dict]:
+    """从目录树快照筛出匹配的文件/目录；snapshot 省略时自行构建（保持旧调用方式可用）。"""
     if not root_dir or not os.path.exists(root_dir):
         return []
-
-    MAX_DIR_TRAVERSAL = 10000
+    entries = snapshot if snapshot is not None else _get_catalog_snapshot(root_dir, cfg)
 
     with Timer(f"list_fs_entries_by_keyword keyword={keyword}"):
         results = []
-        count_dirs = 0
-        count_files = 0
-        traversal_count = 0
+        for kind, name, rel_path in entries:
+            score = path_match_score(keyword, rel_path)
+            if score >= 0.45:
+                results.append({
+                    "type": kind,
+                    "name": name,
+                    "rel_path": rel_path,
+                    "score": round(score, 4),
+                })
 
-        for current_root, dirs, files in os.walk(root_dir, followlinks=False):
-            traversal_count += 1
-            if traversal_count > MAX_DIR_TRAVERSAL:
-                debug_log(f"[WARN] 目录遍历超过 {MAX_DIR_TRAVERSAL} 限制，停止遍历")
-                break
-
-            rel_current = os.path.relpath(current_root, root_dir)
-            if rel_current == ".":
-                rel_current = ""
-
-            for d in dirs:
-                count_dirs += 1
-                rel_path = path_to_unix(os.path.join(rel_current, d) if rel_current else d)
-                score = path_match_score(keyword, rel_path)
-                if score >= 0.45:
-                    results.append({
-                        "type": "directory",
-                        "name": d,
-                        "rel_path": rel_path,
-                        "score": round(score, 4),
-                    })
-
-            for f in files:
-                count_files += 1
-                rel_path = path_to_unix(os.path.join(rel_current, f) if rel_current else f)
-                score = path_match_score(keyword, rel_path)
-                if score >= 0.45:
-                    results.append({
-                        "type": "file",
-                        "name": f,
-                        "rel_path": rel_path,
-                        "score": round(score, 4),
-                    })
-
-        debug_log(
-            f"list_fs_entries_by_keyword scanned_dirs={count_dirs} scanned_files={count_files} matched={len(results)}")
+        debug_log(f"list_fs_entries_by_keyword matched={len(results)} from_snapshot={len(entries)}")
         return sorted(results, key=lambda x: (-x["score"], len(x["rel_path"])))[:limit]
 
 
@@ -1862,11 +2550,16 @@ def list_catalog_entries(target: str) -> Dict:
             checked_roots.append(root_state)
             if not (root_state["exists"] and root_state["is_dir"] and root_state["readable"]):
                 continue
-            matched_dirs = find_best_matching_dirs(target, root_dir, limit=10)
+            # 单次遍历 + 快照缓存：原先两个函数各自全盘 os.walk，改为共用一份快照
+            snapshot = _get_catalog_snapshot(root_dir, config)
+            matched_dirs = find_best_matching_dirs(
+                target, root_dir, limit=10, snapshot=snapshot, cfg=config)
             entries = list_fs_entries_by_keyword(
                 target,
                 root_dir=root_dir,
-                limit=config["FILE_SEARCH_LIMIT"]
+                limit=config["FILE_SEARCH_LIMIT"],
+                snapshot=snapshot,
+                cfg=config,
             )
 
             best_dir = matched_dirs[0] if matched_dirs else None
@@ -1971,22 +2664,30 @@ def catalog_result_count(file_result: Optional[Dict]) -> int:
 
 
 def extract_catalog_content_intent(question: str) -> str:
-    """从原问题保留正文检索意图，不引入模型扩写内容。"""
+    """从原问题保留正文检索意图；触发词与输出词表来自检索词典，不引入模型扩写。"""
+    ci = lexicon.load_lexicon()["catalog_intent"]
     intent_terms = []
-    if any(term in question for term in ("使用", "怎么用", "如何", "操作")):
-        intent_terms.extend(["使用方法", "操作步骤"])
-    if any(term in question for term in ("规范", "注意", "要求", "安全")):
-        intent_terms.extend(["操作规范", "注意事项"])
-    if any(term in question for term in ("参数", "指标", "性能")):
-        intent_terms.append("参数指标")
-    return " ".join(dict.fromkeys(intent_terms)) or "说明 用途"
+    for rule in ci["rules"]:
+        if any(term in question for term in rule["match_terms"]):
+            intent_terms.extend(rule["intent_terms"])
+    return " ".join(dict.fromkeys(intent_terms)) or ci["default_intent"]
 
 
 def build_catalog_retrieval_queries(
-    file_result: Optional[Dict], fallback_target: str, question: str = ""
+    file_result: Optional[Dict], fallback_target: str, question: str = "",
+    cfg: dict = None,
 ) -> List[str]:
-    """使用直接目录级实体和用户正文意图构造检索词，避免深入枚举 Manual 文件。"""
+    """使用目录级实体和用户正文意图构造检索词，避免深入枚举 Manual 文件。
+
+    目录枚举的完整设备清单由 build_catalog_answer_section 直接注入答案，Dense 查询
+    只需覆盖「小组级 + 与问题最相关的设备」；因此对同一 intent 的重复路径做归一化
+    去重并限流，避免 16 路几乎同义的 Dense 往返（保持可追溯性、不改变答案区块）。
+    """
+    cfg = cfg or {}
     intent = extract_catalog_content_intent(question)
+    max_queries = max(1, int(cfg.get("MAX_HYBRID_QUERIES", 8)))
+    q_norm = normalize_retrieval_text(question).strip()
+
     candidates = []
     if file_result:
         candidates.append(file_result.get("matched_dir", ""))
@@ -1995,14 +2696,35 @@ def build_catalog_retrieval_queries(
             for item in file_result.get(key, []) or []:
                 candidates.append(item.get("rel_path", "") or item.get("name", ""))
     candidates.append(fallback_target)
-    result = []
+
+    norm_values = []
     seen = set()
     for value in candidates:
-        value = str(value or "").strip()
-        if value and value not in seen:
-            seen.add(value)
-            result.append(f"{value} {intent}".strip())
-    return result[:16]
+        value = path_to_unix(str(value or "").strip())
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        norm_values.append(value)
+
+    # 小组级/短路径优先，其次按与问题实体的重合度排序；稳定排序保证同分保持目录顺序
+    def relevance(rel_path: str):
+        tokens = [t for t in re.split(r"[\s/_\-]+", q_norm.lower()) if len(t) >= 2]
+        base = rel_path.lower()
+        return (sum(1 for t in tokens if t in base), -len(rel_path))
+
+    ranked = sorted(norm_values, key=relevance, reverse=True)
+    selected = ranked[:max_queries]
+    # 兜底：路数允许时补入小组级检索词；max=1 时保留最相关设备（清单已由答案区块提供）
+    group_value = path_to_unix(str(fallback_target or "").strip())
+    if max_queries > 1 and group_value and not any(s.lower() == group_value.lower() for s in selected):
+        selected = selected[: max_queries - 1] + [group_value]
+
+    result = [f"{value} {intent}".strip() for value in selected]
+    debug_log(f"[HYBRID] catalog queries {len(norm_values)} → {len(result)} (max={max_queries})")
+    return result
 
 
 def build_catalog_answer_section(file_result: Optional[Dict]) -> str:
@@ -2015,6 +2737,27 @@ def build_catalog_answer_section(file_result: Optional[Dict]) -> str:
 # =========================
 # 回答生成
 # =========================
+def build_grounded_notation_answer(context: str) -> str:
+    """从格式表的结构化转写直接生成回答；模板与正则来自检索词典，避免被通用惯例带偏。"""
+    lex = lexicon.load_lexicon()
+    notation = lex["notation"]
+    placeholders = lex["placeholders"]
+    row_pattern = re.compile(notation["row_pattern"])
+    for block in re.split(r"(?=\[来源\d+\])", context or ""):
+        source_match = re.search(r"\[来源(\d+)\]", block)
+        row_match = row_pattern.search(block)
+        if not (source_match and row_match):
+            continue
+        english_rule = row_match.group(1).strip(" ；")
+        roman_rule = row_match.group(2).strip(" ；")
+        source_num = source_match.group(1)
+        return (notation["answer_template"]
+                .replace(placeholders["english_rule"], english_rule)
+                .replace(placeholders["roman_rule"], roman_rule)
+                .replace(placeholders["source_num"], source_num))
+    return ""
+
+
 def build_file_list_answer(question: str, file_result: Dict, route_reason: str) -> str:
     mode = file_result.get("mode", "")
     parts = [""]
@@ -2053,15 +2796,17 @@ def build_file_list_answer(question: str, file_result: Dict, route_reason: str) 
 
 # [FIX] answer_stream 增加 chat_history 参数，确保截断后的历史实际参与 prompt 生成
 # [OPT] 增加 coverage_level 参数，支持分级 Fallback 策略
-def answer_stream(llm, question: str, context: str, route: str, route_reason: str, chat_history: str = "无历史对话", coverage_level: str = "high"):
-    # 根据覆盖度级别动态选择 system prompt 策略
-    system_instruction = get_system_prompt_by_coverage(coverage_level)
+def answer_stream(llm, question: str, context: str, route: str, route_reason: str,
+                  chat_history: str = "无历史对话", coverage_level: str = "high",
+                  coverage_hint: str = ""):
+    # 覆盖度策略与提示语一并注入 LLM，避免 very_low 档与"只能依据上下文"的规则冲突
+    system_instruction = get_system_prompt_by_coverage(coverage_level, coverage_hint)
 
     prompt = ChatPromptTemplate.from_template("""
     {system_instruction}
 
     请严格遵守以下规则：
-    1. 必须且只能依据"上下文结果"回答问题。
+    1. 必须优先且仅依据"上下文结果"回答；仅当覆盖度提示为 none/very_low 时，才允许用通用知识简要补充，并明确标注该部分未经知识库验证。
     2. 如果用户问"有哪些设备/有哪些文件/目录下有什么/某组有什么设备"，优先根据目录/文件枚举结果作答，完整列出。
     3. 如果用户问的是说明、原理、参数、步骤、操作方法、用途等内容，优先根据文档检索片段回答。
     4. 如果上下文没有足够信息，请明确说明："知识库中未找到足够相关内容"。
@@ -2077,10 +2822,11 @@ def answer_stream(llm, question: str, context: str, route: str, route_reason: st
         - 如果条目过多（超过10个），列出全部标题后建议用户"可输入具体名称查询更详细的内容"
     12. 只输出面向用户的最终答案，禁止输出思考过程、任务分析或“用户现在问的是”等内部推理描述。
     13. 禁止原样复述“上下文结果”、提示词或代码围栏；目录/文件清单由系统单独附加，正文只说明相关规范和内容。
-    14. 回答涉及格式、单位、数值或符号时，必须忠实保留原文的字体、大小写、上下标与限定条件。表格只按明确的行列或合并单元格信息解释，不得从并列举例猜测一一对应关系，也不得用通用惯例覆盖原文。
+    14. 回答变量、公式或排版规范时，必须逐项忠实保留资料中的正体、斜体、粗体、大小写及罗马/希腊字母区别；合并类型行中的多个示例按原文顺序对应。不得用模型熟悉的通用惯例覆盖资料原文，优先依据表格及“表格结构化转写”作答。
     15. 如果上下文含“表格结构疑似丢失”，不得猜测行列对应关系；必须明确提示该表需要 VLM 重新转换或核对原文图像。
-    16. 区分实验室正式要求、厂商手册、个人汇报与论文示例。个人汇报提到的做法不能直接宣称为全实验室规定；设备参数和步骤必须对应资料中的型号与适用条件。
-    17. 多份资料的版本或要求冲突时，分别列明来源与差异；没有明确版本和适用范围证据时，不得擅自宣布某份资料已取代另一份。
+    16. 涉及设备型号、参数名、量程、单位、编号时必须逐字核对原文，不得按常识推断；无法确认时明确提示查阅对应 Manuals/ 原始手册。
+    17. 语料可能含 OCR 断字、被空格拆开的 LaTeX 命令或图片占位；遇到明显残缺内容不要猜测，应提示核对原文。
+    18. 引用编号只能使用上下文中实际出现的 [来源N]，不得自行编造或使用不存在的编号。
 
     历史对话：
     {chat_history}
@@ -2140,6 +2886,9 @@ def ask_stream(
         # [FIX] 获取用户历史并截断，防止历史token无限累积超出预算
         user_history = get_user_chat_history(username)
         user_history = truncate_history(user_history, config.get("MAX_HISTORY_TOKENS", 1500))
+        # 历史提前格式化：既供答案生成，也供改写阶段消解代词指代
+        history_text = format_chat_history(user_history)
+        rewrite_history = history_text if bool(config.get("ENABLE_HISTORY_AWARE_REWRITE", True)) else ""
 
         rag_retrievals = []
         file_result = None
@@ -2147,9 +2896,12 @@ def ask_stream(
         rewritten_question = question
         keywords = []
         queries = []
+        hyde_queries = []
         source_map = {}
         coverage_info = {"level": "high", "hint": None}
         citations = []
+        # 特判判定合并为一次，供改写/重排/生成三处复用；词表来自词典且可开关
+        is_notation_specialized = is_notation_format_question(question, config)
 
         yield {
             "type": "metadata",
@@ -2196,14 +2948,22 @@ def ask_stream(
             if route == "hybrid":
                 catalog_target = target or extract_catalog_target(question)
                 content_intent = extract_catalog_content_intent(question)
-                catalog_queries = build_catalog_retrieval_queries(file_result, catalog_target, question)
+                catalog_queries = build_catalog_retrieval_queries(
+                    file_result, catalog_target, question, cfg=config)
                 rewritten_question = f"{catalog_target}各设备的{content_intent}".strip()
                 keywords = content_intent.split()
                 expanded_queries = []
                 queries = catalog_queries or [rewritten_question]
                 debug_log(f"[HYBRID] catalog-driven queries={queries}")
+            elif is_notation_specialized:
+                notation_plan = build_notation_retrieval_plan()
+                rewritten_question = str(notation_plan["rewritten_question"])
+                keywords = list(notation_plan["keywords"])
+                expanded_queries = []
+                queries = list(notation_plan["queries"])
+                debug_log(f"[NOTATION] deterministic retrieval plan={queries}")
             # [智能路由] 判断是否跳过 LLM 改写，直接使用原始问题
-            elif should_skip_rewrite(question):
+            elif should_skip_rewrite(question, rewrite_history):
                 debug_log(f"[智能路由] 跳过改写，直接使用原始问题: {question}")
                 rewritten_question = question
                 keywords = []
@@ -2211,37 +2971,48 @@ def ask_stream(
                 queries = [question]
             else:
                 with Timer("stage_rewrite"):
-                    rewrite_result = rewrite_question(llm, question, cfg=config)
+                    rewrite_result = rewrite_question(llm, question, cfg=config, chat_history=rewrite_history)
                 rewritten_question = rewrite_result["standalone_question"]
                 keywords = rewrite_result["keywords"]
                 expanded_queries = rewrite_result["expanded_queries"]
+                hyde_queries = list(rewrite_result.get("hyde_queries") or [])
 
                 queries = [question, rewritten_question] + expanded_queries
                 if keywords:
                     queries.append(" ".join([str(k).strip() for k in keywords if str(k).strip()]))
                 queries = list(dict.fromkeys([q.strip() for q in queries if q and q.strip()]))
 
+            # Dense 与 HyDE 分开计数：假设文档不再被 queries[:5] 截掉，也避免 7~8 路 Dense
+            max_dense = int(config.get("MAX_DENSE_QUERIES", 4))
+            max_hyde = int(config.get("MAX_HYDE_QUERIES", 2))
+            if route != "hybrid":
+                # hybrid 是目录驱动的确定性多查询，保留完整设备清单，不做路数裁剪
+                queries = queries[:max_dense]
+            queries = list(dict.fromkeys(
+                [q.strip() for q in queries if q and q.strip()]
+                + [q.strip() for q in hyde_queries[:max_hyde] if q and q.strip()]
+            ))
             debug_log(f"queries_count={len(queries)} queries={queries}")
 
             with Timer("stage_retrieval"):
-                # 检索缓存：基于 queries 的 hash 判断是否命中
-                cache_key = hashlib.md5(str(queries).encode()).hexdigest()
+                # 缓存键加入用户、路由与索引版本；入库逻辑变更后递增版本即可失效旧缓存
+                cache_key = hashlib.md5(
+                    f"{username}|{route}|{config.get('RETRIEVAL_INDEX_VERSION', '1')}|{sorted(queries)}".encode()
+                ).hexdigest()
                 cached = _retrieval_cache.get(cache_key)
                 if cached is not None:
                     debug_log(f"[CACHE HIT] key={cache_key}")
-                    recalled_docs = copy.deepcopy(cached)
+                    recalled_docs = cached
                 else:
-                    # 原有稠密检索
+                    # 稠密检索：内部按相似度分数归并，不再依赖并发完成顺序
                     recalled_docs = retrieve_multi_query(
                         vectorstore,
                         queries,
-                        config["INITIAL_RETRIEVAL_K"],
-                        rrf_k=config["RRF_K"]
+                        config["INITIAL_RETRIEVAL_K"]
                     )
 
-                    # 如果开启混合检索，增加稀疏检索并融合
+                    # 混合检索：MatchText 全文词项路与 Dense 路做 RRF 融合
                     if config.get("ENABLE_HYBRID_SEARCH", False):
-                        # 当 keywords 为空时，使用 query 本身作为唯一搜索词
                         if route == "hybrid":
                             sparse_search_terms = list(dict.fromkeys(keywords + queries))[:10]
                         elif not keywords:
@@ -2254,19 +3025,34 @@ def ask_stream(
                             config["QDRANT_COLLECTION_NAME"],
                             rewritten_question,
                             sparse_search_terms,
-                            config["INITIAL_RETRIEVAL_K"], cfg=config
+                            config["INITIAL_RETRIEVAL_K"],
+                            cfg=config,
                         )
                         debug_log(f"sparse_docs_count={len(sparse_docs)}")
                         recalled_docs = reciprocal_rank_fusion(
                             recalled_docs, sparse_docs,
                             dense_weight=config["DENSE_WEIGHT"],
                             sparse_weight=config["BM25_WEIGHT"],
-                            k=config["RRF_K"]
+                            k=config["RRF_K"],
+                            cfg=config,
                         )
                         debug_log(f"after_rrf_fusion={len(recalled_docs)}")
 
+                    # 可选增强：有界全文候选召回（默认关闭，开启才生效）
+                    lexical_docs = retrieve_lexical_candidates(
+                        runtime["client"],
+                        config["QDRANT_COLLECTION_NAME"],
+                        rewritten_question,
+                        list(dict.fromkeys((keywords or []) + queries))[:10],
+                        config["INITIAL_RETRIEVAL_K"],
+                        cfg=config,
+                    )
+                    if lexical_docs:
+                        recalled_docs = list(recalled_docs) + lexical_docs
+                        debug_log(f"[LEXICAL] extra_candidates={len(lexical_docs)}")
+
                     # 缓存检索结果
-                    _retrieval_cache.set(cache_key, copy.deepcopy(recalled_docs))
+                    _retrieval_cache.set(cache_key, recalled_docs)
 
                 debug_log(f"recalled_docs_before_dedup={len(recalled_docs)}")
                 recalled_docs = dedup_docs(recalled_docs)
@@ -2274,42 +3060,61 @@ def ask_stream(
 
             with Timer("stage_rerank"):
                 child_top_k = config["FINAL_TOP_K"] * 3
-                reranked_child_docs = rerank_docs(reranker, rewritten_question, recalled_docs, cfg=config, top_k=child_top_k)
+                reranked_child_docs = rerank_docs(
+                    reranker, rewritten_question, recalled_docs, cfg=config,
+                    top_k=child_top_k, original_question=question,
+                )
+
+                if is_notation_specialized:
+                    exact_notation_docs = []
+                    match_terms = lexicon.load_lexicon()["notation"]["match_terms"]
+                    for doc in recalled_docs:
+                        content = doc.page_content or ""
+                        if all(term in content for term in match_terms):
+                            # 用可配置加分取代写死 1.0，避免制造假满分引用
+                            current_score = float(doc.metadata.get("rerank_score", 0) or 0)
+                            bonus = float(config.get("NOTATION_MATCH_BONUS", 0.15))
+                            doc.metadata["rerank_score"] = min(1.0, current_score + bonus)
+                            exact_notation_docs.append(doc)
+                    if exact_notation_docs:
+                        reranked_child_docs = dedup_docs(exact_notation_docs + reranked_child_docs)[:child_top_k]
+                        debug_log(f"[NOTATION] exact format chunks prioritized={len(exact_notation_docs)}")
 
                 # 【新增】将重排后的子块展开为大召回的父块
                 final_docs = expand_to_parent_docs(reranked_child_docs, cfg=config, top_k=config["FINAL_TOP_K"], qdrant_client=runtime["client"])
+                # 仅在 rerank 分数并列时用型号/路径精确命中打破并列；不改文档集合与内容
+                final_docs = reorder_final_docs_by_evidence(final_docs, question, keywords, config)
 
             debug_log(f"final_docs_after_parent_expansion={len(final_docs)}")
 
-            with Timer("stage_build_context"):
-                max_ctx = max(0, config.get("MAX_CONTEXT_CHARS", 12000))
-                # 清单留在页面完整展示，模型上下文仅保留有界部分，为正文留出空间。
-                if route == "hybrid" and context_parts:
-                    catalog_context = "\n\n".join(context_parts)
-                    catalog_budget = max_ctx // 2
-                    if len(catalog_context) > catalog_budget:
-                        catalog_context = catalog_context[:catalog_budget].rsplit("\n", 1)[0]
-                    context_parts = [catalog_context] if catalog_context else []
-                prefix = "[知识库检索结果]\n"
-                used_chars = sum(len(p) for p in context_parts) + 2 * len(context_parts)
-                rag_budget = max(0, max_ctx - used_chars - len(prefix))
-                rag_context, source_map = build_context(final_docs, max_chars=rag_budget)
-                if rag_context:
-                    context_parts.append(prefix + rag_context)
+            # 拒答闸门：域外问题在父块结构化证据中零命中且 Top-1 分数偏低时，
+            # 不把无关文档包装成引用；清空 final_docs 后 context/引用/覆盖度统一走 none 档。
+            answerability = evaluate_answerability(keywords, final_docs, config, question)
+            if route == "rag_search" and not answerability["answerable"]:
+                debug_log(f"[ANSWERABILITY] 判为知识库无答案: {answerability['reason']} "
+                          f"hits={answerability['keyword_hits']} top1={answerability['top_score']}")
+                final_docs = []
+            else:
+                debug_log(f"[ANSWERABILITY] answerable: hits={answerability['keyword_hits']} "
+                          f"terms={answerability.get('hit_terms')} "
+                          f"top1={answerability['top_score']} route={route}")
 
-            # 引用与覆盖度只对应真正进入上下文的证据，目录命中不提升正文覆盖度。
-            used_docs = [doc for i, doc in enumerate(final_docs, start=1) if i in source_map]
-            coverage_info = assess_coverage(used_docs, config)
+            # [OPT] 覆盖度评估：基于实际入 prompt 的父块，避免评估与回答依据脱节
+            coverage_info = assess_coverage(final_docs, config)
+            if route == "hybrid" and catalog_result_count(file_result) > 0 and coverage_info["level"] in {"none", "very_low"}:
+                coverage_info = {
+                    "level": "medium",
+                    "hint": "ℹ️ 已找到相关目录或文件，但正文检索内容有限；设备/文件名称以目录枚举结果为准。",
+                }
             debug_log(f"coverage_assessment: level={coverage_info['level']} hint={coverage_info.get('hint')}")
 
             # [OPT] 引用溯源：收集引用信息
-            citations = build_citations(used_docs)
+            citations = build_citations(final_docs)
             debug_log(f"citations_count={len(citations)}")
 
             for i, doc in enumerate(final_docs, start=1):
-                if i not in source_map:
-                    continue
-                display_content = source_map[i]["content"]
+                raw_content = (doc.page_content or "").strip()
+                display_content = clean_retrieval_display_text(raw_content)
                 # 因为变成了父块，内容变长，截取预览长度可以稍微放宽
                 preview = display_content[:300]
 
@@ -2319,12 +3124,24 @@ def ask_stream(
                     "file_name": doc.metadata.get("file_name", "未知文件"),
                     "rel_path": doc.metadata.get("rel_path", "未知路径"),
                     "rerank_score": doc.metadata.get("rerank_score"),
-                    "summary": "",  # 生成摘要不作为原文证据展示
+                    "summary": doc.metadata.get("parent_summary", ""),  # 新增：父块摘要
                     "preview": preview,
-                    "content": display_content,  # 与实际送入模型的片段一致
+                    "content": display_content,  # 这里前端展示和传入LLM的已经是完整的父块
                 })
 
                 debug_log(f"[DOC {i}] title={doc.metadata.get('doc_title')}")
+
+            with Timer("stage_build_context"):
+                max_ctx = config.get("MAX_CONTEXT_CHARS", 12000)
+                # [OPT] hybrid 路由下动态分配 RAG 上下文预算：总预算减去已用的文件列表部分
+                if route == "hybrid" and context_parts:
+                    file_context_used = sum(len(p) for p in context_parts)
+                    rag_budget = max(max_ctx - file_context_used, 2000)  # 至少保留 2000 字符给 RAG
+                    debug_log(f"[HYBRID] 上下文预算分配: 总预算={max_ctx}, 文件部分已用={file_context_used}, RAG预算={rag_budget}")
+                else:
+                    rag_budget = max_ctx
+                rag_context, source_map = build_context(final_docs, max_chars=rag_budget, cfg=config)
+                context_parts.append("[知识库检索结果]\n" + rag_context)
 
             yield {
                 "type": "metadata",
@@ -2344,15 +3161,21 @@ def ask_stream(
         # 通知前端：正在生成回答
         yield {"type": "status", "stage": "generating"}
 
-        # [FIX] 将截断后的 user_history 格式化并传入 answer_stream，确保历史实际生效
-        history_text = format_chat_history(user_history)
-        if route == "rag_search" and not source_map:
-            full_answer = "知识库中未找到足够相关的证据，暂时无法确认。请补充文档名称或路径，或核对原始资料。"
-            yield {"type": "chunk", "content": full_answer}
+        # history_text 已在检索前计算（改写阶段同样复用），此处直接用于答案生成
+        grounded_notation_answer = build_grounded_notation_answer(final_context) if is_notation_specialized else ""
+
+        if grounded_notation_answer:
+            full_answer = grounded_notation_answer
+            yield {"type": "chunk", "content": grounded_notation_answer}
+            debug_log("[NOTATION] 使用格式表结构化转写直接回答")
         else:
             with Timer("stage_answer_stream"):
                 first_chunk_time = None
-                for chunk in answer_stream(llm, question, final_context, route, route_reason, chat_history=history_text, coverage_level=coverage_info["level"]):
+                for chunk in answer_stream(
+                        llm, question, final_context, route, route_reason,
+                        chat_history=history_text,
+                        coverage_level=coverage_info["level"],
+                        coverage_hint=coverage_info.get("hint") or ""):
                     content = getattr(chunk, "content", "")
                     if content:
                         if first_chunk_time is None:

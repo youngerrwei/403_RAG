@@ -253,8 +253,50 @@ data: [DONE]
 | `VLLM_API_KEY` | `lab-secret-key` | vLLM 服务密钥 |
 | `VLLM_MODEL_NAME` | `./models/Qwen3-8B-Instruct` | vLLM 推理模型本地路径 |
 | `FILE_SEARCH_LIMIT` | `200` | 文件搜索结果上限 |
+| `ENABLE_MARKDOWN_STRUCTURE_GUARD` | `true` | 标题/代码块/表格原子块保护 |
+| `ENABLE_PATH_CONTEXT_PREFIX` | `true` | 向量化前缀注入小组/设备目录层级 |
+| `CHUNK_FILTER_SPECIAL_CHAR_RATIO` | `0.25` | 质量过滤特殊字符占比上限 |
+| `ENABLE_TABLE_FILTER_EXEMPTION` | `true` | 表格/代码块豁免长度与字符占比过滤 |
+| `INGEST_MAX_FAILED_FILES` | `0` | 允许的文档加载失败数，超出即中止入库 |
+| `QDRANT_INDEX_FAIL_FAST` | `true` | payload 索引缺失时中止入库 |
+| `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照，消除重复全盘遍历 |
+| `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒）；键含索引版本 |
+| `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免噪声路径误命中 |
+| `CATALOG_MAX_TRAVERSAL` | `200000` | 目录树快照遍历上限（目录数）；默认覆盖完整语料目录树，避免靠后目录（如 `设备操作指南/VLP小组`）缺失导致 file_list/hybrid 目录枚举错配 |
+| `MAX_HYBRID_QUERIES` | `8` | hybrid 目录驱动查询去重后的最大路数；完整清单仍由答案区块提供 |
+| `MAX_DENSE_QUERIES` | `4` | Dense 查询最大路数（hybrid 由 `MAX_HYBRID_QUERIES` 单独限流） |
+| `MAX_HYDE_QUERIES` | `2` | HyDE 假设文档最大路数 |
+| `MAX_SPARSE_CONDITIONS` | `30` | MatchText should 条件预算 |
+| `ENABLE_HISTORY_AWARE_REWRITE` | `true` | 改写阶段使用对话历史消解代词 |
+| `RERANKER_RELATIVE_RATIO` | `0` | 重排相对 Top-1 比例阈值（0=关闭） |
+| `RERANKER_MIN_KEEP` | `0` | 重排最少保留条数（0=关闭） |
+| `ENABLE_ANSWERABILITY_GATE` | `true` | 关键词零证据 + 低分时判为知识库无答案，避免假引用 |
+| `ANSWERABILITY_TOP_SCORE_FLOOR` | `0.90` | 拒答闸门的 Top-1 分数下限（双证据策略下上调） |
+| `ANSWERABILITY_MIN_KEYWORD_HITS` | `1` | 判定可答所需的关键词最少命中数 |
+| `ANSWERABILITY_MIN_OVERLAP_HITS` | `2` | 原始问题与召回文档身份字段的中文 2-gram 最少重合数 |
+| `MAX_SPARSE_TERMS` | `12` | MatchText 检索词元预算（纯英文型号修复后放大） |
+| `PARENT_EXPAND_MAX_CHARS` | `9000` | 父块展开累计预算，与最终上下文预算解耦 |
+| `PARENT_MAX_SINGLE_CHARS` | `1500` | 单个父块最大字符数，按行边界截断 |
+| `PARENT_MAX_PER_SOURCE` | `3` | 同一来源文件的父块配额，避免单手册垄断候选 |
+| `LEXICON_PATH` | `config/retrieval_lexicon.json` | 结构化检索规则词典（词表/答案模板/表格恢复模板） |
+| `CORPUS_LEXICON_PATH` | `data/corpus_lexicon.json` | 由语料 `rel_path` 离线生成的派生词典 |
+| `ENABLE_CORPUS_LEXICON` | `true` | 启用语料派生的小组别名；关闭则回退静态别名 |
+| `ENABLE_NOTATION_SPECIALIZATION` | `true` | 变量格式表特判能力开关，关闭后走通用检索+LLM |
+| `ENABLE_EVIDENCE_RERANK` | `true` | 证据加权稳定重排，仅影响引用顺序 |
+| `EVIDENCE_RERANK_WEIGHT` | `0.12` | 型号/路径精确命中在重排并列时的加分权重 |
+| `EVIDENCE_PRIOR_WEIGHT` | `0.12` | 强证据先验每命中一个（日期/文档标题词元/型号）的加性加分 |
+| `EVIDENCE_PRIOR_CAP` | `0.24` | 强证据先验加分上限，避免单文档被过度提升 |
+| `TABLE_SEMANTIC_MAX_REPLACEMENT_RATIO` | `0.15` | 表格语义转写跳过 U+FFFD 占比超阈值的行，避免放大 OCR 噪声 |
+| `RETRIEVAL_INDEX_VERSION` | `2` | 缓存键索引版本；入库逻辑变更后需递增（v3.2.0 因 page_content 变更已递增） |
+| `COVERAGE_HIGH_THRESHOLD` | `0.7` | 高覆盖度阈值 |
+| `COVERAGE_MEDIUM_THRESHOLD` | `0.5` | 中覆盖度阈值 |
+| `COVERAGE_LOW_THRESHOLD` | `0.3` | 低覆盖度阈值 |
+| `RERANK_QUERY_MODE` | `both` | 原始问题+改写问题共同重排 |
+| `RERANKER_ALLOW_LOW_SCORE_FALLBACK` | `false` | 全部低分时是否保底返回 1 条 |
+| `NOTATION_MATCH_BONUS` | `0.15` | 变量格式表命中块的加分上限 |
+| `ENABLE_CONTEXT_NOISE_FILTER` | `true` | 上下文过滤超长链接与 OCR 噪声 |
 
-**注意：** 不要使用 HuggingFace 在线路径（如 `BAAI/bge-m3`），统一使用本地模型路径。
+**注意：** 不要使用 HuggingFace 在线路径（如 `BAAI/bge-m3`），统一使用本地模型路径；新增配置键必须同步 `.env.example`、两侧 `load_config()` 与本表。
 
 ---
 

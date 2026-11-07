@@ -684,7 +684,9 @@
         html = html.replace(/\[来源(\d+)\]/g, (match, num) => {
             const src = sourceMap[num];
             if (src) {
-                return `<sup class="source-link" title="${escapeHtml(src.doc_title || '')}\n${escapeHtml(src.rel_path || '')}" style="color:#1a73e8;cursor:help;text-decoration:underline;">[${num}]</sup>`;
+                // 新增可选字段 header_path：完整章节路径优先展示，旧版 source_map 无该字段时保持原样
+                const chapter = src.header_path ? '\n' + escapeHtml(src.header_path) : '';
+                return `<sup class="source-link" title="${escapeHtml(src.doc_title || '')}\n${escapeHtml(src.rel_path || '')}${chapter}" style="color:#1a73e8;cursor:help;text-decoration:underline;">[${num}]</sup>`;
             }
             return match;
         });
@@ -1008,7 +1010,10 @@
             const filename = (c.source || "").split("/").pop();
             const section = c.section ? '<span class="citation-section">' + escapeHtml(c.section) + '</span>' : '';
             const score = Math.round((c.score || 0) * 100);
-            return '<div class="citation-item"><span class="citation-source">' + escapeHtml(filename) + '</span>' + section + '<span class="citation-score">' + score + '%</span></div>';
+            // 新增可选字段 index：与正文 [来源N] 对齐；旧版事件无该字段时静默省略
+            const indexLabel = Number.isInteger(c.index) && c.index > 0
+                ? '<span class="citation-index">[来源' + c.index + ']</span>' : '';
+            return '<div class="citation-item">' + indexLabel + '<span class="citation-source">' + escapeHtml(filename) + '</span>' + section + '<span class="citation-score">' + score + '%</span></div>';
         }).join("");
         return '<div class="citations-container"><div class="citations-toggle">\u{1F4DA} 参考来源 (' + citations.length + ') \u25B6</div><div class="citations-list">' + items + '</div></div>';
     }
