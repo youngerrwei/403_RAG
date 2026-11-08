@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 from lab_rag import agent_entry as ae
 from lab_rag import rag_agent as ra
 from agent_test_helpers import (_llm, drive as _drive, tool_steps as _tool_steps,
-                                load_assoc_scenarios, drive_assoc)
+                                load_assoc_scenarios, drive_assoc, make_dispatch)
 
 
 MULTISTEP_QUERIES = {
@@ -310,6 +310,105 @@ class CompoundRouteTests(unittest.TestCase):
             outputs, "A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结", cfg=cfg)
         for c in rag.call_args_list:
             self.assertIsNone(c.kwargs.get("route_hint"))
+
+
+class AgenticGroundingAndRecoveryTests(unittest.TestCase):
+    """无依据 / 工具失败时的自愈与诚实收敛（agentic RAG 鲁棒性优化）。"""
+
+    def _cfg(self, max_steps=4):
+        return {"AGENT_MAX_STEPS": max_steps, "AGENT_REPEAT_ACTION_GUARD": True,
+                "AGENT_TOTAL_TIMEOUT_S": 240, "AGENT_MAX_IDLE_STEPS": 2,
+                "AGENT_REUSE_ROUTE_HINT": True}
+
+    def test_tool_failure_recovers_to_fallback(self):
+        """内容工具执行失败（ok=False）：注入恢复提示，最终无依据则诚实收敛。"""
+        dispatch, _rag, _catalog = make_dispatch(rag_ok=False, rag_answer="")
+        outputs = [
+            'Thought: 检索\nAction: rag_qa["不存在的主题X"]',
+            'Answer: 根据知识库内容可概括为：某结论',
+        ]
+        events, llm, _r, _c = _drive(outputs, "关于X的什么问题", route="hybrid",
+                                    cfg=self._cfg(), dispatch=dispatch)
+        final = events[-1]
+        self.assertEqual(final["type"], "final")
+        self.assertFalse(final["agent_metrics"]["converged"])
+        self.assertIn("暂未能形成完整回答", final["content"])
+        # 工具失败后注入恢复提示：第二次 LLM 调用发生在失败之后
+        self.assertGreaterEqual(llm.invoke.call_count, 2)
+
+    def test_no_evidence_content_triggers_fallback(self):
+        """正文检索覆盖度为 none：不标记依据，最终无依据则诚实收敛。"""
+        dispatch, _rag, _catalog = make_dispatch(rag_answer="未检索到",
+                                                rag_coverage_level="none")
+        outputs = [
+            'Thought: 检索\nAction: rag_qa["不存在的主题X"]',
+            'Answer: 根据知识库内容可概括为：某结论',
+        ]
+        events, llm, _r, _c = _drive(outputs, "关于X的问题", route="hybrid",
+                                    cfg=self._cfg(), dispatch=dispatch)
+        final = events[-1]
+        self.assertFalse(final["agent_metrics"]["converged"])
+        self.assertIn("暂未能形成完整回答", final["content"])
+
+    def test_partial_evidence_medium_still_grounded(self):
+        """覆盖度 medium（有依据）：不作无依据收敛，正常作答。"""
+        dispatch, _rag, _catalog = make_dispatch(rag_answer="部分依据",
+                                                rag_coverage_level="medium")
+        outputs = [
+            'Thought: 检索\nAction: rag_qa["A"]',
+            'Answer: 根据知识库内容可概括为：结论',
+        ]
+        events, llm, _r, _c = _drive(outputs, "关于A的问题", route="hybrid",
+                                    cfg=self._cfg(), dispatch=dispatch)
+        final = events[-1]
+        self.assertTrue(final["agent_metrics"]["converged"])
+        self.assertNotIn("暂未能形成完整回答", final["content"])
+
+    def test_tool_failure_then_success_grounds(self):
+        """工具先失败后成功：最终获得依据并正常收敛。"""
+        first = {"ok": False, "observation": "超时", "catalog_result": None,
+                 "coverage_level": None, "elapsed_s": 0.0, "tool_call_id": "tc-1"}
+        second = {"ok": True, "observation": "正文依据", "catalog_result": None,
+                  "coverage_level": "high", "elapsed_s": 0.0, "tool_call_id": "tc-2"}
+        state = {"n": 0}
+
+        def dispatch(name, arg, username, route_hint=None, tool_call_id=""):
+            from lab_rag.agent_tools import tool_role
+            state["n"] += 1
+            return second if state["n"] > 1 else first
+
+        outputs = [
+            'Thought: 第一次（失败）\nAction: rag_qa["A"]',
+            'Thought: 换角度\nAction: rag_qa["A 更具体"]',
+            'Answer: 根据知识库内容可概括为：结论',
+        ]
+        events, llm, _r, _c = _drive(outputs, "关于A的问题", route="hybrid",
+                                    cfg=self._cfg(), dispatch=dispatch)
+        final = events[-1]
+        self.assertTrue(final["agent_metrics"]["converged"])
+        self.assertNotIn("暂未能形成完整回答", final["content"])
+        self.assertEqual(final["agent_metrics"]["tool_calls"], 2)
+
+
+class DeeperChainTests(unittest.TestCase):
+    """更深链式能力：默认步数上限提高到 6，可支撑 5 次工具调用 + 1 次作答。"""
+
+    def test_five_tool_chain_converges(self):
+        outputs = [
+            'Thought: 1\nAction: rag_qa["A"]',
+            'Thought: 2\nAction: rag_qa["B"]',
+            'Thought: 3\nAction: rag_qa["C"]',
+            'Thought: 4\nAction: rag_qa["D"]',
+            'Thought: 5\nAction: rag_qa["E"]',
+            'Answer: 根据知识库内容可概括为：五跳归纳结论',
+        ]
+        # 不依赖旧默认 4，显式给足步数上限以验证更深链路能力
+        cfg = {"AGENT_MAX_STEPS": 6, "AGENT_REPEAT_ACTION_GUARD": True,
+               "AGENT_TOTAL_TIMEOUT_S": 240, "AGENT_MAX_IDLE_STEPS": 2}
+        events, llm, rag, catalog = _drive(outputs, "深度链式问题", route="hybrid", cfg=cfg)
+        final = events[-1]
+        self.assertTrue(final["agent_metrics"]["converged"])
+        self.assertEqual(final["agent_metrics"]["tool_calls"], 5)
 
 
 if __name__ == "__main__":

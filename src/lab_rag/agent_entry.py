@@ -127,6 +127,21 @@ _REPEAT_ACTION_HINT = (
     "若信息已足够，直接输出 Answer 并说明哪一部分未检索到依据。"
 )
 
+# 工具执行失败（超时/异常/未知工具）：注入恢复提示，不计入有效依据，继续换角度重试
+_RECOVERY_HINT = (
+    "上一步工具执行未成功（可能超时或出错），该结果不可作为依据。"
+    "请换一个检索角度或更换工具：目录枚举未命中时改用语正文检索 rag_qa，"
+    "正文检索异常时改用语目录枚举或换更具体的关键词；不要基于失败结果作答。"
+    "若多次尝试仍失败且信息不足，直接说明未在知识库中检索到依据。"
+)
+
+# 正文检索到但覆盖度低/未命中（none/very_low 或空结果）：提示换角度重试，不标记有效依据
+_NO_EVIDENCE_HINT = (
+    "本次正文检索未获得充分依据（覆盖度低或未命中相关文档），该结果不可作为作答依据。"
+    "请换更具体的关键词、设备型号、日期戳或实体重试，或改用 list_group_files 枚举目录；"
+    "不要基于无依据结果作答。若已多次换角度仍无依据，直接说明未检索到。"
+)
+
 
 def _compact_observation(text: str, cfg: dict) -> str:
     """有界裁剪「注入 LLM 上下文」的工具结果，保留首尾并标注省略量。
@@ -244,6 +259,17 @@ def ask_agent_stream(
     used_list_tool = False
     used_rag_after_list = False
     last_observation = ""
+    # 依据记账：是否获得过正文/目录有效依据，用于最终作答前的「无依据诚实收敛」守卫
+    content_grounded = False
+    catalog_grounded = False
+
+    def _grounded_for_answer() -> bool:
+        """是否已有作答依据：正文依据，或目录型问题已获得目录枚举结果。"""
+        if content_grounded:
+            return True
+        if (initial_route and initial_route.get("route") == "file_list") and catalog_grounded:
+            return True
+        return False
 
     def finalize_answer(value: str) -> str:
         answer = sanitize_generated_answer(value)
@@ -283,7 +309,7 @@ def ask_agent_stream(
         # ---- ReAct 循环 ----
         llm = build_qwen_llm()
         messages = _initial_messages(question, chat_history)
-        max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 4)))
+        max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 6)))
         max_idle = max(0, int(cfg.get("AGENT_MAX_IDLE_STEPS", 2)))
         llm_budget = max_steps + max_idle + 1
         observation_indices: List[int] = []
@@ -352,11 +378,27 @@ def ask_agent_stream(
                     seen_actions.add((CONTENT_TOOL_NAME, question))
                     used_rag_after_list = True
                     last_observation = result["observation"]
+                    # 与 step-4 一致的记账：有效正文结果记为依据，避免最终作答被误判无依据
+                    res_cov = result.get("coverage_level")
+                    if result.get("ok") and res_cov not in ("none", "very_low") \
+                            and (result["observation"] or "").strip():
+                        content_grounded = True
                     if result["catalog_result"]:
                         latest_catalog_result = result["catalog_result"]
                     yield from emit_tool_step(step, CONTENT_TOOL_NAME, question, result)
                     append_observation(result["observation"], "请基于目录结果与正文给出 Answer。")
                     continue
+
+                # 无依据却要作答：拒绝凭空作答，转入诚实收敛
+                if tool_calls > 0 and not _grounded_for_answer():
+                    final_answer = finalize_answer(
+                        _agent_fallback_answer(question, tool_log, last_observation, cfg))
+                    append_user_chat_history(username, "user", question)
+                    append_user_chat_history(username, "assistant", final_answer)
+                    yield {"type": "final", "content": final_answer,
+                           "file_result": latest_catalog_result,
+                           "agent_metrics": agent_metrics(False)}
+                    return
 
                 final_answer = finalize_answer(parse_answer(content))
                 append_user_chat_history(username, "user", question)
@@ -398,13 +440,40 @@ def ask_agent_stream(
             tool_calls += 1
             tool_log.append((name, arg))
             last_observation = result["observation"]
+
+            # 工具执行失败：注入恢复提示、不计入有效依据，继续换角度重试
+            if not result.get("ok"):
+                yield from emit_tool_step(step, name, arg, result)
+                append_observation(result["observation"], _RECOVERY_HINT)
+                continue
+
             role = tool_role(name)
             if role == "catalog":
                 used_list_tool = True
-            if used_list_tool and role == "content":
-                used_rag_after_list = True
-            if result["catalog_result"]:
-                latest_catalog_result = result["catalog_result"]
+                # 目录枚举返回了非空结果（无论 catalog_result 是否为结构化对象）即可作为作答依据
+                if result["catalog_result"] or (result["observation"] or "").strip():
+                    catalog_grounded = True
+                    if result["catalog_result"]:
+                        latest_catalog_result = result["catalog_result"]
+            elif role == "content":
+                if used_list_tool:
+                    used_rag_after_list = True
+                cov = result.get("coverage_level")
+                # 检索无命中（覆盖度 none）或返回空：提示换角度重试，不标记依据；
+                # 仅 none 触发（very_low 仍属有命中，交由底层可答性闸门与 LLM 判断，避免过度收敛）
+                if cov == "none" or not (result["observation"] or "").strip():
+                    if result["catalog_result"]:
+                        latest_catalog_result = result["catalog_result"]
+                    yield from emit_tool_step(step, name, arg, result)
+                    append_observation(result["observation"], _NO_EVIDENCE_HINT)
+                    continue
+                content_grounded = True
+                if result["catalog_result"]:
+                    latest_catalog_result = result["catalog_result"]
+            else:
+                # 未知工具：dispatch 已降级为错误观察，复用其结果
+                pass
+
             yield from emit_tool_step(step, name, arg, result)
             append_observation(
                 result["observation"],
@@ -428,6 +497,16 @@ def ask_agent_stream(
                 content = resp.content if hasattr(resp, "content") else str(resp)
                 yield {"type": "step_llm", "step": step, "content": content}
                 if "Answer:" in content:
+                    # 无依据：诚实收敛而非回显无依据作答
+                    if tool_calls > 0 and not _grounded_for_answer():
+                        final_answer = finalize_answer(
+                            _agent_fallback_answer(question, tool_log, last_observation, cfg))
+                        append_user_chat_history(username, "user", question)
+                        append_user_chat_history(username, "assistant", final_answer)
+                        yield {"type": "final", "content": final_answer,
+                               "file_result": latest_catalog_result,
+                               "agent_metrics": agent_metrics(False)}
+                        return
                     final_answer = finalize_answer(parse_answer(content))
                     append_user_chat_history(username, "user", question)
                     append_user_chat_history(username, "assistant", final_answer)

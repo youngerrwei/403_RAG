@@ -4,6 +4,32 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.7] Agentic RAG 鲁棒性优化 + 测试集扩充
+
+### Changed
+
+- **Agentic RAG 无依据/失败自愈**：`agent_entry.py` ReAct 编排器新增两类鲁棒性守卫——
+  1. **工具失败恢复**：工具执行失败（`dispatch_tool` 返回 `ok=False`）时注入恢复提示、不计入有效依据并继续换角度重试，而非把失败结果当依据。
+  2. **无依据诚实收敛**：正文检索覆盖度为 `none/very_low` 或返回空时，注入换角度重试提示且不标记依据；最终要作答却**全程无有效依据**时，转入诚实收敛（拒绝凭空作答），而非回显无依据结论。
+  - 依据记账：`content_grounded`（正文依据）与 `catalog_grounded`（目录枚举依据）区分；目录型问题以目录枚举结果作为作答依据。
+  - 信号透传：底层 `ask_rag` 的 `coverage.level` 经 `rag_tool.ask_rag` → `_handle_rag_qa` → `dispatch_tool` 一路透传到编排器（`agent_tools.py`）。
+- **更深链式能力**：`AGENT_MAX_STEPS` 默认上限由 `4` 提高到 `6`（单次「工具调用」计 1 步、最终作答不占步数，故可支撑 5 次检索 + 1 次作答），覆盖更长链式/多实体/跨多小组任务。同步更新 `rag_agent.py` `load_config` 默认与 `AGENTS.md` 配置共识表。
+
+### Added
+
+- **测试集扩充**：`tests/agent_assoc_scenarios.json` 新增 8 个 agentic 场景——深链提取归纳（`deep_paper_dive`）、跨三小组对比（`three_group_compare`）、嵌套目录导航（`nested_manuals`）、自我纠正换角度（`self_correct`）、定位+逐项聚合（`device_spec_aggregate`）、多跳引用说明（`citation_explain`）、多格式规范链路（`format_rule_chain`）、纯目录列举（`pure_listing`）。上述场景同时被单测与离线评测脚本自动消费。
+- **单测覆盖新能力**：`tests/test_agent_multistep.py` 新增 `AgenticGroundingAndRecoveryTests`（工具失败恢复、无依据收敛、部分依据仍正常作答、失败后成功）与 `DeeperChainTests`（5 次工具链收敛）；`agent_test_helpers.py` 的 `make_dispatch`/`drive` 支持模拟 `ok=False` 与 `coverage_level`。
+
+### 说明
+
+- 全部为离线 mock 验证，零回归风险；生产默认步数上限提升仅在复杂长链时生效，简单查询仍 1–2 步收敛。
+- 无仓库重建；agentic 鲁棒性守卫默认开启。
+
+---
+
+
+
+
 ---
 
 ## [3.4.6] 单卡 3090 模型优化落地：vLLM 内置 BitsAndBytes 4-bit（免下载）

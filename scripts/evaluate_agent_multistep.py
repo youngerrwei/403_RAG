@@ -150,9 +150,12 @@ def run_scenario(name, spec, cfg):
 
     def dispatch(name, arg, username, route_hint=None, tool_call_id=""):
         # 统一分派点：目录工具返回长清单，正文工具返回固定答案
-        obs = observation if name == "list_group_files" else "正文依据"
+        # 注意：部分 JSON 场景未声明 observation，需保证目录工具返回非空清单（否则依据误判）
+        obs = (observation if name == "list_group_files" else "正文依据") or (
+            "目录：A设备/B设备" if name == "list_group_files" else "正文依据")
         return {"ok": True, "observation": obs, "catalog_result": None,
-                "elapsed_s": 0.0, "tool_call_id": tool_call_id or "tc-perf"}
+                "coverage_level": None, "elapsed_s": 0.0,
+                "tool_call_id": tool_call_id or "tc-perf"}
 
     with patch.object(ae, "rule_based_route", return_value={"route": spec["route"], "target": "VLC小组"}), \
             patch.object(ae, "_agent_config", return_value=scenario_cfg), \

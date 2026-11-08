@@ -719,7 +719,7 @@ def load_config() -> dict:
         # 按「词元形态」判定，不依赖任何测试集语义或具体文档名。
         "ENABLE_ADAPTIVE_LEXICAL_RECALL": _env_bool("ENABLE_ADAPTIVE_LEXICAL_RECALL", "true"),
         # ReAct Agent 编排层：步数预算与重复调用抑制（不硬编码可调参数）
-        "AGENT_MAX_STEPS": int(os.getenv("AGENT_MAX_STEPS", "4")),
+        "AGENT_MAX_STEPS": int(os.getenv("AGENT_MAX_STEPS", "6")),
         "AGENT_REPEAT_ACTION_GUARD": _env_bool("AGENT_REPEAT_ACTION_GUARD", "true"),
         # 整个 Agent 轮次的总耗时预算（秒），与 web_app 300s 上游超时错开
         "AGENT_TOTAL_TIMEOUT_S": float(os.getenv("AGENT_TOTAL_TIMEOUT_S", "240")),

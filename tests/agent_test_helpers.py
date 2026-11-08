@@ -57,10 +57,11 @@ def _llm(outputs):
 
 
 def make_dispatch(observation="目录：A设备/B设备", rag_answer="正文依据",
-                  catalog_result=None):
+                  catalog_result=None, rag_ok=True, rag_coverage_level=None):
     """返回 (dispatch_mock, rag_recorder, catalog_recorder)。
 
     rag_recorder / catalog_recorder 记录每次工具调用的参数，便于沿用既有断言。
+    rag_ok / rag_coverage_level 用于模拟工具失败与「检索无充分依据」场景。
     """
     rag = Mock(return_value={"answer": rag_answer, "file_result": catalog_result})
     catalog = Mock(return_value={"mode": "filesystem_directory"})
@@ -71,22 +72,36 @@ def make_dispatch(observation="目录：A设备/B设备", rag_answer="正文依�
         if role == "content":
             rag(arg, username=username, route_hint=route_hint)
             obs, cat = rag_answer, catalog_result
+            ok = rag_ok
+            cov = rag_coverage_level
         elif role == "catalog":
             catalog(arg)
             obs, cat = observation, catalog_result
+            ok = True
+            cov = None
         else:
             obs, cat = f"[工具错误] 未找到名为 {name} 的工具。", None
-        return {"ok": True, "observation": obs, "catalog_result": cat,
-                "elapsed_s": 0.0, "tool_call_id": tool_call_id or "tc-test"}
+            ok = False
+            cov = None
+        return {"ok": ok, "observation": obs, "catalog_result": cat,
+                "coverage_level": cov, "elapsed_s": 0.0,
+                "tool_call_id": tool_call_id or "tc-test"}
 
     return Mock(side_effect=dispatch), rag, catalog
 
 
 def drive(outputs, question, route="hybrid", cfg=None,
-          observation="目录：A设备/B设备", rag_answer="正文依据"):
-    """驱动流式单编排器，返回 (events, llm, rag_recorder, catalog_recorder)。"""
+          observation="目录：A设备/B设备", rag_answer="正文依据", dispatch=None):
+    """驱动流式单编排器，返回 (events, llm, rag_recorder, catalog_recorder)。
+
+    dispatch 可选：传入自定义分派（如 make_dispatch(rag_ok=False)）以模拟工具失败/无依据。
+    传入时 rag_recorder/catalog_recorder 为 None（记录器由调用方自行持有）。
+    """
     llm = _llm(outputs)
-    dispatch, rag, catalog = make_dispatch(observation=observation, rag_answer=rag_answer)
+    if dispatch is None:
+        dispatch, rag, catalog = make_dispatch(observation=observation, rag_answer=rag_answer)
+    else:
+        rag = catalog = None
     cfg = cfg or {"AGENT_MAX_STEPS": 4, "AGENT_REPEAT_ACTION_GUARD": True,
                   "AGENT_TOTAL_TIMEOUT_S": 240, "AGENT_MAX_IDLE_STEPS": 2}
     with patch.object(ae, "rule_based_route", return_value={"route": route, "target": "VLC小组"}), \

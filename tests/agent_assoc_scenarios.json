@@ -58,5 +58,110 @@
       {"thought": "梳理两者配合关系与引用手册", "tool": "rag_qa", "arg": "USRP RIO HOLOEYE 配合 引用手册 梳理"},
       {"answer": "根据知识库内容可概括为：USRP RIO 负责射频信号收发，HOLOEYE 负责光场调制，二者通过时序同步联用，相关手册分别为 USRP RIO 入门指南与 HOLOEYE LETO-3 Manuals。"}
     ]
+  },
+  {
+    "id": "deep_paper_dive",
+    "category": "检索→多篇提取→归纳",
+    "question": "A2X小组在光通信方向有哪些论文，逐篇提取摘要并归纳研究脉络",
+    "route": "hybrid",
+    "max_steps": 5,
+    "steps": [
+      {"thought": "定位 A2X 光通信方向论文候选", "tool": "rag_qa", "arg": "A2X小组 光通信 方向 论文"},
+      {"thought": "提取第一篇摘要", "tool": "rag_qa", "arg": "A2X小组 光通信 论文一 摘要 研究内容"},
+      {"thought": "提取第二篇摘要", "tool": "rag_qa", "arg": "A2X小组 光通信 论文二 摘要 研究内容"},
+      {"thought": "提取第三篇摘要", "tool": "rag_qa", "arg": "A2X小组 光通信 论文三 摘要 研究内容"},
+      {"answer": "根据知识库内容可概括为：三篇论文分别围绕硅光调制、相干接收与低功耗收发，逐步从器件走向系统级集成，形成清晰的研究脉络。"}
+    ]
+  },
+  {
+    "id": "three_group_compare",
+    "category": "跨三小组主题对比",
+    "question": "VLC、A2X、B3 三个小组在信号处理方向各自的研究侧重是什么，请对比",
+    "route": "hybrid",
+    "max_steps": 5,
+    "steps": [
+      {"thought": "检索 VLC 信号处理侧重", "tool": "rag_qa", "arg": "VLC小组 信号处理 研究侧重"},
+      {"thought": "检索 A2X 信号处理侧重", "tool": "rag_qa", "arg": "A2X小组 信号处理 研究侧重"},
+      {"thought": "检索 B3 信号处理侧重", "tool": "rag_qa", "arg": "B3小组 信号处理 研究侧重"},
+      {"thought": "对比三组合成结论", "tool": "rag_qa", "arg": "VLC A2X B3 信号处理 研究侧重 对比"},
+      {"answer": "根据知识库内容可概括为：VLC 侧重实时 DSP 实现，A2X 侧重阵列校准，B3 侧重低功耗前端，三者互补。"}
+    ]
+  },
+  {
+    "id": "nested_manuals",
+    "category": "嵌套目录导航",
+    "question": "VLC小组某设备的 Manuals 与 SDK 子目录下分别有哪些资料，并各说明其用途",
+    "route": "hybrid",
+    "max_steps": 5,
+    "steps": [
+      {"thought": "先列 VLC 小组设备 Manuals", "tool": "list_group_files", "arg": "VLC小组 设备 Manuals"},
+      {"thought": "目录未见 SDK，换更窄关键词列 SDK 子目录", "tool": "list_group_files", "arg": "VLC小组 SDK 子目录"},
+      {"thought": "读某手册正文说明用途", "tool": "rag_qa", "arg": "VLC小组 Manuals 入门指南 用途 内容说明"},
+      {"thought": "读 SDK 文档正文说明用途", "tool": "rag_qa", "arg": "VLC小组 SDK 开发文档 用途 内容说明"},
+      {"answer": "根据知识库内容可概括为：Manuals 下为设备操作与快速入门手册，SDK 子目录下为二次开发接口与示例，二者分别面向使用与集成。"}
+    ]
+  },
+  {
+    "id": "self_correct",
+    "category": "自我纠正（换角度重试）",
+    "question": "EDU36311A 电源的快速入门讲了什么",
+    "route": "hybrid",
+    "max_steps": 4,
+    "steps": [
+      {"thought": "先用较宽关键词检索", "tool": "rag_qa", "arg": "EDU36311A 电源 内容"},
+      {"thought": "改用更精确的设备+文档名检索", "tool": "rag_qa", "arg": "EDU36311A 电源 快速入门 指南 内容说明"},
+      {"thought": "再针对快速入门章节提取要点", "tool": "rag_qa", "arg": "EDU36311A 快速入门 章节 要点 总结"},
+      {"answer": "根据知识库内容可概括为：快速入门覆盖上电自检、基础测量与保护阈值设置，是首次使用的操作基线。"}
+    ]
+  },
+  {
+    "id": "device_spec_aggregate",
+    "category": "定位+逐项提取+聚合",
+    "question": "列出 A2X小组 的主要设备，并分别说明其关键规格参数",
+    "route": "hybrid",
+    "max_steps": 5,
+    "steps": [
+      {"thought": "先列出 A2X 小组设备", "tool": "list_group_files", "arg": "A2X小组 设备"},
+      {"thought": "提取设备一规格", "tool": "rag_qa", "arg": "A2X小组 设备一 关键规格 参数"},
+      {"thought": "提取设备二规格", "tool": "rag_qa", "arg": "A2X小组 设备二 关键规格 参数"},
+      {"thought": "提取设备三规格", "tool": "rag_qa", "arg": "A2X小组 设备三 关键规格 参数"},
+      {"answer": "根据知识库内容可概括为：三台设备分别覆盖采集、处理与输出环节，关键规格集中在带宽、动态范围与接口类型，形成完整链路。"}
+    ]
+  },
+  {
+    "id": "citation_explain",
+    "category": "多跳引用说明",
+    "question": "VLC小组的 HOLOEYE 调制器手册里引用了哪些文献，并说明这些文献对实验的作用",
+    "route": "hybrid",
+    "max_steps": 5,
+    "steps": [
+      {"thought": "定位 HOLOEYE 调制器手册内容", "tool": "rag_qa", "arg": "VLC小组 HOLOEYE 调制器 手册"},
+      {"thought": "提取手册引用的文献", "tool": "rag_qa", "arg": "HOLOEYE 调制器 手册 引用 文献"},
+      {"thought": "说明各文献的实验作用", "tool": "rag_qa", "arg": "HOLOEYE 手册 引用文献 实验 作用 说明"},
+      {"answer": "根据知识库内容可概括为：手册引用了两篇文献，分别用于相位校准算法验证与色散补偿链路设计，是实验可复现的理论支撑。"}
+    ]
+  },
+  {
+    "id": "format_rule_chain",
+    "category": "多格式规范链路",
+    "question": "组会汇报的周报格式与实验记录要求分别是什么，总结成规范清单",
+    "route": "llm_fallback",
+    "max_steps": 4,
+    "steps": [
+      {"thought": "检索周报格式要求", "tool": "rag_qa", "arg": "周报 格式 要求 规范"},
+      {"thought": "检索实验记录要求", "tool": "rag_qa", "arg": "实验记录 要求 规范 内容"},
+      {"answer": "根据知识库内容可概括为：周报需含进展、风险与下周计划；实验记录需含环境、步骤与原始数据留存，二者共同构成可追溯的汇报规范。"}
+    ]
+  },
+  {
+    "id": "pure_listing",
+    "category": "纯目录列举（file_list）",
+    "question": "列出 VLC小组 名下有哪些设备文档",
+    "route": "file_list",
+    "max_steps": 2,
+    "steps": [
+      {"thought": "列出 VLC 小组设备文档", "tool": "list_group_files", "arg": "VLC小组 设备"},
+      {"answer": "根据目录枚举结果，VLC小组设备文档涵盖示波器、信号源与调制器等多类手册与清单。"}
+    ]
   }
 ]

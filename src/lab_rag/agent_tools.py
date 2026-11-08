@@ -29,9 +29,12 @@ class ToolSpec:
 
 
 def _handle_rag_qa(arg: str, username: str,
-                   route_hint: Optional[dict]) -> Tuple[str, Any]:
+                   route_hint: Optional[dict]) -> Tuple[str, Any, Optional[str]]:
     rag_result = ask_rag(arg, username=username, route_hint=route_hint)
-    return rag_result.get("answer", ""), rag_result.get("file_result")
+    coverage = rag_result.get("coverage") or {}
+    # 透传底层覆盖度级别，供编排器判断「检索是否获得充分依据」（无依据时不作为作答依据）
+    coverage_level = coverage.get("level")
+    return (rag_result.get("answer", ""), rag_result.get("file_result"), coverage_level)
 
 
 def _handle_list_group_files(arg: str, username: str,
@@ -110,18 +113,26 @@ def dispatch_tool(name: str, arg: str, username: str,
             "observation": (f"[工具错误] 未找到名为 {name} 的工具。"
                             f"可用工具：{', '.join(tool_names())}"),
             "catalog_result": None,
+            "coverage_level": None,
             "elapsed_s": 0.0,
             "tool_call_id": tool_call_id,
         }
 
     started = time.perf_counter()
     try:
-        observation, catalog_result = spec.handler(arg, username, route_hint)
+        handler_out = spec.handler(arg, username, route_hint)
+        # 正文工具返回三元组（含覆盖度级别），目录工具返回二元组
+        if len(handler_out) == 3:
+            observation, catalog_result, coverage_level = handler_out
+        else:
+            observation, catalog_result = handler_out
+            coverage_level = None
         elapsed = time.perf_counter() - started
         return {
             "ok": True,
             "observation": str(observation or ""),
             "catalog_result": catalog_result,
+            "coverage_level": coverage_level,
             "elapsed_s": round(elapsed, 3),
             "tool_call_id": tool_call_id,
         }
