@@ -148,6 +148,25 @@ SCENARIOS = {
             "Answer: 根据知识库内容可概括为：MSO-X 3054A 的使用方法",
         ],
     },
+    # rag_search 确定性直调已纳入 ReAct 循环：内容型问题由模型自主调用内容工具后作答
+    "content_in_loop": {
+        "question": "周报格式是什么",
+        "route": "rag_search",
+        "outputs": [
+            _action("rag_qa", "周报格式规范"),
+            "Answer: 根据知识库内容可概括为：周报格式规范",
+        ],
+    },
+    # content-first 守卫：模型首轮直接 Answer（无依据）时须被挡回，先检索正文
+    "content_first_guard": {
+        "question": "周报怎么写",
+        "route": "rag_search",
+        "outputs": [
+            "Answer: 第一段写本周完成事项",
+            _action("rag_qa", "周报写作规范"),
+            "Answer: 根据知识库内容可概括为：周报写作规范",
+        ],
+    },
 }
 
 

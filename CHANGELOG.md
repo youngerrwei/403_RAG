@@ -4,6 +4,27 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.10] rag_search 纳入 ReAct 循环（统一全意图编排范式）
+
+### Changed
+
+- **移除 `rag_search` 确定性直调短路**：所有意图（内容/目录/混合）现在统一进入 ReAct 循环，由模型自主决定调用哪个内容工具（`rag_qa` / `read_file`）、是否再补检索。修正 3.4.9 说明中「rag_search 仍走确定性直调」的保留项。
+- 内容型路由仍发出 `route_direct`（编排器 LLM 路由决策事件），但**仅作为决策标记**，随后进入循环并产出真实的 `step_llm` / `step_tool`；`final.agent_metrics` 不再含 `deterministic_route` 字段。
+- 内容型路由在用户问题前注入轻量路由倾向提示，引导模型首轮即调用内容工具，减少无谓空转（模型仍可自主选择 `read_file`）。
+
+### Added
+
+- **content-first 守卫**：内容型路由下，模型若未调用任何内容工具就想结束（`Answer:` 或不带前缀的自由文本），守卫挡回并要求先检索正文；覆盖主循环 `Answer` 分支、自由文本分支与预算耗尽收敛轮，任何路径都必须有正文依据才允许输出，否则「无依据诚实收敛」。保留旧确定性直调「必有正文依据」的保证。
+
+### 说明
+
+- SSE 协议格式未变，仅 `route_direct` 语义与 `agent_metrics` 字段调整；`AGENTS.md` 第 7 节与前端 `index.html` 文案已同步（前端对未知字段有兜底，向后兼容）。
+- 单测由 `DeterministicRouteTests` 改写为 `RagSearchLoopTests`（进入循环 / content-first 守卫 / 无依据诚实收敛），perf 与可靠性契约测试同步更新；源码契约断言由旧注释改为 `content_intent` / `content-first`。
+- 离线评测新增 `content_in_loop`、`content_first_guard` 两个场景：**24 场景收敛率 0.958**（原 22 场景 0.955），`max_context_chars_peak` 5258 远低于 `AGENT_CONTEXT_MAX_CHARS=16000`，无上下文爆炸；内容型问题进入循环后代价为 2~3 次 LLM + 1 次工具调用。
+- agent 全量单测 62 全过；可靠性测试 78 个仍为 7 个预存失败，无新增回归。
+
+---
+
 ## [3.4.9] Agent 强制 LLM 路由 + read_file 文档精读工具
 
 ### Added

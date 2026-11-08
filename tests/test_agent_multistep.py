@@ -156,24 +156,56 @@ class StepBudgetTests(unittest.TestCase):
         self.assertEqual(rag.call_count, 0)
 
 
-class DeterministicRouteTests(unittest.TestCase):
-    """明确内容型问题仍确定性直调 rag_qa，不进入 LLM 多轮循环。"""
+class RagSearchLoopTests(unittest.TestCase):
+    """内容型问题（rag_search）不再确定性直调，而是进入 ReAct 循环由模型自主调用内容工具。"""
 
-    def test_rag_search_route_uses_single_direct_call(self):
-        llm = Mock()
-        from agent_test_helpers import make_dispatch
-        dispatch, rag, _catalog = make_dispatch(rag_answer="周报格式正文")
-        with patch.object(ae, "route_query", return_value={"route": "rag_search", "target": "周报"}), \
-                patch.object(ae, "build_qwen_llm", return_value=llm), \
-                patch.object(ae, "dispatch_tool", dispatch), \
-                patch.object(ae, "append_user_chat_history"):
-            events = list(ae.ask_agent_stream("周报怎么写", username="tester"))
-        rag.assert_called_once_with("周报怎么写", username="tester", route_hint={"route": "rag_search", "target": "周报"})
-        llm.invoke.assert_not_called()
-        # 不再伪造模型思考：首条是编排器确定性路由事件，且带可追溯 tool_call_id
+    def test_rag_search_enters_loop_and_calls_content_tool(self):
+        outputs = [
+            'Thought: 检索周报格式\nAction: rag_qa["周报格式规范"]',
+            'Answer: 根据知识库内容可概括为：周报格式规范',
+        ]
+        events, llm, rag, catalog = _events(outputs, "周报怎么写", route="rag_search")
+        # 首条仍是编排器路由决策事件，但随后真正进入 LLM 循环（不再短路直调）
         self.assertEqual(events[0]["type"], "route_direct")
-        self.assertEqual(events[1]["tool_call_id"], "tc-1")
-        self.assertEqual([e["type"] for e in events][-1], "final")
+        self.assertIn("step_llm", [e["type"] for e in events])
+        llm.invoke.assert_called()
+        # 由模型自主发起内容工具调用，并透传内容路由 hint 避免重复路由
+        rag.assert_called_once_with("周报格式规范", username="tester",
+                                    route_hint={"route": "rag_search"})
+        final = events[-1]
+        self.assertEqual(final["type"], "final")
+        self.assertTrue(final["agent_metrics"]["converged"])
+        self.assertTrue(final["agent_metrics"]["content_grounded"])
+        self.assertNotIn("deterministic_route", final["agent_metrics"])
+
+    def test_content_first_guard_rejects_answer_without_tool(self):
+        """模型首轮直接 Answer（无依据）时，content-first 守卫挡回并要求先检索正文。"""
+        outputs = [
+            "Answer: 周报格式第一段写本周完成事项",
+            'Thought: 需要先检索\nAction: rag_qa["周报格式规范"]',
+            'Answer: 根据知识库内容可概括为：周报格式规范',
+        ]
+        events, llm, rag, catalog = _events(outputs, "周报怎么写", route="rag_search")
+        rag.assert_called_once()
+        final = events[-1]
+        self.assertEqual(final["type"], "final")
+        self.assertTrue(final["agent_metrics"]["converged"])
+        self.assertTrue(final["agent_metrics"]["content_grounded"])
+        self.assertGreaterEqual(final["agent_metrics"]["llm_calls"], 3)
+
+    def test_content_route_without_evidence_converges_honestly(self):
+        """内容型路由检索无命中时不得凭空作答，须诚实收敛。"""
+        outputs = [
+            'Thought: 检索\nAction: rag_qa["周报格式规范"]',
+            'Answer: 根据知识库内容可概括为：周报格式规范',
+        ]
+        dispatch, rag, _catalog = make_dispatch(rag_coverage_level="none")
+        events, llm, rag, catalog = _drive(outputs, "周报怎么写", route="rag_search",
+                                           dispatch=dispatch)
+        final = events[-1]
+        self.assertEqual(final["type"], "final")
+        self.assertFalse(final["agent_metrics"]["converged"])
+        self.assertFalse(final["agent_metrics"]["content_grounded"])
 
 
 class NonStreamAdapterTests(unittest.TestCase):

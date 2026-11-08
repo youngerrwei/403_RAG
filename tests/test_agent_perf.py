@@ -198,18 +198,25 @@ class AgentMetricsContractTests(unittest.TestCase):
         self.assertTrue(m["converged"])
         self.assertEqual(m["tool_calls"], 1)
 
-    def test_deterministic_route_exposes_metrics(self):
-        llm = Mock()
-        dispatch, _rag, _catalog = make_dispatch(rag_answer="周报格式正文")
-        with patch.object(ae, "route_query", return_value={"route": "rag_search", "target": "周报"}), \
-                patch.object(ae, "build_qwen_llm", return_value=llm), \
-                patch.object(ae, "dispatch_tool", dispatch), \
-                patch.object(ae, "append_user_chat_history"):
-            events = list(ae.ask_agent_stream("周报怎么写", username="tester"))
+    def test_rag_search_route_enters_loop_and_exposes_metrics(self):
+        """内容型路由不再确定性直调：进入循环、指标仍完整且不含 deterministic_route。"""
+        outputs = [
+            'Thought: 检索\nAction: rag_qa["周报格式规范"]',
+            'Answer: 根据知识库内容可概括为：周报格式规范',
+        ]
+        events, llm, rag = _drive(outputs, question="周报怎么写", route="rag_search")
         m = events[-1]["agent_metrics"]
+        for key in ("llm_calls", "tool_calls", "idle_steps", "context_chars_peak",
+                    "converged", "content_grounded", "elapsed_s"):
+            with self.subTest(key=key):
+                self.assertIn(key, m)
         self.assertTrue(m["converged"])
-        self.assertTrue(m["deterministic_route"])
+        self.assertTrue(m["content_grounded"])
+        self.assertNotIn("deterministic_route", m)
+        self.assertEqual(m["tool_calls"], 1)
+        self.assertGreaterEqual(m["llm_calls"], 2)
         self.assertEqual(events[0]["type"], "route_direct")
+        self.assertIn("step_llm", [e["type"] for e in events])
 
 
 class UnifiedOrchestratorContractTests(unittest.TestCase):

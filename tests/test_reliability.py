@@ -260,7 +260,9 @@ class ScriptContractTests(unittest.TestCase):
         self.assertIn("build_catalog_answer_section", rag_source)
         agent_source = (PROJECT_ROOT / "src" / "lab_rag" / "agent_entry.py").read_text(encoding="utf-8")
         self.assertIn('"tool_name": "list_catalog_entries"', agent_source)
-        self.assertIn('rag_result.get("file_result")', agent_source)
+        # rag_search 确定性直调已纳入 ReAct 循环：由 content-first 守卫保证必有正文依据
+        self.assertIn("content_intent", agent_source)
+        self.assertIn("content-first", agent_source)
         self.assertIn('"file_result": latest_catalog_result', agent_source)
 
     def test_readme_documents_persistent_cifs_mount(self):
@@ -456,33 +458,46 @@ class WebContractTests(unittest.TestCase):
         output = "Thought: 已完成检索。\nAnswer: 第一行\n第二行\n主要来源：VLC小组"
         self.assertEqual(parse_answer(output), "第一行\n第二行\n主要来源：VLC小组")
 
-    def test_agent_content_question_uses_rag_directly(self):
+    def test_agent_content_question_enters_react_loop(self):
         from lab_rag import agent_entry
 
+        from types import SimpleNamespace
         from unittest.mock import Mock
         result = {"ok": True, "observation": "知识库周报规范 [来源1]",
                   "catalog_result": None, "elapsed_s": 0.0, "tool_call_id": "tc-1"}
+        llm = Mock()
+        llm.invoke.side_effect = [
+            SimpleNamespace(content='Thought: 检索周报规范\nAction: rag_qa["周报怎么写"]'),
+            SimpleNamespace(content='Answer: 根据知识库内容可概括为：周报规范'),
+        ]
         with patch.object(agent_entry, "route_query",
                           return_value={"route": "rag_search", "target": "周报怎么写"}) as mocked_route, \
                 patch.object(agent_entry, "dispatch_tool",
                           return_value=result) as mocked_dispatch, \
-                patch.object(agent_entry, "build_qwen_llm") as mocked_llm, \
+                patch.object(agent_entry, "build_qwen_llm", return_value=llm) as mocked_llm, \
                 patch.object(agent_entry, "append_user_chat_history"):
             events = list(agent_entry.ask_agent_stream("周报怎么写", username="tester"))
 
-        # agent 模式已改为强制 LLM 路由（route_query force_llm），故路由决策由大模型给出；
-        # 内容型问题仍走确定性直调：把 LLM 算出的路由透传给工具层，不进入 ReAct 循环。
+        # agent 模式强制 LLM 路由；内容型问题现也进入 ReAct 循环，由模型自主调用内容工具
+        mocked_route.assert_called_once()
+        llm.invoke.assert_called()
         self.assertEqual(mocked_dispatch.call_args.args[0], "rag_qa")
         self.assertEqual(mocked_dispatch.call_args.args[1], "周报怎么写")
         self.assertIsNotNone(mocked_dispatch.call_args.kwargs.get("route_hint"))
 
-        mocked_route.assert_called_once()  # 路由决策改由 LLM 给出
-        # 3.4.3：确定性路由不再伪造模型 Thought，首条为编排器决策事件
+        # 首条为编排器路由决策事件（非模型 Thought），随后才是模型原文与工具结果
         self.assertEqual(events[0]["type"], "route_direct")
         self.assertEqual(events[0]["tool"], "rag_qa")
-        self.assertEqual(events[1]["tool"], "rag_qa")
-        self.assertEqual(events[1]["tool_call_id"], "tc-1")
-        self.assertEqual(events[-1]["content"], "知识库周报规范 [来源1]")
+        self.assertIn("step_llm", [e["type"] for e in events])
+        tool_steps = [e for e in events if e["type"] == "step_tool"]
+        self.assertTrue(tool_steps)
+        self.assertEqual(tool_steps[0]["tool"], "rag_qa")
+        self.assertEqual(tool_steps[0]["observation"], "知识库周报规范 [来源1]")
+        final = events[-1]
+        self.assertEqual(final["type"], "final")
+        self.assertTrue(final["agent_metrics"]["converged"])
+        self.assertTrue(final["agent_metrics"]["content_grounded"])
+        self.assertNotIn("deterministic_route", final["agent_metrics"])
 
     def test_health_requires_llm_but_allows_qdrant_degraded(self):
         with self._client() as client:

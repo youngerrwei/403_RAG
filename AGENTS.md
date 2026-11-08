@@ -205,14 +205,17 @@ data: {"type": "metadata", "stage": "coverage", "coverage": {...}, "citations": 
 data: {"type": "final", "content": "...", "route": "...", "coverage": {...}, "citations": [...], "file_result": {...}}
 
 // Agent 模式扩展事件（仅 use_agent=true 时产生）
-// route_direct：编排器确定性路由决策，不是模型输出（不再伪造 Thought）
+// route_direct：编排器 LLM 路由决策（不是模型输出，不伪造 Thought）；内容型路由（rag_search）
+//   也仅发出此决策事件，随后同样进入 ReAct 循环，由模型自主调用内容工具，不再确定性直调短路
 data: {"type": "route_direct", "step": 1, "tool": "rag_qa", "arg": "...", "route": "rag_search", "reason": "..."}
 // step_llm：仅承载模型真实输出
 data: {"type": "step_llm", "step": 1, "content": "Thought/Action/Answer 原文"}
 // step_tool：observation 为完整原文；tool_call_id 串联一次调用的可追溯链
 data: {"type": "step_tool", "step": 1, "tool": "rag_qa", "arg": "...", "observation": "...", "tool_call_id": "tc-1", "elapsed_s": 0.4, "ok": true}
 // final 事件额外携带 agent_metrics（前端可选读取，未知字段忽略）
-data: {"type": "final", "content": "...", "agent_metrics": {"llm_calls": 3, "tool_calls": 2, "idle_steps": 0, "context_chars_peak": 4258, "converged": true, "timed_out": false, "elapsed_s": 1.2}}
+// content_grounded / catalog_grounded 表示是否已获得可作答的正文/目录依据；
+// 已无 deterministic_route 字段（内容型问题不再走确定性直调短路）
+data: {"type": "final", "content": "...", "agent_metrics": {"llm_calls": 3, "tool_calls": 2, "idle_steps": 0, "context_chars_peak": 4258, "converged": true, "timed_out": false, "content_grounded": true, "catalog_grounded": false, "elapsed_s": 1.2}}
 
 // 心跳包（src/lab_rag/web_app.py 注入，保持连接活跃）
 data: {"type": "heartbeat"}

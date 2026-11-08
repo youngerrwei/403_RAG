@@ -1205,13 +1205,14 @@
                             renderCoverageAndCitations(data.coverage, data.citations, ab);
                         }
                         else if (data.type === "route_direct") {
-                            // 编排器确定性路由决策（非模型输出），单独标注避免误认为 LLM 思考过程
+                            // 编排器 LLM 路由决策（非模型输出），单独标注避免误认为 LLM 思考过程；
+                            // 该事件之后仍进入 ReAct 循环，由模型自主调用工具
                             const directDiv = document.createElement('div');
                             directDiv.className = 'agent-step';
                             directDiv.innerHTML = `
                                 <details open style="margin:8px 0;border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;background:#f1f5f9;">
                                     <summary style="cursor:pointer;font-size:13px;color:#475569;font-weight:500;">
-                                        确定性路由 · ${escapeHtml(data.tool || '')}
+                                        路由决策 · ${escapeHtml(data.tool || '')}
                                     </summary>
                                     <pre style="margin:8px 0 0;white-space:pre-wrap;font-size:12px;color:#334155;line-height:1.5;">${escapeHtml(data.reason || '')}\n检索问题：${escapeHtml(data.arg || '')}</pre>
                                 </details>

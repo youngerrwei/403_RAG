@@ -306,7 +306,7 @@ def ask_agent_stream(
 ) -> Generator[dict, None, None]:
     """Agent 模式唯一编排器：产出统一事件流。
 
-    事件：route_direct（确定性路由决策，非模型输出）、step_llm（模型原文）、
+    事件：route_direct（编排器 LLM 路由决策，非模型输出；其后仍进入 ReAct 循环）、step_llm（模型原文）、
     step_tool（工具调用 + 完整 observation + tool_call_id）、tool（目录结果）、
     final（含 agent_metrics）、error。协议见 AGENTS.md 第 7 节。
     """
@@ -315,6 +315,8 @@ def ask_agent_stream(
     llm = build_qwen_llm()
     initial_route = route_query(llm, question, force_llm=True)
     requires_rag_after_list = bool(initial_route and initial_route.get("route") == "hybrid")
+    # 内容型路由：进入循环后仍须先由模型调用内容工具取得正文依据，不得凭空作答
+    content_intent = bool(initial_route and initial_route.get("route") == "rag_search")
 
     cfg = _agent_config()
     guard_repeat = bool(cfg.get("AGENT_REPEAT_ACTION_GUARD", True))
@@ -347,37 +349,23 @@ def ask_agent_stream(
         return answer
 
     try:
-        # ---- 确定性直调：内容型问题不进入 LLM 循环（README.md 的 Agent 边界契约）----
-        if initial_route and initial_route.get("route") == "rag_search":
-            # 不再伪造 step_llm / Thought：明确发出编排器决策事件
+        # 内容型路由（rag_search）：发出编排器决策事件（非模型输出），随后进入 ReAct 循环。
+        # 不再短路直调：由模型在循环中自行决定调用 rag_qa / read_file（允许作答前再补精读、
+        # 换角度检索），从而统一所有意图的循环范式；「必有正文依据」由下方 content-first 守卫保证。
+        if content_intent:
             yield {"type": "route_direct", "step": 1, "tool": CONTENT_TOOL_NAME,
                    "arg": question, "route": "rag_search",
-                   "reason": "内容/格式/规范型问题直接检索文档正文"}
-            result = dispatch_tool(CONTENT_TOOL_NAME, question, username,
-                                   route_hint=initial_route, tool_call_id="tc-1")
-            observation_text = result["observation"]
-            last_observation = observation_text
-            latest_catalog_result = result["catalog_result"]
-            yield {"type": "step_tool", "step": 1, "tool": CONTENT_TOOL_NAME, "arg": question,
-                   "observation": observation_text, "tool_call_id": "tc-1",
-                   "deterministic": True, "elapsed_s": result["elapsed_s"]}
-            if latest_catalog_result:
-                yield {"type": "tool", "tool_name": "list_catalog_entries",
-                       "content": latest_catalog_result}
-            final_answer = finalize_answer(observation_text)
-            append_user_chat_history(username, "user", question)
-            append_user_chat_history(username, "assistant", final_answer)
-            # rag_result.get("file_result") 由 agent_tools 的 handler 统一提供
-            yield {"type": "final", "content": final_answer,
-                   "file_result": latest_catalog_result,
-                   "agent_metrics": {"llm_calls": 0, "tool_calls": 1, "idle_steps": 0,
-                                     "context_chars_peak": 0, "converged": True,
-                                     "content_grounded": True, "catalog_grounded": False,
-                                     "elapsed_s": 0.0, "deterministic_route": True}}
-            return
+                   "reason": "内容/格式/规范型问题，进入循环由模型检索文档正文"}
 
         # ---- ReAct 循环 ----
         messages = _initial_messages(question, chat_history, cfg)
+        # 内容型路由：在用户问题前注入路由倾向，让模型首轮即调用内容工具（减少无谓空转；仍可自主选择 read_file）
+        if content_intent:
+            for _m in reversed(messages):
+                if _m.get("role") == "user":
+                    _m["content"] = (f"（路由判断为内容检索型，请先调用 {CONTENT_TOOL_NAME} 或 read_file "
+                                   f"检索知识库正文后再作答）\n{_m['content']}")
+                    break
         max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 6)))
         max_idle = max(0, int(cfg.get("AGENT_MAX_IDLE_STEPS", 2)))
         llm_budget = max_steps + max_idle + 1
@@ -440,6 +428,19 @@ def ask_agent_stream(
             debug_log(f"[AGENT] step={step} LLM耗时={time.perf_counter()-llm_start:.3f}s")
             yield {"type": "step_llm", "step": step, "content": content}
 
+            action = parse_action(content)
+
+            # content-first 守卫：内容型路由必须先由模型调用内容工具取得正文依据。
+            # 覆盖 Answer 与不带前缀的自由文本，避免模型绕过检索凭空作答；一旦已调用过工具
+            # （成功或失败），则交给后续覆盖度判定与「无依据诚实收敛」逻辑处理。
+            if content_intent and tool_calls == 0 and not content_grounded and not action:
+                messages.append({"role": "assistant", "content": content})
+                append_observation(
+                    "你尚未检索知识库正文，请先调用 rag_qa（若已通过 list_group_files 定位到具体文档也可调用 "
+                    "read_file）获取依据后再作答；不要凭记忆或猜测作答。",
+                    "请先调用内容工具检索知识库正文，再给出 Answer。")
+                continue
+
             # 1) 最终 Answer（hybrid 清单+内容问题必须先补读正文）
             if "Answer:" in content:
                 if requires_rag_after_list and used_list_tool and not used_rag_after_list \
@@ -464,8 +465,10 @@ def ask_agent_stream(
                     append_observation(result["observation"], "请基于目录结果与正文给出 Answer。")
                     continue
 
-                # 无依据却要作答：拒绝凭空作答，转入诚实收敛
-                if tool_calls > 0 and not _grounded_for_answer():
+                # 无依据却要作答：拒绝凭空作答，转入诚实收敛。
+                # content_intent 即使 tool_calls==0（模型反复 Answer 被 content-first 守卫挡回），
+                # 也必须有正文依据才允许输出，避免预算耗尽后回显无依据内容。
+                if (tool_calls > 0 or content_intent) and not _grounded_for_answer():
                     final_answer = finalize_answer(
                         _agent_fallback_answer(question, tool_log, last_observation, cfg))
                     append_user_chat_history(username, "user", question)
@@ -484,8 +487,17 @@ def ask_agent_stream(
                 return
 
             # 2) 解析 Action；未知工具名交由 dispatch_tool 统一降级
-            action = parse_action(content)
             if not action:
+                # 自由文本也无依据时同样诚实收敛，避免绕过 Answer 分支的守卫
+                if (tool_calls > 0 or content_intent) and not _grounded_for_answer():
+                    final_answer = finalize_answer(
+                        _agent_fallback_answer(question, tool_log, last_observation, cfg))
+                    append_user_chat_history(username, "user", question)
+                    append_user_chat_history(username, "assistant", final_answer)
+                    yield {"type": "final", "content": final_answer,
+                           "file_result": latest_catalog_result,
+                           "agent_metrics": agent_metrics(False)}
+                    return
                 final_answer = finalize_answer(content)
                 append_user_chat_history(username, "user", question)
                 append_user_chat_history(username, "assistant", final_answer)
@@ -579,8 +591,8 @@ def ask_agent_stream(
                 content = resp.content if hasattr(resp, "content") else str(resp)
                 yield {"type": "step_llm", "step": step, "content": content}
                 if "Answer:" in content:
-                    # 无依据：诚实收敛而非回显无依据作答
-                    if tool_calls > 0 and not _grounded_for_answer():
+                    # 无依据：诚实收敛而非回显无依据作答（content_intent 同样强制有正文依据）
+                    if (tool_calls > 0 or content_intent) and not _grounded_for_answer():
                         final_answer = finalize_answer(
                             _agent_fallback_answer(question, tool_log, last_observation, cfg))
                         append_user_chat_history(username, "user", question)
