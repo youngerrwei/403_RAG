@@ -6,6 +6,57 @@
 
 ---
 
+## [3.4.2] Agent 多轮推理性能
+
+### Changed
+
+- 上下文有界：注入 LLM 的单条工具结果按 `AGENT_OBSERVATION_MAX_CHARS`(2000) 压缩，
+  只保留 `AGENT_KEEP_RECENT_OBSERVATIONS`(2) 轮完整结果，更早的折叠为占位；
+  SSE `step_tool.observation` 仍传完整原文，前端展示不受影响。
+- 步数预算只计「有效工具调用」；重复调用抑制等空转不再挤占预算，
+  受 `AGENT_MAX_IDLE_STEPS`(2) 与 LLM 硬上限双重保护，避免死循环。
+- hybrid 问题模型过早给出 Answer 时，编排层直接用原始问题确定性调用 `rag_qa`，
+  省一轮「让模型重新决定调什么工具」的 LLM 调用，且保证不丢失用户意图。
+- 预算耗尽不再回显最后一次原始工具输出：先给一次收敛轮（不执行新工具，
+  `AGENT_FINAL_CONVERGE_ROUND` 可关闭），仍无答案则基于已尝试角度诚实说明。
+- `final` 事件新增可选 `agent_metrics`（llm_calls / tool_calls / idle_steps /
+  context_chars_peak / converged / elapsed_s），前端 Agent 推理卡片可选展示；
+  `AGENTS.md` 第 7 节补齐 `step_llm`/`step_tool` 与指标字段协议。
+
+### Tests
+
+- 新增 `scripts/evaluate_agent_multistep.py`：离线可复现（mock LLM 驱动真实
+  `ask_agent_stream`），支持 `--agent-module` 加载历史版本源码生成可比基线；
+  8 个场景覆盖复合意图、跨小组、目录未命中换角度、重复调用、过早 Answer、
+  预算耗尽、长 Observation、小预算空转恢复。
+- 新增 `tests/test_agent_perf.py`（17 项）覆盖上下文压缩、历史折叠、
+  SSE 原文保真、空转预算、LLM 硬上限、优雅收敛、指标契约与收敛轮开关。
+- 全量离线回归 **115 项通过**（3 项按标注跳过）；HTML 契约 32/32。
+
+### 实测（vs 优化前同一脚本同一 mock 序列）
+
+| 指标 | 优化前 | 优化后 |
+|------|--------|--------|
+| 上下文峰值（最大） | 8843 | **4382（-50.5%）** |
+| 平均上下文峰值 | 3316 | **2686（-19.0%）** |
+| 平均上下文总量 | 9453 | **9076（-4.0%）** |
+| 收敛率 | 0.75 | **1.0** |
+| LLM 平均轮次（全部场景） | 3.38 | 3.75 |
+| LLM 平均轮次（已收敛场景） | 3.50 | 3.75 |
+
+- LLM 轮次上升**仅发生在优化前直接 fallback 的两个场景**：优化后多花 1~2 轮
+  LLM 换来了真正的 Answer；在优化前也能收敛的 6 个场景上轮次 **21 vs 21 持平**。
+- 真实链路冒烟（hybrid 复合意图）：3 轮 LLM / 2 次工具 / 0 空转 / 已收敛，
+  答案 1406 字符，`agent_metrics` 正常输出。
+
+### 升级注意
+
+- 零重建：未改动 `page_content` / metadata / `RETRIEVAL_INDEX_VERSION`(2)。
+- 全部新增参数走配置；时延敏感场景可设 `AGENT_FINAL_CONVERGE_ROUND=false`
+  省一次 LLM 调用，但收敛率会下降。
+
+---
+
 ## [3.4.1] 召回兜底与 Agent 多轮检索
 
 ### Added
