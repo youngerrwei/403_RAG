@@ -235,6 +235,10 @@ def ask_agent_stream(
     cfg = _agent_config()
     guard_repeat = bool(cfg.get("AGENT_REPEAT_ACTION_GUARD", True))
     total_timeout = max(1.0, float(cfg.get("AGENT_TOTAL_TIMEOUT_S", 240)))
+    # 多步连锁场景优化：循环内 rag_qa 子问题复用内容路由，跳过冗余规则/LLM 重路由。
+    # 模型已显式选择 rag_qa（内容工具），语义等价于内容路由；该 hint 对 list_group_files 无副作用。
+    reuse_route_hint = bool(cfg.get("AGENT_REUSE_ROUTE_HINT", True))
+    tool_route_hint = {"route": "rag_search"} if reuse_route_hint else None
     seen_actions = set()
     latest_catalog_result = None
     used_list_tool = False
@@ -341,6 +345,7 @@ def ask_agent_stream(
                         and (CONTENT_TOOL_NAME, question) not in seen_actions:
                     messages.append({"role": "assistant", "content": content})
                     result = dispatch_tool(CONTENT_TOOL_NAME, question, username,
+                                           route_hint=tool_route_hint,
                                            tool_call_id=f"tc-{tool_calls + 1}")
                     tool_calls += 1
                     tool_log.append((CONTENT_TOOL_NAME, question))
@@ -388,6 +393,7 @@ def ask_agent_stream(
 
             # 4) 统一分派执行
             result = dispatch_tool(name, arg, username,
+                                   route_hint=tool_route_hint,
                                    tool_call_id=f"tc-{tool_calls + 1}")
             tool_calls += 1
             tool_log.append((name, arg))

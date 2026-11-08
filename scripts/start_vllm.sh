@@ -16,6 +16,8 @@ mkdir -p "$DATA_DIR" "$LOG_DIR"
 load_env_keys "$ENV_FILE" \
     VLLM_MODEL_NAME VLLM_API_KEY VLLM_CUDA_DEVICES VLLM_HOST VLLM_PORT \
     VLLM_GPU_UTIL VLLM_MAX_MODEL_LEN VLLM_ENABLE_PREFIX_CACHING \
+    VLLM_QUANTIZATION VLLM_DTYPE VLLM_TENSOR_PARALLEL_SIZE VLLM_MAX_NUM_SEQS \
+    VLLM_ENABLE_CHUNKED_PREFILL \
     VLLM_CONDA_ENV VLLM_STARTUP_TIMEOUT VLLM_INFERENCE_PROBE_TIMEOUT \
     STARTUP_PROBE_TIMEOUT || true
 
@@ -27,6 +29,17 @@ VLLM_PORT="${VLLM_PORT:-8000}"
 VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.85}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-6000}"
 VLLM_ENABLE_PREFIX_CACHING="${VLLM_ENABLE_PREFIX_CACHING:-true}"
+# 单卡（如单条 RTX 3090，24GB）模型优化旋钮：全部默认保持现状，按需开启。
+# - VLLM_QUANTIZATION：权重量化（awq/gptq/fp8），显著缩小显存占用，需对应量化权重已落盘。
+# - VLLM_DTYPE：auto（fp16）或 half/bfloat16；量化开启时通常配合 auto。
+# - VLLM_TENSOR_PARALLEL_SIZE：单卡固定为 1。
+# - VLLM_MAX_NUM_SEQS：并发序列上限，单卡可下调以省 KV 显存。
+# - VLLM_ENABLE_CHUNKED_PREFILL：分块预填充，提升单卡混合预填/解码吞吐。
+VLLM_QUANTIZATION="${VLLM_QUANTIZATION:-}"
+VLLM_DTYPE="${VLLM_DTYPE:-auto}"
+VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
+VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-}"
+VLLM_ENABLE_CHUNKED_PREFILL="${VLLM_ENABLE_CHUNKED_PREFILL:-false}"
 VLLM_CONDA_ENV="${VLLM_CONDA_ENV:-rag-vllm}"
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-300}"
 VLLM_INFERENCE_PROBE_TIMEOUT="${VLLM_INFERENCE_PROBE_TIMEOUT:-15}"
@@ -193,12 +206,16 @@ args=(
     --api-key "$VLLM_API_KEY"
     --max-model-len "$VLLM_MAX_MODEL_LEN"
     --gpu-memory-utilization "$VLLM_GPU_UTIL"
-    --dtype auto --trust-remote-code
+    --dtype "$VLLM_DTYPE" --trust-remote-code
+    --tensor-parallel-size "$VLLM_TENSOR_PARALLEL_SIZE"
 )
+[[ -n "$VLLM_QUANTIZATION" ]] && args+=(--quantization "$VLLM_QUANTIZATION")
+[[ -n "$VLLM_MAX_NUM_SEQS" ]] && args+=(--max-num-seqs "$VLLM_MAX_NUM_SEQS")
 [[ "$VLLM_ENABLE_PREFIX_CACHING" == "true" ]] && args+=(--enable-prefix-caching)
+[[ "$VLLM_ENABLE_CHUNKED_PREFILL" == "true" ]] && args+=(--enable-chunked-prefill)
 
 LOG_FILE="$LOG_DIR/vllm_server.log"
-echo "[信息] 启动 vLLM：环境=$VLLM_CONDA_ENV GPU=$VLLM_CUDA_DEVICES 端口=$VLLM_PORT"
+echo "[信息] 启动 vLLM：环境=$VLLM_CONDA_ENV GPU=$VLLM_CUDA_DEVICES 端口=$VLLM_PORT 量化=${VLLM_QUANTIZATION:-无} dtype=$VLLM_DTYPE TP=$VLLM_TENSOR_PARALLEL_SIZE 分块预填充=$VLLM_ENABLE_CHUNKED_PREFILL"
 if [[ "$BACKGROUND" == "true" ]]; then
     nohup env CUDA_VISIBLE_DEVICES="$VLLM_CUDA_DEVICES" "${args[@]}" 9>&- >"$LOG_FILE" 2>&1 &
 else

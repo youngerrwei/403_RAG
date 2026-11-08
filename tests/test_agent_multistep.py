@@ -285,6 +285,32 @@ class CompoundRouteTests(unittest.TestCase):
     def test_pure_listing_stays_file_list(self):
         self.assertEqual(ra.rule_based_route("列出VLC小组设备")["route"], "file_list")
 
+    def test_loop_passes_content_route_hint_to_rag_qa(self):
+        """默认开启 AGENT_REUSE_ROUTE_HINT：循环内 rag_qa 子问题复用内容路由 hint。"""
+        outputs = [
+            'Thought: 检索\nAction: rag_qa["A2X小组 水下 论文"]',
+            'Thought: 摘要\nAction: rag_qa["A2X小组 水下 论文一 摘要"]',
+            'Answer: 根据知识库内容可概括为：摘要',
+        ]
+        events, llm, rag, catalog = _events(
+            outputs, "A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结")
+        for c in rag.call_args_list:
+            self.assertEqual(c.kwargs.get("route_hint"), {"route": "rag_search"})
+
+    def test_loop_route_hint_can_be_disabled(self):
+        """关闭后恢复历史逐轮子路由行为（route_hint=None）。"""
+        cfg = {"AGENT_MAX_STEPS": 4, "AGENT_REPEAT_ACTION_GUARD": True,
+               "AGENT_TOTAL_TIMEOUT_S": 240, "AGENT_MAX_IDLE_STEPS": 2,
+               "AGENT_REUSE_ROUTE_HINT": False}
+        outputs = [
+            'Thought: 检索\nAction: rag_qa["A2X小组 水下 论文"]',
+            'Answer: 根据知识库内容可概括为：摘要',
+        ]
+        events, llm, rag, catalog = _events(
+            outputs, "A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结", cfg=cfg)
+        for c in rag.call_args_list:
+            self.assertIsNone(c.kwargs.get("route_hint"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

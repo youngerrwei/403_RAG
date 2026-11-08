@@ -732,6 +732,10 @@ def load_config() -> dict:
         "AGENT_MAX_IDLE_STEPS": int(os.getenv("AGENT_MAX_IDLE_STEPS", "2")),
         # 预算用尽后是否给模型一次「基于已有证据作答」的收敛轮（时延敏感场景可关闭）
         "AGENT_FINAL_CONVERGE_ROUND": _env_bool("AGENT_FINAL_CONVERGE_ROUND", "true"),
+        # 多步连锁场景优化：agent 循环里每个 rag_qa 子问题复用内容路由，跳过冗余规则/LLM 重路由。
+        # 模型已显式选择 rag_qa（内容工具），语义即等价于内容路由；歧义子问题也不会再触发一次 LLM 路由。
+        # 关闭可恢复为「每轮子问题各自路由」的历史行为（见 3.4.5 变更说明）。
+        "AGENT_REUSE_ROUTE_HINT": _env_bool("AGENT_REUSE_ROUTE_HINT", "true"),
         "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),
         "ADAPTIVE_LEXICAL_TOP_K": int(os.getenv("ADAPTIVE_LEXICAL_TOP_K", "16")),
 

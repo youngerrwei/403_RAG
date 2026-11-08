@@ -6,6 +6,38 @@
 
 ---
 
+## [3.4.5] Agent 模型调用优化 + 单卡（RTX 3090）部署旋钮
+
+### Changed
+
+- **连锁场景模型调用优化**：`agent_entry.py` 的 ReAct 循环内，每个 `rag_qa` 子问题（含 hybrid 补检索分支）
+  现传入内容路由 `route_hint`，复用已确定的内容路由，跳过冗余的 `rule_based_route`/LLM 重路由。
+  模型已显式选择 `rag_qa`（内容工具），语义即等价于内容路由；该 hint 对 `list_group_files` 无副作用。
+  新增开关 `AGENT_REUSE_ROUTE_HINT`（默认 `true`），关闭可恢复「每轮子问题各自路由」的历史行为。
+- **单卡模型优化旋钮**（`scripts/start_vllm.sh` + `.env.example` + `AGENTS.md`）：新增
+  `VLLM_QUANTIZATION` / `VLLM_DTYPE` / `VLLM_TENSOR_PARALLEL_SIZE` / `VLLM_MAX_NUM_SEQS` /
+  `VLLM_ENABLE_CHUNKED_PREFILL`，全部默认保持现状（零回归）。`VLLM_GPU_UTIL`、`VLLM_MAX_MODEL_LEN`、
+  `VLLM_ENABLE_PREFIX_CACHING` 已在配置共识中登记。
+- `data/README.md` 新增「单卡部署（如单条 RTX 3090，24GB）」段：量化推理模型 → 同卡设备分配 →
+  吞吐优化（分块预填充 + 前缀缓存）→ Agent 连锁路由复用，给出可落地的显存拟合与模型调用优化顺序。
+
+### 优化空间分析（本场景 vs 单卡 3090）
+
+- **关联性 / 链式任务（本场景）**：实测每连锁 3 工具 + 1 收敛轮 = 4 次 ReAct LLM 调用；具体正文子问题本就由
+  `rule_based_route` 确定性命中、`route_query` 不调 LLM，故本次优化主要消除「歧义/复合子问题」可能触发的
+  额外 LLM 路由，并使路由语义显式化。多步开销的主要杠杆是**前缀缓存**（已开，缓存逐步重发的系统提示词前缀）
+  与提示词引导的「≤3 条目一次覆盖」，二者此前已具备。
+- **单卡 RTX 3090（24GB）**：fp16 Qwen3-8B(~16GB)+KV 与 bge-m3(~2.3GB)+reranker(~1.1GB) 同卡会超显存；
+  真正的模型优化空间在**量化**（AWQ/GPTQ/fp8，权重降至 4–5GB）+ 同卡设备分配 + 下调 `VLLM_MAX_MODEL_LEN`
+  /`VLLM_GPU_UTIL` + 分块预填充，本次以可配置旋钮形式交付，未改动多卡默认行为。
+
+### 升级注意
+
+- 零重建；Agent 连环路由复用默认开启，若发现某歧义子问题确需独立路由可设 `AGENT_REUSE_ROUTE_HINT=false` 回退。
+- 单卡场景请先准备量化权重再设 `VLLM_QUANTIZATION`，否则 vLLM 启动会失败。
+
+---
+
 ## [3.4.4] Agent 关联性 / 链式任务：可成长测试集 + 路由与提示词优化
 
 ### Added

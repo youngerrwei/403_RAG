@@ -261,6 +261,14 @@ data: [DONE]
 | `RERANKER_DEVICE` | `cuda:2` | Reranker 运行设备 |
 | `VLLM_API_KEY` | `lab-secret-key` | vLLM 服务密钥 |
 | `VLLM_MODEL_NAME` | `./models/Qwen3-8B-Instruct` | vLLM 推理模型本地路径 |
+| `VLLM_GPU_UTIL` | `0.85` | vLLM 显存占用比例；单卡（如 RTX 3090）可上调至 ~0.90 |
+| `VLLM_MAX_MODEL_LEN` | `6000` | 上下文窗口上限；单卡想省 KV 显存可下调（如 4096） |
+| `VLLM_ENABLE_PREFIX_CACHING` | `true` | 前缀缓存；多步 Agent 复用系统提示词前缀，是连锁场景的关键优化 |
+| `VLLM_QUANTIZATION` | `（空）` | 权重量化（awq/gptq/fp8），需对应量化权重已落盘；单卡显存优化首选 |
+| `VLLM_DTYPE` | `auto` | 计算精度（auto=fp16 / half / bfloat16） |
+| `VLLM_TENSOR_PARALLEL_SIZE` | `1` | 张量并行度；单卡固定为 1 |
+| `VLLM_MAX_NUM_SEQS` | `（空）` | 并发序列上限；单卡可下调以省 KV 显存（空=vLLM 默认） |
+| `VLLM_ENABLE_CHUNKED_PREFILL` | `false` | 分块预填充，提升单卡混合预填/解码吞吐 |
 | `FILE_SEARCH_LIMIT` | `200` | 文件搜索结果上限 |
 | `ENABLE_MARKDOWN_STRUCTURE_GUARD` | `true` | 标题/代码块/表格原子块保护 |
 | `ENABLE_PATH_CONTEXT_PREFIX` | `true` | 向量化前缀注入小组/设备目录层级 |
@@ -279,6 +287,7 @@ data: [DONE]
 | `AGENT_FINAL_CONVERGE_ROUND` | `true` | 预算用尽后给一次收敛轮（不执行新工具）；关闭可省一次 LLM 调用，但收敛率下降 |
 | `AGENT_MAX_IDLE_STEPS` | `2` | 空转轮上限；空转不占工具步数预算，另有 LLM 硬上限防死循环 |
 | `AGENT_REPEAT_ACTION_GUARD` | `true` | 抑制「同工具+完全相同参数」重复调用，避免多轮搜索空转 |
+| `AGENT_REUSE_ROUTE_HINT` | `true` | 多步连锁场景优化：agent 循环内 rag_qa 子问题复用内容路由，跳过冗余规则/LLM 重路由（模型已选内容工具即等价于内容路由）；关闭可恢复历史逐轮子路由行为 |
 | `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）在首轮召回身份字段零命中时，自动启用本地词边界匹配补召回（按词元形态判定，无用例语义） |
 | `ADAPTIVE_LEXICAL_MIN_DIGITS` | `6` | 触发自适应兜底的纯数字词元最小长度 |
 | `ADAPTIVE_LEXICAL_TOP_K` | `16` | 自适应兜底补充候选数上限 |
