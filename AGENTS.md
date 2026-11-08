@@ -264,7 +264,7 @@ data: [DONE]
 | `VLLM_GPU_UTIL` | `0.85` | vLLM 显存占用比例；单卡（如 RTX 3090）可上调至 ~0.90 |
 | `VLLM_MAX_MODEL_LEN` | `6000` | 上下文窗口上限；单卡想省 KV 显存可下调（如 4096） |
 | `VLLM_ENABLE_PREFIX_CACHING` | `true` | 前缀缓存；多步 Agent 复用系统提示词前缀，是连锁场景的关键优化 |
-| `VLLM_QUANTIZATION` | `（空）` | 权重量化（awq/gptq/fp8），需对应量化权重已落盘；单卡显存优化首选 |
+| `VLLM_QUANTIZATION` | `（空）` | 模型量化；单卡 3090 首选 `bitsandbytes`（vLLM 用本地 fp16 实时量化 4-bit，权重 16GB→约 5.7GB，免下载）；亦支持 awq/gptq/fp8 预量化权重（需先获取） |
 | `VLLM_DTYPE` | `auto` | 计算精度（auto=fp16 / half / bfloat16） |
 | `VLLM_TENSOR_PARALLEL_SIZE` | `1` | 张量并行度；单卡固定为 1 |
 | `VLLM_MAX_NUM_SEQS` | `（空）` | 并发序列上限；单卡可下调以省 KV 显存（空=vLLM 默认） |

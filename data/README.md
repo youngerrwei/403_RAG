@@ -34,14 +34,16 @@
 
 ### 单卡部署（如单条 RTX 3090，24GB）
 
-默认按四卡分布（Embedding/Reranker 在 GPU2、vLLM 在 GPU3）。若只有一张 3090，需要把三个模型塞进同一张 24GB 卡，并按以下顺序优化显存占用：
+默认按四卡分布（Embedding/Reranker 在 GPU2、vLLM 在 GPU3）。若只有一张 3090，需要把三个模型塞进同一张 24GB 卡。已验证的可行方案（本机 vLLM 0.8.5 + RTX 3090 实测）：
 
-1. **量化推理模型**：在 `.env` 设置 `VLLM_QUANTIZATION=awq`（或 `gptq`/`fp8`），需先准备对应量化权重（可用 `llm-compressor` 对本地 Qwen3-8B 量化后落盘）。fp16 权重约 16GB，AWQ 约 4–5GB，单卡即可与 bge-m3(≈2.3GB)+reranker(≈1.1GB) 共存。
-2. **同卡设备分配**：将 `EMBEDDING_DEVICE` / `RERANKER_DEVICE` / `VLLM_CUDA_DEVICES` 都指向同一张卡（如 `cuda:0`），并适当下调 `VLLM_GPU_UTIL`（如 0.90）、`VLLM_MAX_MODEL_LEN`（如 4096）以省 KV 显存；必要时设 `VLLM_MAX_NUM_SEQS` 限制并发序列。
-3. **吞吐优化**：开启 `VLLM_ENABLE_CHUNKED_PREFILL=true`、`VLLM_ENABLE_PREFIX_CACHING=true`（默认已开）。前缀缓存对多步 Agent（检索→提取→摘要）尤为关键——每一步都重发系统提示词，前缀缓存命中后只计算增量。
+1. **量化推理模型（免下载首选）**：在 `.env` 设置 `VLLM_QUANTIZATION=bitsandbytes`。vLLM 会在加载时用本地 fp16 权重**实时量化为 4-bit**，权重由 16GB 降至约 **5.7GB**，无需任何外部量化权重；可与 bge-m3(≈2.3GB)+reranker(≈1.1GB) 同卡共存（总计约 10GB，留足 KV 余量）。代价：bnb 推理速度略慢于 fp16（用显存换速度），单卡场景可接受。
+   - 前置：需在 `rag-vllm` 环境安装 `bitsandbytes>=0.45.3`（本机已装 0.50.2）；其余依赖由 vLLM 自动调用。
+2. **同卡设备分配**：将 `EMBEDDING_DEVICE` / `RERANKER_DEVICE` / `VLLM_CUDA_DEVICES` 都指向同一张卡（如 `cuda:0`），并下调 `VLLM_GPU_UTIL`（建议 0.6，因 emb/reranker 同卡共享）、`VLLM_MAX_MODEL_LEN`（如 4096）以省 KV 显存；必要时设 `VLLM_MAX_NUM_SEQS` 限制并发序列。
+3. **吞吐优化**：开启 `VLLM_ENABLE_CHUNKED_PREFILL=true`、`VLLM_ENABLE_PREFIX_CACHING=true`（默认已开）、`VLLM_ENABLE_THINKING=false`（关 Qwen3 思考链降延迟）。前缀缓存对多步 Agent（检索→提取→摘要）尤为关键——每一步都重发系统提示词，前缀缓存命中后只计算增量。
 4. **Agent 连锁场景的模型调用优化**：`AGENT_REUSE_ROUTE_HINT=true`（默认）让 agent 循环内每个 `rag_qa` 子问题复用内容路由，跳过冗余重路由，避免歧义子问题额外触发一次 LLM 调用。
 
-> 量化权重未就绪前不要开启 `VLLM_QUANTIZATION`，否则 vLLM 启动会因找不到量化配置而失败。
+> 已有开箱即用的单卡模板 **`.env.3090.example`**（复制为 `.env` 即可），已内置上述全部单卡优化。
+> 追求推理速度（而非极致省显存）时，可改用 `awq`/`gptq`/`fp8` 预量化权重（需先获取对应权重并落盘），它们使用高效 CUDA 内核、比 bnb 更快，但体积略大（4–5GB）。
 
 ## v3.0 启动方式变化
 

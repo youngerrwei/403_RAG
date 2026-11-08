@@ -6,6 +6,39 @@
 
 ---
 
+## [3.4.6] 单卡 3090 模型优化落地：vLLM 内置 BitsAndBytes 4-bit（免下载）
+
+### Changed
+
+- **单卡 3090 模型优化实测落地**：本机即 4× RTX 3090；原 fp16 Qwen3-8B(~16GB) 与 bge-m3(~2.3GB)+reranker(~1.1GB)
+  分布在两张卡，单卡无法同驻。改用 vLLM 0.8.5 内置 **BitsAndBytes 量化**——
+  加载时用本地 fp16 权重实时量化为 **4-bit**，权重降至 **约 5.7GB**，与 emb/reranker 同卡共存总计约 10GB，
+  单张 24GB 3090 完全容纳（已在 GPU2 与现有 emb/reranker 共存实测：服务正常启动并生成连贯中文）。
+  - **无需下载任何额外权重**，也无需单独量化步骤；`VLLM_QUANTIZATION=bitsandbytes` 即生效
+    （vLLM 自动将 `load_format` 设为 `bitsandbytes`，默认 4-bit）。
+  - 代价：vLLM 提示 bnb 推理速度略慢于 fp16（用显存换速度），单卡场景可接受；追求速度可改用
+    AWQ/GPTQ-Int4 预量化权重（需先获取）。
+  - 注：本网络对 HuggingFace / ModelScope 程序化 API 不可达，故未采用「下载官方量化权重」路径；bitsandbytes 为最稳妥的免下载方案。
+
+### Added
+
+- **单卡配置模板** `.env.3090.example`：基于本机 `.env` 仅覆盖单卡差异项——
+  三模型同卡 `cuda:0`、`VLLM_QUANTIZATION=bitsandbytes`、`VLLM_GPU_UTIL=0.6`、
+  `VLLM_MAX_MODEL_LEN=4096`、`VLLM_ENABLE_THINKING=false`、`VLLM_ENABLE_CHUNKED_PREFILL=true`、
+  占位 `FLASK_SECRET_KEY`；复制为 `.env` 即可在单张 3090 上运行整套 RAG 栈。
+
+### Docs
+
+- `data/README.md` 单卡段改写为「bitsandbytes 免下载首选」方案，并标注开箱即用的 `.env.3090.example`。
+- `.env.example` 与 `AGENTS.md` 配置共识表将 `VLLM_QUANTIZATION` 说明更新为 bitsandbytes 优先。
+
+### 说明
+
+- **未改动生产多卡配置**：本机多卡（vLLM 在 GPU3、emb/reranker 在 GPU2）仍以 fp16 运行，推理更快且显存已够；
+  量化仅用于单卡约束场景。如需把多卡也切到 bnb 4-bit 以进一步省显存，设 `VLLM_QUANTIZATION=bitsandbytes` 即可（会牺牲部分推理速度）。
+
+---
+
 ## [3.4.5] Agent 模型调用优化 + 单卡（RTX 3090）部署旋钮
 
 ### Changed
