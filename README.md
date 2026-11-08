@@ -960,14 +960,15 @@ lab_rag/
 | `src/lab_rag/__init__.py` | 声明 `lab_rag` Python 包 | 使核心模块可以通过 `python -m lab_rag.<module>` 和包内相对导入运行 |
 | `src/lab_rag/paths.py` | 统一计算 `PROJECT_ROOT` 并解析项目相对路径 | 被日志、Web、入库、用户管理和 Agent 模块使用，避免目录迁移后依赖当前工作目录 |
 | `src/lab_rag/logger.py` | 创建控制台与按日轮转的文件 Logger | 从根目录 `.env` 读取 `LOG_*`，相对 `LOG_DIR` 固定解析到项目根目录 |
-| `src/lab_rag/rag_agent.py` | 主 RAG 引擎：路由、改写、HyDE、多查询、Dense/全文词项检索、RRF、重排、父块展开、覆盖率、引用与流式生成 | 被 `web_app.py`、`rag_tool.py` 和 `tools.py` 调用；共享唯一 Embedding、Reranker、Qdrant 与 LLM 运行时 |
+| `src/lab_rag/rag_agent.py` | 主 RAG 引擎：路由、改写、HyDE、多查询、Dense/全文词项检索、RRF、重排、父块展开、覆盖率、引用与流式生成 | 被 `web_app.py`、`rag_tool.py` 和 `agent_tools.py` 调用；共享唯一 Embedding、Reranker、Qdrant 与 LLM 运行时；支持 `route_hint` 复用调用方已确定的路由 |
 | `src/lab_rag/web_app.py` | Flask 服务入口：认证、Session、限流、历史记录、SSE、健康检查与 MCP 内部 API | `scripts/start_rag.sh` 以 `python -m lab_rag.web_app` 启动；`use_agent=true` 时包内导入 `agent_entry.py` |
 | `src/lab_rag/ingest.py` | 知识入库：Markdown 加载、清洗、父子分块、摘要增强、Embedding、Qdrant 建集与幂等写入 | `scripts/auto_ingest.sh` 以 `python -m lab_rag.ingest` 调用；同时维护子块和父块集合 |
 | `src/lab_rag/create_user.py` | 交互式创建或更新 Web 登录用户，使用 PBKDF2 哈希和原子文件替换 | 通过 `PYTHONPATH=src python -m lab_rag.create_user` 执行；默认写入根目录 `config/users.json` |
 | `src/lab_rag/mcp_server.py` | 轻量 stdio MCP Bridge，暴露知识检索与目录工具 | 不加载模型；通过 loopback Bearer Token 调用 Web 内部 API；由 `scripts/start_mcp.sh` 启动 |
-| `src/lab_rag/agent_entry.py` | 可选 ReAct Agent 编排层 | 复用 `rag_agent.py` 的 LLM、历史和工具，不创建第二套模型实例 |
-| `src/lab_rag/tools.py` | ReAct 请求级工具定义与用户名上下文 | 将目录浏览和 RAG 问答包装为 LangChain 工具，供 `agent_entry.py` 使用 |
-| `src/lab_rag/rag_tool.py` | RAG 问答工具兼容适配器 | 将 `rag_agent.ask_stream()` 聚合为 Agent 可调用的工具结果，并复用历史清理能力 |
+| `src/lab_rag/agent_entry.py` | Agent 模式唯一 ReAct 编排器（流式）；`ask_agent` 为消费同一事件流的非流式薄适配器 | 复用 `rag_agent.py` 的 LLM 与历史，不创建第二套模型实例；RAG 模式（`use_agent=false`）不经过本模块 |
+| `src/lab_rag/agent_tools.py` | Agent 工具注册表：提示词、校验、分派共用的单一数据源 | `ToolSpec` 定义工具描述/参数/角色(目录或正文)/handler；`dispatch_tool` 是唯一执行路径，返回完整观察、耗时与 `tool_call_id` |
+| `src/lab_rag/rag_tool.py` | Agent 侧 RAG 适配层 | 将 `rag_agent.ask_stream()` 聚合为结构化结果；`persist_history=False` 保证 Agent 内部问题不污染用户正式历史；支持 `route_hint` 透传 |
+| `legacy/agent_entry_nonstream.py`、`legacy/agent_tools_langchain.py` | 3.4.3 前的非流式 ReAct 循环与 LangChain `@tool` 层历史快照 | 已归档，不在包路径内、不被生产代码导入 |
 | `src/lab_rag/templates/index.html` | 主问答页面 | 解析完整 SSE 协议，展示路由、检索状态、引用、覆盖率、历史记录和流式回答 |
 | `src/lab_rag/templates/login.html` | 登录页面 | 由 Flask `render_template()` 渲染，提交凭据到 Web 登录接口 |
 

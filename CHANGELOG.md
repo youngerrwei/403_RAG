@@ -6,6 +6,63 @@
 
 ---
 
+## [3.4.3] Agent 模式收敛为单一编排器（保留 RAG / Agent 双模式）
+
+### Changed
+
+- **单一编排器**：`ask_agent_stream` 成为 Agent 模式唯一的 ReAct 循环；
+  `ask_agent` 改为消费同一事件流的非流式薄适配器，不再另写一套循环。
+  此前两套循环在步数预算、重复抑制、上下文压缩、收敛轮、错误降级上已分叉。
+- **统一工具注册表**：新增 `src/lab_rag/agent_tools.py`，`ToolSpec` 集中定义
+  工具描述、参数名、角色（catalog/content）、handler；提示词工具段落由注册表生成，
+  `dispatch_tool` 是唯一执行路径，返回完整观察、耗时与 `tool_call_id`。
+  消除「提示词 / @tool docstring / 硬编码分派」三处元数据漂移，以及
+  ContextVar 隐式用户名绑定在生产链路不生效的问题（改为显式传参）。
+- **协议与轨迹诚实**：确定性直调分支不再伪造 `step_llm`/Thought，新增
+  `route_direct` 事件（前端与 `AGENTS.md` 第 7 节同步）；`step_tool` 带
+  `tool_call_id`/`elapsed_s`/`ok`；`error` 统一为 `message` 字段（前端兼容 content）；
+  `final` 补 `file_result` 文档；前端 `[DONE]` 按协议终止循环。
+- **路由复用**：`ask_stream` 新增可选 `route_hint`，编排器已确定路由时直接复用，
+  避免同一问句重复路由（默认 `None`，RAG 模式行为完全不变）。
+- **预算与可观测**：新增 `AGENT_TOTAL_TIMEOUT_S`(240) 总耗时预算与
+  `AGENT_FALLBACK_SNIPPET_CHARS`(300) 兜底摘要；`agent_metrics` 增加 `timed_out`；
+  删除已无用的 `AGENT_LEGACY_MAX_STEPS`（同步 7 处）。
+- 提示词与代码契约对齐：明确每轮仅一个 Action、Observation 可能被压缩/折叠、
+  目录清单由系统统一附加而非要求模型在末尾罗列；复合意图补检索先查已调用集合。
+
+### Removed / Archived
+
+- 删除 `src/lab_rag/tools.py`（LangChain `@tool` + ContextVar 层）及
+  `rag_tool.py` 中全仓无引用的 `clear_history`/`rag_qa_tool`；
+  旧非流式循环与工具层原样归档到 `legacy/agent_entry_nonstream.py`、
+  `legacy/agent_tools_langchain.py`，不在包路径内、不被生产代码导入。
+
+### Fixed
+
+- 修正 `scripts/evaluate_agent_multistep.py` 收敛判据：优先读
+  `agent_metrics.converged`，历史模块回退文案判据。上一版仍按旧文案
+  「工具调用达到最大步数」判断，在优雅收敛文案上线后会把预算耗尽误判为已收敛，
+  导致上一轮报告的 `convergence_rate=1.0` 失真，真实值为 **0.875**。
+
+### Tests
+
+- 新增 `tests/agent_test_helpers.py` 统一 mock 装配；
+  `tests/test_agent_perf.py` 增加单一编排器 / 注册表一致性 / 未知工具降级 /
+  可追溯事件 / 统一错误字段 / 总耗时预算 6 项架构用例。
+- 全量离线回归 **122 项通过**（3 项按标注跳过）、HTML 契约 32/32。
+- 双模式真实链路冒烟：RAG 模式（`ask_stream`）final 755 字符；
+  Agent 确定性分支事件 `route_direct → step_tool → final`；
+  Agent 多轮 hybrid 3 轮 LLM / 2 次工具 / 0 空转 / 已收敛 / 答案 1390 字符。
+
+### 升级注意
+
+- 零重建：未改动 `page_content` / metadata / `RETRIEVAL_INDEX_VERSION`(2)。
+- `use_agent=false` 的 RAG 模式链路不变（`route_hint` 默认 `None`）；
+  `use_agent=true` 的 Agent 模式新增 `route_direct` 事件，前端已同步解析，
+  旧前端会按未知类型兜底忽略，不会报错。
+
+---
+
 ## [3.4.2] Agent 多轮推理性能
 
 ### Changed
