@@ -620,6 +620,9 @@ def load_config() -> dict:
         "FINAL_TOP_K": int(os.getenv("FINAL_TOP_K", "16")),
 
         "MAX_HISTORY_TOKENS": int(os.getenv("MAX_HISTORY_TOKENS", "1500")),
+        # 对话历史管理：软轮次上限（超过的最旧轮次折叠而非丢弃）+ 折叠开关（默认开启）
+        "HISTORY_SOFT_TURN_LIMIT": int(os.getenv("HISTORY_SOFT_TURN_LIMIT", "16")),
+        "HISTORY_COMPACT_ENABLED": _env_bool("HISTORY_COMPACT_ENABLED", "true"),
 
         "RERANKER_MODEL_NAME": os.getenv("RERANKER_MODEL_NAME", "./models/bge-reranker-v2-m3"),
         "RERANKER_DEVICE": os.getenv("RERANKER_DEVICE", "cuda:2"),
@@ -736,6 +739,11 @@ def load_config() -> dict:
         # 模型已显式选择 rag_qa（内容工具），语义即等价于内容路由；歧义子问题也不会再触发一次 LLM 路由。
         # 关闭可恢复为「每轮子问题各自路由」的历史行为（见 3.4.5 变更说明）。
         "AGENT_REUSE_ROUTE_HINT": _env_bool("AGENT_REUSE_ROUTE_HINT", "true"),
+        # 更长对话上下文：Agent 历史注入的轮次护栏 + 字符预算（超出折叠旧轮）；
+        # 以及多轮 RAG 结果累积的总上下文预算护栏（对抗「RAG 结果爆炸」）。
+        "AGENT_HISTORY_MAX_TURNS": int(os.getenv("AGENT_HISTORY_MAX_TURNS", "20")),
+        "AGENT_HISTORY_MAX_CHARS": int(os.getenv("AGENT_HISTORY_MAX_CHARS", "3000")),
+        "AGENT_CONTEXT_MAX_CHARS": int(os.getenv("AGENT_CONTEXT_MAX_CHARS", "16000")),
         "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),
         "ADAPTIVE_LEXICAL_TOP_K": int(os.getenv("ADAPTIVE_LEXICAL_TOP_K", "16")),
 
@@ -1013,19 +1021,82 @@ def estimate_history_tokens(history: List[Dict[str, str]]) -> int:
     return sum(4 + estimate_tokens(x.get("content", "")) for x in history)
 
 
-def truncate_history(history: List[Dict[str, str]], max_tokens: int) -> List[Dict[str, str]]:
-    if estimate_history_tokens(history) <= max_tokens:
-        return history
+def _compact_turn(turn: Dict[str, str]) -> Dict[str, str]:
+    """把一条历史轮次折叠为紧凑摘要占位（保留 user 问题 + assistant 答案要点）。
 
-    kept = []
-    total = 0
-    for msg in reversed(history):
+    用于历史超出预算时保留早期上下文线索但大幅压缩，而非完全丢弃导致
+    指代/意图丢失；不调用 LLM，纯确定性的首尾裁剪，离线安全。
+    """
+    role = str(turn.get("role", ""))
+    content = str(turn.get("content", "")).strip()
+    if not content:
+        return {"role": role, "content": ""}
+    if role == "user":
+        head = content[:60]
+        tail = f"（…共 {len(content)} 字）" if len(content) > 60 else ""
+        return {"role": role, "content": f"用户曾问：{head}{tail}"}
+    label = "助手曾答" if role == "assistant" else role
+    head = content[:120]
+    tail = f"（…共 {len(content)} 字）" if len(content) > 120 else ""
+    return {"role": role, "content": f"{label}：{head}{tail}"}
+
+
+def _keep_recent_within_budget(window, max_tokens, enabled):
+    """在 window 内从最近往回保留完整轮次；超预算的更旧轮次按需折叠或丢弃。"""
+    kept, total = [], 0
+    for msg in reversed(window):
         cost = 4 + estimate_tokens(msg.get("content", ""))
         if total + cost > max_tokens:
             break
         kept.insert(0, msg)
         total += cost
+    remaining = window[:len(window) - len(kept)]
+    if not remaining:
+        return kept
+    if enabled:
+        return [_compact_turn(t) for t in remaining] + kept
     return kept
+
+
+def truncate_history(history: List[Dict[str, str]], max_tokens: int,
+                    cfg: dict = None) -> List[Dict[str, str]]:
+    """按 token 预算保留最近对话；超出预算的更旧轮次折叠压缩而非直接丢弃。
+
+    支持更长的对话上下文：旧轮次被压成「用户曾问 / 助手曾答」紧凑占位，保留指代
+    与意图线索，避免完全丢失导致后续回答割裂。
+    - HISTORY_COMPACT_ENABLED（默认 true）：false 时退化为旧的硬截断行为。
+    - HISTORY_SOFT_TURN_LIMIT（默认 16）：超过该轮数的最旧轮次先折叠，作为护栏。
+    """
+    if not history:
+        return history
+    cfg = cfg or {}
+    enabled = str(cfg.get("HISTORY_COMPACT_ENABLED",
+                          os.getenv("HISTORY_COMPACT_ENABLED", "true"))).lower() in {
+        "1", "true", "yes", "y", "on"}
+    soft_limit = max(0, int(cfg.get("HISTORY_SOFT_TURN_LIMIT",
+                                  os.getenv("HISTORY_SOFT_TURN_LIMIT", "16"))))
+
+    # 软轮次上限：超过的最旧轮次先折叠（保留线索），不直接丢弃
+    if soft_limit and len(history) > soft_limit:
+        old = history[:len(history) - soft_limit]
+        kept_window = history[len(history) - soft_limit:]
+    else:
+        old, kept_window = [], history
+
+    if estimate_history_tokens(kept_window) <= max_tokens:
+        folded_window = kept_window
+    else:
+        folded_window = _keep_recent_within_budget(kept_window, max_tokens, enabled)
+
+    if old:
+        old = [_compact_turn(t) for t in old] if enabled else []
+
+    result = old + folded_window
+    # 整体预算兜底：折叠后仍超预算则关闭压缩递归丢弃最旧项
+    if enabled and estimate_history_tokens(result) > max_tokens:
+        result = truncate_history(result, max_tokens,
+                                  {**cfg, "HISTORY_COMPACT_ENABLED": False})
+    return result
 
 
 def format_chat_history(history: List[Dict[str, str]]) -> str:

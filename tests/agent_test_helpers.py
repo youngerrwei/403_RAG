@@ -91,11 +91,13 @@ def make_dispatch(observation="目录：A设备/B设备", rag_answer="正文依�
 
 
 def drive(outputs, question, route="hybrid", cfg=None,
-          observation="目录：A设备/B设备", rag_answer="正文依据", dispatch=None):
+          observation="目录：A设备/B设备", rag_answer="正文依据", dispatch=None,
+          chat_history=None):
     """驱动流式单编排器，返回 (events, llm, rag_recorder, catalog_recorder)。
 
     dispatch 可选：传入自定义分派（如 make_dispatch(rag_ok=False)）以模拟工具失败/无依据。
     传入时 rag_recorder/catalog_recorder 为 None（记录器由调用方自行持有）。
+    chat_history 可选：传入对话历史以验证历史压缩/更长上下文场景。
     """
     llm = _llm(outputs)
     if dispatch is None:
@@ -109,7 +111,7 @@ def drive(outputs, question, route="hybrid", cfg=None,
             patch.object(ae, "build_qwen_llm", return_value=llm), \
             patch.object(ae, "dispatch_tool", dispatch), \
             patch.object(ae, "append_user_chat_history"):
-        events = list(ae.ask_agent_stream(question, username="tester"))
+        events = list(ae.ask_agent_stream(question, username="tester", chat_history=chat_history))
     return events, llm, rag, catalog
 
 

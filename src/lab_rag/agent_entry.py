@@ -222,13 +222,75 @@ def parse_answer(text: str) -> str:
     return match.group(1).strip() if match else text.strip()
 
 
-def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]] = None):
+def _fold_turn_agent(turn: Dict[str, str]) -> Dict[str, str]:
+    """Agent 侧历史折叠：超字符预算的最旧轮次压成紧凑占位，保留意图线索。"""
+    role = str(turn.get("role", ""))
+    content = str(turn.get("content", "")).strip()
+    if not content:
+        return {"role": role, "content": ""}
+    if role == "user":
+        if len(content) <= 50:
+            return {"role": role, "content": f"用户：{content}"}
+        return {"role": role,
+                "content": f"[早期历史压缩] 用户曾问：{content[:50]}（…共 {len(content)} 字）"}
+    if len(content) <= 100:
+        return {"role": role, "content": f"助手：{content}"}
+    label = "助手曾答" if role == "assistant" else role
+    return {"role": role,
+            "content": f"[早期历史压缩] {label}：{content[:100]}（…共 {len(content)} 字）"}
+
+
+def _trim_agent_context(messages: List[Dict[str, str]], budget: int,
+                        protected_indices: set) -> None:
+    """messages 总字符超 budget 时，从最旧的非系统/非受保护消息开始折叠。
+
+    对抗「RAG 结果爆炸」：多轮工具结果累积超出模型窗口时，把早期上下文压成
+    占位，而非任由超长上下文导致截断或报错；受保护索引（最近若干 observation）不折叠。
+    """
+    if budget <= 0:
+        return
+    total = sum(len(m.get("content", "")) for m in messages)
+    if total <= budget:
+        return
+    for i, m in enumerate(messages):
+        if i == 0 or i in protected_indices:
+            continue
+        if total <= budget:
+            break
+        c = m.get("content", "")
+        if c.startswith("[已折叠]") or c.startswith("[早期历史压缩]"):
+            continue
+        new_c = ("[已折叠] 早期上下文已压缩（原 %d 字符），如需细节请换更具体的"
+                 "关键词重新检索。" % len(c))
+        total -= (len(c) - len(new_c))
+        m["content"] = new_c
+
+
+def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]] = None,
+                      cfg: dict = None):
+    """构建 Agent 初始消息：注入对话历史（受轮次与字符预算约束）。
+
+    历史超 AGENT_HISTORY_MAX_CHARS 预算时，最旧的轮次折叠为紧凑占位而非丢弃，
+    支持更长对话上下文而不撑爆模型窗口；AGENT_HISTORY_MAX_TURNS 为总轮次护栏。
+    """
+    cfg = cfg or {}
     messages: List[Dict[str, str]] = [{"role": "system", "content": REACT_SYSTEM_PROMPT}]
-    for item in (chat_history or [])[-20:]:
-        role = item.get("role")
-        content = str(item.get("content", "")).strip()
-        if role in {"user", "assistant"} and content:
-            messages.append({"role": role, "content": content})
+    max_turns = max(1, int(cfg.get("AGENT_HISTORY_MAX_TURNS", 20)))
+    max_chars = max(0, int(cfg.get("AGENT_HISTORY_MAX_CHARS", 3000)))
+    turns = [it for it in (chat_history or [])[-max_turns:]
+             if str(it.get("role", "")) in {"user", "assistant"}
+             and str(it.get("content", "")).strip()]
+    kept, used, folded = [], 0, []
+    for it in reversed(turns):
+        c = str(it.get("content", ""))
+        if max_chars and kept and used + len(c) > max_chars:
+            folded.insert(0, _fold_turn_agent(it))
+        else:
+            kept.insert(0, {"role": str(it.get("role")), "content": c})
+            used += len(c)
+    for m in folded + kept:
+        if m.get("content"):
+            messages.append(m)
     messages.append({"role": "user", "content": question})
     return messages
 
@@ -308,7 +370,7 @@ def ask_agent_stream(
 
         # ---- ReAct 循环 ----
         llm = build_qwen_llm()
-        messages = _initial_messages(question, chat_history)
+        messages = _initial_messages(question, chat_history, cfg)
         max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 6)))
         max_idle = max(0, int(cfg.get("AGENT_MAX_IDLE_STEPS", 2)))
         llm_budget = max_steps + max_idle + 1
@@ -353,6 +415,11 @@ def ask_agent_stream(
             step = llm_calls
             context_chars_peak = max(
                 context_chars_peak, sum(len(m.get("content", "")) for m in messages))
+            # 总上下文预算护栏：多轮 RAG 结果 / 长历史累积超长时折叠最旧消息，防爆炸
+            context_budget = max(0, int(cfg.get("AGENT_CONTEXT_MAX_CHARS", 16000)))
+            keep_obs = max(0, int(cfg.get("AGENT_KEEP_RECENT_OBSERVATIONS", 2)))
+            protected = set(observation_indices[-keep_obs:]) if observation_indices else set()
+            _trim_agent_context(messages, context_budget, protected)
 
             llm_start = time.perf_counter()
             try:

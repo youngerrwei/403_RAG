@@ -288,6 +288,9 @@ data: [DONE]
 | `AGENT_MAX_IDLE_STEPS` | `2` | 空转轮上限；空转不占工具步数预算，另有 LLM 硬上限防死循环 |
 | `AGENT_REPEAT_ACTION_GUARD` | `true` | 抑制「同工具+完全相同参数」重复调用，避免多轮搜索空转 |
 | `AGENT_REUSE_ROUTE_HINT` | `true` | 多步连锁场景优化：agent 循环内 rag_qa 子问题复用内容路由，跳过冗余规则/LLM 重路由（模型已选内容工具即等价于内容路由）；关闭可恢复历史逐轮子路由行为 |
+| `AGENT_HISTORY_MAX_TURNS` | `20` | Agent 初始消息注入历史的总轮次护栏（超过的更旧轮次参与字符预算折叠） |
+| `AGENT_HISTORY_MAX_CHARS` | `3000` | Agent 历史注入的字符预算；超出时最旧轮次折叠为紧凑占位，支持更长对话上下文而不撑爆窗口 |
+| `AGENT_CONTEXT_MAX_CHARS` | `16000` | Agent 多轮总上下文预算护栏；多轮 RAG 结果/长历史累积超长时折叠最旧消息，对抗「RAG 结果爆炸」 |
 | `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）在首轮召回身份字段零命中时，自动启用本地词边界匹配补召回（按词元形态判定，无用例语义） |
 | `ADAPTIVE_LEXICAL_MIN_DIGITS` | `6` | 触发自适应兜底的纯数字词元最小长度 |
 | `ADAPTIVE_LEXICAL_TOP_K` | `16` | 自适应兜底补充候选数上限 |
@@ -297,6 +300,8 @@ data: [DONE]
 | `MAX_HYDE_QUERIES` | `2` | HyDE 假设文档最大路数 |
 | `MAX_SPARSE_CONDITIONS` | `30` | MatchText should 条件预算 |
 | `ENABLE_HISTORY_AWARE_REWRITE` | `true` | 改写阶段使用对话历史消解代词 |
+| `HISTORY_SOFT_TURN_LIMIT` | `16` | 对话历史软轮次上限；超过该轮数的最旧轮次在 token 截断前先折叠压缩，保留意图线索 |
+| `HISTORY_COMPACT_ENABLED` | `true` | 历史超预算时折叠旧轮而非直接丢弃（关闭则退化为旧的硬截断行为） |
 | `RERANKER_RELATIVE_RATIO` | `0` | 重排相对 Top-1 比例阈值（0=关闭） |
 | `RERANKER_MIN_KEEP` | `0` | 重排最少保留条数（0=关闭） |
 | `ENABLE_ANSWERABILITY_GATE` | `true` | 关键词零证据 + 低分时判为知识库无答案，避免假引用 |

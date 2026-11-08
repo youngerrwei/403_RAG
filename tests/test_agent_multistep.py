@@ -411,5 +411,71 @@ class DeeperChainTests(unittest.TestCase):
         self.assertEqual(final["agent_metrics"]["tool_calls"], 5)
 
 
+class HistoryCompressionTests(unittest.TestCase):
+    """上下文压缩与历史管理：支持更长对话上下文（RAG 结果爆炸 / 更多轮次）。"""
+
+    def test_initial_messages_keeps_short_history_intact(self):
+        hist = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+        msgs = ae._initial_messages("新", hist, {"AGENT_HISTORY_MAX_CHARS": 3000})
+        contents = [m["content"] for m in msgs]
+        self.assertIn("q", contents)
+        self.assertIn("a", contents)
+        self.assertFalse(any(c.startswith("[早期历史压缩]") for c in contents))
+
+    def test_initial_messages_folds_old_turns_when_over_char_budget(self):
+        hist = [
+            {"role": "user", "content": "x" * 2000},
+            {"role": "assistant", "content": "y" * 2000},
+            {"role": "user", "content": "z" * 2000},
+        ]
+        msgs = ae._initial_messages(
+            "新", hist, {"AGENT_HISTORY_MAX_CHARS": 1000, "AGENT_HISTORY_MAX_TURNS": 20})
+        folded = [m for m in msgs if m["content"].startswith("[早期历史压缩]")]
+        self.assertTrue(folded, "超字符预算的最旧历史轮次应被折叠")
+        self.assertEqual(msgs[-1]["content"], "新")
+
+    def test_truncate_history_folds_old_turns(self):
+        # 用足量中文长文本，确保真实触发「超预算旧轮折叠」而非被递归全丢弃
+        hist = [{"role": "user", "content": "问题%d" % i} for i in range(5)] + \
+               [{"role": "assistant", "content": "内容" * 600} for _ in range(5)]
+        out = ra.truncate_history(hist, max_tokens=1500, cfg={"HISTORY_COMPACT_ENABLED": True})
+        folded = [t for t in out if "用户曾问" in t["content"] or "助手曾答" in t["content"]]
+        self.assertTrue(folded, "超预算旧轮应折叠为摘要而非直接丢弃")
+
+    def test_truncate_history_disabled_drops_old(self):
+        hist = [{"role": "user", "content": "q" * 200} for _ in range(6)]
+        out = ra.truncate_history(hist, max_tokens=20, cfg={"HISTORY_COMPACT_ENABLED": False})
+        self.assertLess(len(out), len(hist))
+        self.assertFalse(any("曾问" in t["content"] or "曾答" in t["content"] for t in out))
+
+    def test_long_history_still_converges(self):
+        hist = []
+        for i in range(12):
+            hist.append({"role": "user", "content": ("第%d轮问题：" % i) + "内容" * 300})
+            hist.append({"role": "assistant", "content": ("第%d轮回答：" % i) + "内容" * 300})
+        cfg = {"AGENT_MAX_STEPS": 4, "AGENT_REPEAT_ACTION_GUARD": True,
+               "AGENT_TOTAL_TIMEOUT_S": 240, "AGENT_MAX_IDLE_STEPS": 2,
+               "AGENT_REUSE_ROUTE_HINT": True, "AGENT_HISTORY_MAX_CHARS": 3000}
+        outputs = ['Thought: 检索\nAction: rag_qa["某主题"]',
+                   'Answer: 根据知识库内容可概括为：答案']
+        events, llm, rag, catalog = _drive(
+            outputs, "新问题", route="hybrid", cfg=cfg, chat_history=hist)
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertTrue(events[-1]["agent_metrics"]["converged"])
+
+    def test_context_budget_guard_folds_old_messages(self):
+        msgs = [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "A" * 5000},
+            {"role": "assistant", "content": "B" * 5000},
+            {"role": "user", "content": "C" * 5000},
+        ]
+        ae._trim_agent_context(msgs, budget=8000, protected_indices=set())
+        folded = [m for m in msgs if m["content"].startswith("[已折叠]")]
+        self.assertTrue(folded, "总上下文超预算时最旧消息应被折叠")
+        # 系统消息不被折叠
+        self.assertEqual(msgs[0]["content"], "S")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

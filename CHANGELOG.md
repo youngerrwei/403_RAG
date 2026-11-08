@@ -4,6 +4,26 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.8] 上下文压缩与历史管理（支持更长对话上下文）
+
+### Added
+
+- **历史记录压缩（折叠而非丢弃）**：`rag_agent.py` `truncate_history` 新增旧轮折叠能力——对话历史超出 `MAX_HISTORY_TOKENS` 预算或 `HISTORY_SOFT_TURN_LIMIT` 软轮次上限时，最旧的轮次被压成「用户曾问 / 助手曾答」紧凑摘要占位，保留指代与意图线索，而非直接丢弃；`HISTORY_COMPACT_ENABLED=false` 退化为旧的硬截断行为。
+- **Agent 历史注入预算**：`agent_entry.py` `_initial_messages` 新增字符预算（`AGENT_HISTORY_MAX_CHARS`）+ 轮次护栏（`AGENT_HISTORY_MAX_TURNS`），超出时最旧历史轮次折叠为 `[早期历史压缩]` 占位，支持更长对话上下文而不撑爆模型窗口。
+- **Agent 总上下文预算护栏**：新增 `AGENT_CONTEXT_MAX_CHARS`，多轮 RAG 结果 / 长历史累积超长时折叠最旧消息（受保护的最近若干 observation 不折叠），对抗「RAG 结果爆炸」导致的窗口溢出。
+
+### Changed
+
+- 新增 5 个配置项并在 `load_config` / `AGENTS.md` 配置共识表 / `.env.example` 注册：`HISTORY_SOFT_TURN_LIMIT`(16)、`HISTORY_COMPACT_ENABLED`(true)、`AGENT_HISTORY_MAX_TURNS`(20)、`AGENT_HISTORY_MAX_CHARS`(3000)、`AGENT_CONTEXT_MAX_CHARS`(16000)。
+- 单测新增 `HistoryCompressionTests`（历史折叠 / 长历史收敛 / 总上下文护栏），`agent_test_helpers.drive` 支持透传 `chat_history`。
+
+### 说明
+
+- 默认行为保持兼容：短历史 / 未超预算时不做任何折叠；压缩为确定性的首尾裁剪，不调用 LLM，离线安全。
+- 评测 21 场景收敛率保持 0.952，agent 单测 34 全过，零回归。
+
+---
+
 ## [3.4.7] Agentic RAG 鲁棒性优化 + 测试集扩充
 
 ### Changed
