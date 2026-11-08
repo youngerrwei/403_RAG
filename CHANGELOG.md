@@ -54,6 +54,16 @@
   Agent 确定性分支事件 `route_direct → step_tool → final`；
   Agent 多轮 hybrid 3 轮 LLM / 2 次工具 / 0 空转 / 已收敛 / 答案 1390 字符。
 
+### 性能复测（round9，确认「保留 RAG 模式」零回归）
+
+- 主集严格命中率 **0.959 → 0.967**（L08 由 MISS 转 HIT）、Top-1 **0.719 → 0.727**、
+  留出集 **0.864 持平**、逐 id **零回归**；`use_agent=false` 的 RAG 模式链路未变
+  （`ask_stream` 的 `route_hint` 默认 `None`），`route_direct` 仅由 Agent 模式产生。
+- 门槛 18/23 通过，未达成项均非本次重构引入：`file_list_total_s` 12.369→12.349 持平、
+  `hybrid_total_s` 16.19→13.852 改善、`avg_retrieval_s` 5.512→5.548 属波动；
+  `generalization_gap` 0.095→0.103 是「主集提升而留出持平」的算术结果；
+  `refuse_acc` 0.875→0.75 为 LLM 拒答非确定性波动（按既定要求不强修）。
+
 ### 升级注意
 
 - 零重建：未改动 `page_content` / metadata / `RETRIEVAL_INDEX_VERSION`(2)。
