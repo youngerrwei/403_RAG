@@ -1,0 +1,62 @@
+[
+  {
+    "id": "extract_summarize_papers",
+    "category": "检索→提取→总结",
+    "question": "A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结",
+    "route": "hybrid",
+    "steps": [
+      {"thought": "先检索 A2X 小组水下方向的论文候选", "tool": "rag_qa", "arg": "A2X小组 水下方向 论文"},
+      {"thought": "对第一篇水下论文做内容摘要", "tool": "rag_qa", "arg": "A2X小组 水下 论文一 研究内容与摘要"},
+      {"thought": "对第二篇水下论文做内容摘要", "tool": "rag_qa", "arg": "A2X小组 水下 论文二 研究内容与摘要"},
+      {"answer": "根据知识库内容可概括为：A2X小组水下方向主要有两篇论文。论文一针对水下声学传感阵列展开；论文二关注水下通信链路建模。两篇均围绕实验室水下平台的核心方向。"}
+    ]
+  },
+  {
+    "id": "cross_group_papers_compare",
+    "category": "跨组同主题关联",
+    "question": "VLC小组和A2X小组在水下声学方向各有哪些论文，对比其研究重点",
+    "route": "hybrid",
+    "steps": [
+      {"thought": "检索 VLC 小组水下声学方向论文", "tool": "rag_qa", "arg": "VLC小组 水下声学 论文"},
+      {"thought": "检索 A2X 小组水下声学方向论文", "tool": "rag_qa", "arg": "A2X小组 水下声学 论文"},
+      {"thought": "对比两组研究重点", "tool": "rag_qa", "arg": "VLC小组 A2X小组 水下声学论文 研究重点 对比"},
+      {"answer": "根据知识库内容可概括为：VLC 侧重声学阵列标定，A2X 侧重链路建模；两者共同关注水下低信噪比条件下的稳健性。"}
+    ]
+  },
+  {
+    "id": "multi_hop_citation",
+    "category": "多跳跨文档关联",
+    "question": "VLC小组的EDU36311A电源编程指南里引用了哪些论文，并分别说明其用途",
+    "route": "llm_fallback",
+    "steps": [
+      {"thought": "先定位 EDU36311A 电源编程指南内容", "tool": "rag_qa", "arg": "VLC小组 EDU36311A 电源 编程指南"},
+      {"thought": "从指南中提取引用的论文", "tool": "rag_qa", "arg": "EDU36311A 编程指南 引用 论文"},
+      {"thought": "说明各引用论文的用途", "tool": "rag_qa", "arg": "EDU36311A 指南 引用论文 用途 说明"},
+      {"answer": "根据知识库内容可概括为：该指南引用了三篇论文，分别用于阵列校准、噪声建模与实时处理链路设计。"}
+    ]
+  },
+  {
+    "id": "list_then_summarize_methods",
+    "category": "先定位后总结",
+    "question": "列出VLC小组近三年组会，提取其中的论文写作方法要点并总结",
+    "route": "hybrid",
+    "steps": [
+      {"thought": "先列出 VLC 小组近三年组会文档", "tool": "list_group_files", "arg": "VLC小组 组会"},
+      {"thought": "提取组会中的论文写作方法要点", "tool": "rag_qa", "arg": "VLC小组 组会 论文写作方法 要点"},
+      {"thought": "归纳总结写作方法", "tool": "rag_qa", "arg": "VLC小组 组会 论文写作方法 总结"},
+      {"answer": "根据知识库内容可概括为：近三年组会提到的论文写作方法主要包括问题驱动的引言、可复现的实验编排与图表优先的呈现。"}
+    ]
+  },
+  {
+    "id": "cross_device_association",
+    "category": "跨实体关联",
+    "question": "VLC小组的USRP RIO和HOLOEYE空间光调制器在实验里是怎么配合使用的，分别引用了哪些手册",
+    "route": "hybrid",
+    "steps": [
+      {"thought": "检索 USRP RIO 在实验中的用法", "tool": "rag_qa", "arg": "VLC小组 USRP RIO 实验 配合使用"},
+      {"thought": "检索 HOLOEYE 空间光调制器在实验中的用法", "tool": "rag_qa", "arg": "VLC小组 HOLOEYE 空间光调制器 实验 配合使用"},
+      {"thought": "梳理两者配合关系与引用手册", "tool": "rag_qa", "arg": "USRP RIO HOLOEYE 配合 引用手册 梳理"},
+      {"answer": "根据知识库内容可概括为：USRP RIO 负责射频信号收发，HOLOEYE 负责光场调制，二者通过时序同步联用，相关手册分别为 USRP RIO 入门指南与 HOLOEYE LETO-3 Manuals。"}
+    ]
+  }
+]

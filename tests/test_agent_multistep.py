@@ -8,7 +8,9 @@ import unittest
 from unittest.mock import Mock, patch
 
 from lab_rag import agent_entry as ae
-from agent_test_helpers import _llm, drive as _drive, tool_steps as _tool_steps
+from lab_rag import rag_agent as ra
+from agent_test_helpers import (_llm, drive as _drive, tool_steps as _tool_steps,
+                                load_assoc_scenarios, drive_assoc)
 
 
 MULTISTEP_QUERIES = {
@@ -224,6 +226,64 @@ class PromptContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, p)
 
+    def test_prompt_guides_extract_then_summarize_chain(self):
+        p = ae.REACT_SYSTEM_PROMPT
+        for token in ("先定位", "分批处理", "提取", "摘要", "综合", "≤3"):
+            with self.subTest(token=token):
+                self.assertIn(token, p)
+
+
+class AssociativeScenarioTests(unittest.TestCase):
+    """关联性/链式任务：先定位一批条目，再对其中若干做提取/摘要/对比等处理。
+
+    场景来自 tests/agent_assoc_scenarios.json，新增场景无需改动本文件。
+    """
+
+    def test_all_assoc_scenarios_drive_and_converge(self):
+        for sc in load_assoc_scenarios():
+            with self.subTest(id=sc["id"], category=sc.get("category")):
+                events, llm, rag, catalog = drive_assoc(sc)
+                final = [e for e in events if e["type"] == "final"][-1]
+                # 实际工具序列与声明一致
+                tools = [e["tool"] for e in _tool_steps(events)]
+                expected = [s["tool"] for s in sc["steps"] if "tool" in s]
+                self.assertEqual(tools, expected)
+                # 正文检索参数彼此不同（无重复调用空转）
+                rag_args = [c.args[0] for c in rag.call_args_list]
+                self.assertEqual(len(rag_args), len(set(rag_args)))
+                # 在预算内收敛，不触发确定性直调（首条不是 route_direct）
+                self.assertTrue(final["agent_metrics"]["converged"])
+                self.assertLessEqual(final["agent_metrics"]["tool_calls"],
+                                     sc.get("max_steps", 4))
+                self.assertNotEqual(events[0]["type"], "route_direct")
+
+    def test_chain_preserves_original_intent_on_supplementary_search(self):
+        """链式任务以 list 起手、过早 Answer 时，复合补检索必须保留原始问题。"""
+        outputs = [
+            'Thought: 先列组会\nAction: list_group_files["VLC小组 组会"]',
+            'Answer: 有几篇组会',
+            'Thought: 补提取写作方法\nAction: rag_qa["VLC小组 组会 论文写作方法 要点"]',
+            'Answer: 根据知识库内容可概括为：写作方法要点',
+        ]
+        events, llm, rag, catalog = _events(outputs,
+            "列出VLC小组近三年组会，提取其中的论文写作方法要点并总结")
+        # 复合补检索（hybrid 下 list 后过早 Answer）使用原始问题，而非换固定话术
+        self.assertEqual(rag.call_args_list[0].args[0],
+                         "列出VLC小组近三年组会，提取其中的论文写作方法要点并总结")
+
+
+class CompoundRouteTests(unittest.TestCase):
+    """「定位一批条目 + 处理」型问题不应被折叠成单次确定性 rag_search。"""
+
+    def test_compound_process_task_enters_loop(self):
+        q = "A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结"
+        self.assertIsNone(ra.rule_based_route(q))
+
+    def test_simple_content_stays_deterministic(self):
+        self.assertEqual(ra.rule_based_route("周报怎么写")["route"], "rag_search")
+
+    def test_pure_listing_stays_file_list(self):
+        self.assertEqual(ra.rule_based_route("列出VLC小组设备")["route"], "file_list")
 
 
 if __name__ == "__main__":

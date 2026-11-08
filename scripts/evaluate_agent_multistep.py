@@ -197,6 +197,25 @@ def main():
     global ae
     ae = load_agent_module(args.agent_module)
 
+    # 纳入可成长的关联性/链式任务场景库（tests/agent_assoc_scenarios.json）
+    _assoc_path = PROJECT_ROOT / "tests" / "agent_assoc_scenarios.json"
+    if _assoc_path.exists():
+        for sc in json.loads(_assoc_path.read_text(encoding="utf-8")):
+            outs = []
+            for s in sc["steps"]:
+                if "answer" in s:
+                    outs.append("Answer: " + s["answer"])
+                else:
+                    outs.append(f"Thought: {s.get('thought', '继续检索')}\n"
+                                f"Action: {s['tool']}[{json.dumps(s['arg'], ensure_ascii=False)}]")
+            SCENARIOS[sc["id"]] = {
+                "question": sc["question"],
+                "route": sc.get("route", "hybrid"),
+                "outputs": outs,
+                "observation": sc.get("observation"),
+                "max_steps": sc.get("max_steps"),
+            }
+
     cfg = {"AGENT_MAX_STEPS": args.max_steps,
            "AGENT_REPEAT_ACTION_GUARD": True,
            "AGENT_TOTAL_TIMEOUT_S": 240}

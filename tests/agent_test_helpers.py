@@ -4,9 +4,49 @@
 `agent_entry.dispatch_tool` 处打桩，返回与真实分派一致的结构化结果。
 """
 
+import json
+import os
 from unittest.mock import Mock, patch
 
 from lab_rag import agent_entry as ae
+
+ASSOC_SCENARIOS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "agent_assoc_scenarios.json")
+
+
+def load_assoc_scenarios(path=None):
+    """装载可成长的关联性/链式任务场景库（tests/agent_assoc_scenarios.json）。
+
+    新增场景只需往该 JSON 追加一条 {id, category, question, route, steps[]}，
+    单测与评测脚本会自动纳入，无需改动 Python 代码。
+    """
+    with open(path or ASSOC_SCENARIOS_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def steps_to_outputs(steps):
+    """把结构化 step 转成 mock LLM 的输出字符串（Thought/Action/Answer）。"""
+    outs = []
+    for s in steps:
+        if "answer" in s:
+            outs.append("Answer: " + s["answer"])
+        else:
+            arg = json.dumps(s["arg"], ensure_ascii=False)
+            outs.append(f"Thought: {s.get('thought', '继续检索')}\nAction: {s['tool']}[{arg}]")
+    return outs
+
+
+def drive_assoc(scenario):
+    """驱动一条关联性场景，返回 (events, llm, rag_recorder, catalog_recorder)。"""
+    cfg = {
+        "AGENT_MAX_STEPS": scenario.get("max_steps", 4),
+        "AGENT_REPEAT_ACTION_GUARD": True,
+        "AGENT_TOTAL_TIMEOUT_S": 240,
+        "AGENT_MAX_IDLE_STEPS": 2,
+    }
+    outputs = steps_to_outputs(scenario["steps"])
+    return drive(outputs, scenario["question"], route=scenario.get("route", "hybrid"),
+                 cfg=cfg, observation=scenario.get("observation", "目录：A设备/B设备"))
 
 
 def _llm(outputs):

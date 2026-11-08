@@ -6,6 +6,40 @@
 
 ---
 
+## [3.4.4] Agent 关联性 / 链式任务：可成长测试集 + 路由与提示词优化
+
+### Added
+
+- **可成长的关联性场景库** `tests/agent_assoc_scenarios.json`：涵盖「检索→提取→总结」
+  （小组水下论文逐篇摘要）、「跨组同主题关联」（VLC/A2X 水下论文对比）、「多跳跨文档关联」
+  （编程指南引用论文及用途）、「先定位后总结」（组会写作方法归纳）、「跨实体关联」
+  （USRP RIO 与 HOLOEYE 配合）。单测与评测脚本共用同一份 JSON，**新增场景只改 JSON、不动代码**。
+- `tests/agent_test_helpers.py` 增加场景库装载与驱动（`load_assoc_scenarios` /
+  `steps_to_outputs` / `drive_assoc`）；`scripts/evaluate_agent_multistep.py` 启动时自动并入该库。
+
+### Changed
+
+- **路由守卫**：`rule_based_route` 对「先定位/检索一批条目 + 再提取/摘要/对比等处理」的复合任务
+  返回 `None` 进入 LLM 多步循环，不再被折叠成单次确定性 `rag_search` 直调
+  （例：「A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结」从直调改为多步分解）。
+  简单内容问句（「周报怎么写」）与纯列举（「列出VLC小组设备」）路由不受影响。
+- **提示词分解规则**：`REACT_SYSTEM_PROMPT` 新增「关联性 / 链式任务分解规则」，明确
+  「先定位 → 分批处理 → 最后综合」三步法，并给出条目数 ≤3 可一次覆盖、较多须分批的指引。
+
+### Tests
+
+- `tests/test_agent_multistep.py` 新增 `AssociativeScenarioTests`（按 JSON 驱动，校验工具序列、
+  正文检索参数无重复、预算内收敛、非确定性直调）与 `CompoundRouteTests`（路由守卫三态）。
+- 离线回归 **128 项通过**（3 项按标注跳过）；HTML 契约 32/32。
+- 评测场景由 8 扩至 **13**（并入 5 个关联性），avg_context_chars_peak=2889.8、max=4689、
+  收敛率 **0.923**（未收敛项为预期的 `budget_exhausted`；5 个关联性全部 3 工具 / 4 LLM 收敛）。
+
+### 升级注意
+
+- 零重建；仅影响 `use_agent=true` 的路由与提示词。`use_agent=false` 的 RAG 模式链路不变。
+
+---
+
 ## [3.4.3] Agent 模式收敛为单一编排器（保留 RAG / Agent 双模式）
 
 ### Changed

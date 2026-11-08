@@ -1160,11 +1160,29 @@ def extract_catalog_target(question: str, cfg: dict = None) -> str:
     return prefix if len(prefix) >= 2 else text
 
 
+# 复合处理型任务：先定位/检索一批条目，再对其中若干做提取/摘要/对比等处理。
+# 这类问题不应被折叠成单次确定性 rag_search，需进入 LLM 多轮循环以分步完成。
+_COMPOUND_SET_LOCATORS = (
+    "有哪些", "哪些", "列出", "分别", "各有哪些", "各做", "每篇", "每个",
+    "逐一", "各小组", "各设备", "分别有哪些",
+)
+_COMPOUND_PROCESS_VERBS = (
+    "提取", "摘要", "总结", "对比", "归纳", "梳理", "罗列", "分别说明",
+    "分别总结", "做摘要", "分析其", "说明其",
+)
+
+
 def rule_based_route(question: str) -> Optional[dict]:
     """
     基于规则的快速路由。
     如果能确定意图则返回路由结果 dict，否则返回 None 表示需要 LLM 判断。
     """
+    # 复合处理型任务（定位一批条目 + 处理）强制进入 LLM 多轮循环，
+    # 不被确定性直调折叠；简单内容问句（如「周报怎么写」）不受影响。
+    if (any(loc in question for loc in _COMPOUND_SET_LOCATORS)
+            and any(verb in question for verb in _COMPOUND_PROCESS_VERBS)):
+        return None
+
     # 四张词表统一来自检索词典，代码只保留通用判定逻辑
     keywords = lexicon.load_lexicon()["route_keywords"]
     file_list_keywords = keywords["file_list"]
