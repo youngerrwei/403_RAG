@@ -744,6 +744,8 @@ def load_config() -> dict:
         "AGENT_HISTORY_MAX_TURNS": int(os.getenv("AGENT_HISTORY_MAX_TURNS", "20")),
         "AGENT_HISTORY_MAX_CHARS": int(os.getenv("AGENT_HISTORY_MAX_CHARS", "3000")),
         "AGENT_CONTEXT_MAX_CHARS": int(os.getenv("AGENT_CONTEXT_MAX_CHARS", "16000")),
+        # read_file 工具单次读取的字符预算（文件/目录拼接均受此上限约束）
+        "READ_FILE_MAX_CHARS": int(os.getenv("READ_FILE_MAX_CHARS", "6000")),
         "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),
         "ADAPTIVE_LEXICAL_TOP_K": int(os.getenv("ADAPTIVE_LEXICAL_TOP_K", "16")),
 
@@ -1295,12 +1297,13 @@ def rule_based_route(question: str) -> Optional[dict]:
     return None
 
 
-def route_query(llm, question: str) -> dict:
-    # 规则优先：尝试基于关键词快速路由
-    rule_result = rule_based_route(question)
-    if rule_result is not None:
-        debug_log(f"rule_based_route hit: route={rule_result['route']} target={rule_result['target']}")
-        return rule_result
+def route_query(llm, question: str, force_llm: bool = False) -> dict:
+    # 规则优先：尝试基于关键词快速路由（agent 模式可强制走 LLM 路由）
+    if not force_llm:
+        rule_result = rule_based_route(question)
+        if rule_result is not None:
+            debug_log(f"rule_based_route hit: route={rule_result['route']} target={rule_result['target']}")
+            return rule_result
 
     # LLM 兜底：规则未命中时调用 LLM 路由
     prompt = ChatPromptTemplate.from_template("""

@@ -291,6 +291,7 @@ data: [DONE]
 | `AGENT_HISTORY_MAX_TURNS` | `20` | Agent 初始消息注入历史的总轮次护栏（超过的更旧轮次参与字符预算折叠） |
 | `AGENT_HISTORY_MAX_CHARS` | `3000` | Agent 历史注入的字符预算；超出时最旧轮次折叠为紧凑占位，支持更长对话上下文而不撑爆窗口 |
 | `AGENT_CONTEXT_MAX_CHARS` | `16000` | Agent 多轮总上下文预算护栏；多轮 RAG 结果/长历史累积超长时折叠最旧消息，对抗「RAG 结果爆炸」 |
+| `READ_FILE_MAX_CHARS` | `6000` | `read_file` 工具单次读取的字符预算（读取文件/目录拼接均受此上限约束） |
 | `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）在首轮召回身份字段零命中时，自动启用本地词边界匹配补召回（按词元形态判定，无用例语义） |
 | `ADAPTIVE_LEXICAL_MIN_DIGITS` | `6` | 触发自适应兜底的纯数字词元最小长度 |
 | `ADAPTIVE_LEXICAL_TOP_K` | `16` | 自适应兜底补充候选数上限 |

@@ -9,11 +9,12 @@ agent_entry 里的硬编码分派），容易漂移。这里集中定义 ToolSpe
 handler 统一显式接收 username，不再依赖 ContextVar 的隐式绑定。
 """
 
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from .rag_agent import build_file_context, list_catalog_entries
+from .rag_agent import build_file_context, list_catalog_entries, load_config, _runtime
 from .rag_tool import ask_rag
 
 
@@ -44,6 +45,89 @@ def _handle_list_group_files(arg: str, username: str,
     return (text or f"未找到与 {arg} 相关的文件。"), result
 
 
+def _resolve_kb_roots(cfg: Dict) -> List[str]:
+    """解析知识库根目录（与 list_catalog_entries 共用 KNOWLEDGE_BASE_ROOT / DOCS_PATH）。"""
+    roots = []
+    for key in ("KNOWLEDGE_BASE_ROOT", "DOCS_PATH"):
+        value = str(cfg.get(key, "") or "").strip()
+        if value and value not in roots:
+            roots.append(value)
+    return roots
+
+
+def _safe_join(root: str, rel_path: str) -> Optional[str]:
+    """将 rel_path 安全拼接到 root，阻止路径穿越；返回绝对路径或 None。"""
+    root_abs = os.path.abspath(root)
+    target = os.path.abspath(os.path.join(root_abs, rel_path))
+    if target == root_abs or target.startswith(root_abs + os.sep):
+        return target
+    return None
+
+
+def _read_markdown_text(path: str, max_chars: int) -> Optional[str]:
+    """读取文本文档并返回（超长截断）；失败返回 None。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except Exception:
+        return None
+    if len(text) > max_chars:
+        text = text[:max_chars] + (
+            f"\n\n[文档已截断，仅显示前 {max_chars} 字符；"
+            f"如需更多请换更聚焦的子目录/章节再次 read_file]")
+    return text
+
+
+def _handle_read_file(arg: str, username: str,
+                     route_hint: Optional[dict]) -> Tuple[str, Any]:
+    """按 rel_path 读取知识库文档/目录的完整正文。
+
+    文件：返回其完整正文（受 READ_FILE_MAX_CHARS 截断）。
+    目录：拼接其下全部 .md/.txt（受数量与字符预算约束），便于一次性获取某设备的全部手册。
+    未找到或路径非法时抛 ValueError，由 dispatch_tool 降级为「工具失败」以触发重试恢复。
+    """
+    config = _runtime["config"] if _runtime is not None else load_config()
+    max_chars = max(2000, int(config.get("READ_FILE_MAX_CHARS", 6000)))
+    rel_path = str(arg or "").strip().strip('"').strip("'").strip()
+    if not rel_path:
+        raise ValueError("read_file 需要 rel_path 参数（来自 list_group_files 返回的路径）。")
+    roots = _resolve_kb_roots(config)
+    target = None
+    for root in roots:
+        cand = _safe_join(root, rel_path)
+        if cand and os.path.exists(cand):
+            target = cand
+            break
+    if not target:
+        raise ValueError(
+            f"未找到路径 {rel_path} 对应的文档或目录；请用 list_group_files 重新定位后再 read_file。")
+
+    if os.path.isfile(target):
+        text = _read_markdown_text(target, max_chars)
+        if text is None:
+            raise ValueError(f"读取文件失败：{rel_path}")
+        return (f"[文档] {rel_path}\n" + text, None)
+
+    # 目录：拼接其下全部文本文档（受预算与数量上限约束）
+    md_files = []
+    for dp, _dirs, fns in os.walk(target):
+        for fn in fns:
+            if fn.lower().endswith((".md", ".markdown", ".txt")):
+                md_files.append(os.path.join(dp, fn))
+    md_files.sort()
+    md_files = md_files[:10]
+    if not md_files:
+        raise ValueError(f"目录 {rel_path} 下未发现可读取的文档。")
+    per_file = max(1000, max_chars // len(md_files))
+    parts = [f"[目录] {rel_path}（共读取 {len(md_files)} 个文档）"]
+    for fp in md_files:
+        sub = _read_markdown_text(fp, per_file)
+        if sub is None:
+            continue
+        parts.append(f"\n--- 文件: {os.path.relpath(fp, target)} ---\n" + sub)
+    return ("\n".join(parts), None)
+
+
 TOOL_SPECS: Tuple[ToolSpec, ...] = (
     ToolSpec(
         name="rag_qa",
@@ -56,6 +140,20 @@ TOOL_SPECS: Tuple[ToolSpec, ...] = (
         role="content",
         emits_catalog=True,
         handler=_handle_rag_qa,
+    ),
+    ToolSpec(
+        name="read_file",
+        arg_name="rel_path",
+        description="文档阅读工具：按 list_group_files / 目录枚举返回的 rel_path 读取知识库中某文档（或某设备/目录）的完整正文。",
+        bullets=(
+            "参数 rel_path：来自文件清单的路径，如 设备操作指南/VLC小组/.../Manual.md，或某个设备目录。",
+            "读取文件返回其完整正文（超长会截断并标注）；读取目录则返回该目录下全部手册的拼接正文，便于一次性获取某设备的完整用法。",
+            "需要某一设备/文档的具体用法、步骤、参数时，优先用 list_group_files 定位路径再用 read_file 精读，而非仅用 rag_qa 全局检索；"
+            "rag_qa 更适合跨多文档综合检索或用户未指明具体文档的场景。",
+        ),
+        role="content",
+        emits_catalog=False,
+        handler=_handle_read_file,
     ),
     ToolSpec(
         name="list_group_files",
@@ -140,7 +238,8 @@ def dispatch_tool(name: str, arg: str, username: str,
         elapsed = time.perf_counter() - started
         return {
             "ok": False,
-            "observation": "[工具执行异常] 服务暂时不可用，请稍后重试。",
+            "observation": (f"[工具执行异常] {type(exc).__name__}: {exc}"
+                           f"（请换更聚焦的参数重试，或用 list_group_files 重新定位）"),
             "catalog_result": None,
             "elapsed_s": round(elapsed, 3),
             "tool_call_id": tool_call_id,

@@ -462,18 +462,21 @@ class WebContractTests(unittest.TestCase):
         from unittest.mock import Mock
         result = {"ok": True, "observation": "知识库周报规范 [来源1]",
                   "catalog_result": None, "elapsed_s": 0.0, "tool_call_id": "tc-1"}
-        with patch.object(agent_entry, "dispatch_tool",
+        with patch.object(agent_entry, "route_query",
+                          return_value={"route": "rag_search", "target": "周报怎么写"}) as mocked_route, \
+                patch.object(agent_entry, "dispatch_tool",
                           return_value=result) as mocked_dispatch, \
                 patch.object(agent_entry, "build_qwen_llm") as mocked_llm, \
                 patch.object(agent_entry, "append_user_chat_history"):
             events = list(agent_entry.ask_agent_stream("周报怎么写", username="tester"))
 
-        # 确定性分支把已算出的路由透传给工具层，避免重复路由
+        # agent 模式已改为强制 LLM 路由（route_query force_llm），故路由决策由大模型给出；
+        # 内容型问题仍走确定性直调：把 LLM 算出的路由透传给工具层，不进入 ReAct 循环。
         self.assertEqual(mocked_dispatch.call_args.args[0], "rag_qa")
         self.assertEqual(mocked_dispatch.call_args.args[1], "周报怎么写")
         self.assertIsNotNone(mocked_dispatch.call_args.kwargs.get("route_hint"))
 
-        mocked_llm.assert_not_called()
+        mocked_route.assert_called_once()  # 路由决策改由 LLM 给出
         # 3.4.3：确定性路由不再伪造模型 Thought，首条为编排器决策事件
         self.assertEqual(events[0]["type"], "route_direct")
         self.assertEqual(events[0]["tool"], "rag_qa")

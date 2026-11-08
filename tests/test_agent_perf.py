@@ -26,7 +26,7 @@ def _drive(outputs, question="复合意图问题：有哪些设备并说明安�
            route="hybrid", cfg=None, observation="目录：A设备/B设备"):
     llm = _llm(outputs)
     dispatch, rag, _catalog = make_dispatch(observation=observation)
-    with patch.object(ae, "rule_based_route", return_value={"route": route, "target": "VLC小组"}), \
+    with patch.object(ae, "route_query", return_value={"route": route, "target": "VLC小组"}), \
             patch.object(ae, "_agent_config", return_value=cfg or CFG), \
             patch.object(ae, "build_qwen_llm", return_value=llm), \
             patch.object(ae, "dispatch_tool", dispatch), \
@@ -201,7 +201,7 @@ class AgentMetricsContractTests(unittest.TestCase):
     def test_deterministic_route_exposes_metrics(self):
         llm = Mock()
         dispatch, _rag, _catalog = make_dispatch(rag_answer="周报格式正文")
-        with patch.object(ae, "rule_based_route", return_value={"route": "rag_search", "target": "周报"}), \
+        with patch.object(ae, "route_query", return_value={"route": "rag_search", "target": "周报"}), \
                 patch.object(ae, "build_qwen_llm", return_value=llm), \
                 patch.object(ae, "dispatch_tool", dispatch), \
                 patch.object(ae, "append_user_chat_history"):
@@ -238,7 +238,7 @@ class UnifiedOrchestratorContractTests(unittest.TestCase):
 
     def test_dispatch_returns_traceable_result(self):
         dispatch, _rag, _catalog = make_dispatch()
-        with patch.object(ae, "rule_based_route", return_value={"route": "llm_fallback", "target": "x"}), \
+        with patch.object(ae, "route_query", return_value={"route": "llm_fallback", "target": "x"}), \
                 patch.object(ae, "_agent_config", return_value=CFG), \
                 patch.object(ae, "build_qwen_llm", return_value=_llm([
                     'Action: rag_qa["A"]', "Answer: 完成"])), \
@@ -250,7 +250,7 @@ class UnifiedOrchestratorContractTests(unittest.TestCase):
                             for e in steps))
 
     def test_error_event_uses_unified_message_field(self):
-        with patch.object(ae, "rule_based_route", return_value={"route": "llm_fallback", "target": "x"}), \
+        with patch.object(ae, "route_query", return_value={"route": "llm_fallback", "target": "x"}), \
                 patch.object(ae, "_agent_config", return_value=CFG), \
                 patch.object(ae, "build_qwen_llm", return_value=Mock(
                     invoke=Mock(side_effect=RuntimeError("boom")))), \

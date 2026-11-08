@@ -4,6 +4,7 @@
 跨小组分别检索、目录未命中、正文答非所问、重复调用空转、步数预算耗尽。
 """
 
+import os
 import unittest
 from unittest.mock import Mock, patch
 
@@ -162,7 +163,7 @@ class DeterministicRouteTests(unittest.TestCase):
         llm = Mock()
         from agent_test_helpers import make_dispatch
         dispatch, rag, _catalog = make_dispatch(rag_answer="周报格式正文")
-        with patch.object(ae, "rule_based_route", return_value={"route": "rag_search", "target": "周报"}), \
+        with patch.object(ae, "route_query", return_value={"route": "rag_search", "target": "周报"}), \
                 patch.object(ae, "build_qwen_llm", return_value=llm), \
                 patch.object(ae, "dispatch_tool", dispatch), \
                 patch.object(ae, "append_user_chat_history"):
@@ -214,7 +215,7 @@ class PromptContractTests(unittest.TestCase):
 
     def test_prompt_defines_multi_step_decision_rules(self):
         p = ae.REACT_SYSTEM_PROMPT
-        for token in ("多轮检索决策规则", "每一个子问", "必须再调用 rag_qa",
+        for token in ("多轮检索决策规则", "每一个子问", "必须再调用内容工具",
                       "分别检索", "换一个检索角度", "步数预算", "禁止用完全相同的参数"):
             with self.subTest(token=token):
                 self.assertIn(token, p)
@@ -475,6 +476,42 @@ class HistoryCompressionTests(unittest.TestCase):
         self.assertTrue(folded, "总上下文超预算时最旧消息应被折叠")
         # 系统消息不被折叠
         self.assertEqual(msgs[0]["content"], "S")
+
+
+class ReadFileToolTests(unittest.TestCase):
+    """read_file 工具：验证「先 file_list 定位，再 read_file 精读」链路可用。"""
+
+    def test_read_file_after_list_used_and_converged(self):
+        outputs = [
+            'Thought: 列设备\nAction: list_group_files["VLC小组"]',
+            'Thought: 读手册\nAction: read_file["设备操作指南/VLC小组/Agilent MSO-X 3054A 示波器/MSOX3054A-数据手册.md"]',
+            'Answer: 根据知识库内容可概括为：使用方法',
+        ]
+        events, llm, rag, catalog = _drive(outputs, "VLC小组 MSO 怎么用", route="hybrid")
+        tools = [e["tool"] for e in events if e["type"] == "step_tool"]
+        self.assertIn("read_file", tools)
+        self.assertTrue(events[-1]["agent_metrics"]["converged"])
+        self.assertTrue(events[-1]["agent_metrics"]["content_grounded"])
+
+    def test_safe_join_blocks_traversal(self):
+        from lab_rag.agent_tools import _safe_join
+        root = "/tmp/kb_root"
+        self.assertIsNone(_safe_join(root, "../../etc/passwd"))
+        self.assertIsNone(_safe_join(root, "/etc/passwd"))
+        self.assertEqual(_safe_join(root, "sub/file.md"), os.path.abspath("/tmp/kb_root/sub/file.md"))
+
+    def test_read_markdown_truncates(self):
+        from lab_rag.agent_tools import _read_markdown_text
+        import tempfile as _tf
+        with _tf.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
+            f.write("x" * 5000)
+            path = f.name
+        try:
+            text = _read_markdown_text(path, 100)
+            self.assertIn("已截断", text)
+            self.assertLessEqual(len(text), 200)
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

@@ -106,7 +106,7 @@ def drive(outputs, question, route="hybrid", cfg=None,
         rag = catalog = None
     cfg = cfg or {"AGENT_MAX_STEPS": 4, "AGENT_REPEAT_ACTION_GUARD": True,
                   "AGENT_TOTAL_TIMEOUT_S": 240, "AGENT_MAX_IDLE_STEPS": 2}
-    with patch.object(ae, "rule_based_route", return_value={"route": route, "target": "VLC小组"}), \
+    with patch.object(ae, "route_query", return_value={"route": route, "target": "VLC小组"}), \
             patch.object(ae, "_agent_config", return_value=cfg), \
             patch.object(ae, "build_qwen_llm", return_value=llm), \
             patch.object(ae, "dispatch_tool", dispatch), \

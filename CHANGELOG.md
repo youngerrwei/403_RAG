@@ -4,6 +4,29 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.9] Agent 强制 LLM 路由 + read_file 文档精读工具
+
+### Added
+
+- **Agent 模式强制走大模型路由**：`ask_agent_stream` 改用 `route_query(llm, question, force_llm=True)` 进行路由决策（而非规则路由短路），由模型决定目录/正文/混合路径；仅在 LLM 路由完全失败时才回退。直接服务于「先 file_list 再 read_file」等需要模型链式编排的场景。
+- **新增 `read_file` 工具**：按 `list_group_files` 返回的 `rel_path` 读取知识库文档/目录的完整正文（content 角色，与 `rag_qa` 并列的内容工具）。读取文件返回其完整正文；读取目录则拼接该目录下全部手册，便于一次性获取某设备的完整用法。`READ_FILE_MAX_CHARS`（默认 6000）约束单次读取字符预算。
+- `agent_metrics` 新增 `content_grounded` / `catalog_grounded` 字段，前端可读取 grounding 状态。
+
+### Changed
+
+- ReAct 提示词泛化「内容工具（rag_qa 或 read_file）」并新增通用引导：已通过 file_list 定位到具体文档、用户要详细用法/步骤/参数时，优先 `read_file` 精读该文档（更完整、更聚焦），`rag_qa` 更适合跨多文档综合检索。
+- `route_query` 新增 `force_llm` 参数；`dispatch_tool` 工具失败时透出异常信息（便于 read_file 未命中时给出可恢复提示）。
+- 编排器对正文工具增加「执行失败（ok=False）不标记为依据」守卫，避免 read_file 路径未命中被误判为已 grounded。
+- 新增配置项并在 `load_config` / `AGENTS.md` / `.env(.3090).example` 注册：`READ_FILE_MAX_CHARS`。
+- 单测/评测路由 mock 由 `rule_based_route` 迁移到 `route_query`；评测新增 `read_file_flow` 场景。
+
+### 说明
+
+- 离线评测 22 场景收敛率 0.955，agent 全量单测（含 read_file 链路）通过；`max_context_chars_peak` 约 5.3k，远低于 `AGENT_CONTEXT_MAX_CHARS=16000` 预算，无上下文爆炸。
+- `rag_search` 路由仍走确定性直调（LLM 决定路由后直接检索正文，不进入 ReAct 循环）；需 file_list→read_file 的「混合/目录」路由才进入循环，符合本需求。
+
+---
+
 ## [3.4.8] 上下文压缩与历史管理（支持更长对话上下文）
 
 ### Added

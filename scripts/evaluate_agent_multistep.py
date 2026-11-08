@@ -138,6 +138,16 @@ SCENARIOS = {
             "Answer: 根据知识库内容可概括为：设备清单与安装步骤",
         ],
     },
+    # 验证「先 file_list 定位，再 read_file 精读」的链路（agent 模式 LLM 路由 + read_file 工具）
+    "read_file_flow": {
+        "question": "VLC小组的 MSO-X 3054A 示波器怎么用",
+        "route": "hybrid",
+        "outputs": [
+            _action("list_group_files", "VLC小组"),
+            _action("read_file", "设备操作指南/VLC小组/Agilent MSO-X 3054A 示波器/MSOX3054A-数据手册.md"),
+            "Answer: 根据知识库内容可概括为：MSO-X 3054A 的使用方法",
+        ],
+    },
 }
 
 
@@ -151,13 +161,17 @@ def run_scenario(name, spec, cfg):
     def dispatch(name, arg, username, route_hint=None, tool_call_id=""):
         # 统一分派点：目录工具返回长清单，正文工具返回固定答案
         # 注意：部分 JSON 场景未声明 observation，需保证目录工具返回非空清单（否则依据误判）
-        obs = (observation if name == "list_group_files" else "正文依据") or (
-            "目录：A设备/B设备" if name == "list_group_files" else "正文依据")
+        if name == "list_group_files":
+            obs = observation or "目录：A设备/B设备"
+        elif name == "read_file":
+            obs = "文档正文：该示波器的使用方法为连接探头、执行自动设置、读取波形并保存。"
+        else:
+            obs = "正文依据"
         return {"ok": True, "observation": obs, "catalog_result": None,
                 "coverage_level": None, "elapsed_s": 0.0,
                 "tool_call_id": tool_call_id or "tc-perf"}
 
-    with patch.object(ae, "rule_based_route", return_value={"route": spec["route"], "target": "VLC小组"}), \
+    with patch.object(ae, "route_query", return_value={"route": spec["route"], "target": "VLC小组"}), \
             patch.object(ae, "_agent_config", return_value=scenario_cfg), \
             patch.object(ae, "build_qwen_llm", return_value=llm), \
             patch.object(ae, "dispatch_tool", side_effect=dispatch), \

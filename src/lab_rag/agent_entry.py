@@ -22,6 +22,7 @@ from .rag_agent import (
     build_catalog_answer_section,
     get_runtime,
     load_config,
+    route_query,
     rule_based_route,
     sanitize_generated_answer,
 )
@@ -73,7 +74,10 @@ _PROMPT_TAIL = """
 每次拿到 Observation 后，先判断信息是否**覆盖用户问题的每一个子问**：
 - 只有列出/定位类问题：目录结果已给出完整清单即算充分。
 - 同时要求清单与内容说明（如「有哪些设备及使用规范」）：目录结果只回答了清单部分，
-  **必须再调用 rag_qa 读正文**，且第二轮问题要保留用户原始意图，不能换成无关的固定话术。
+  **必须再调用内容工具（read_file 或 rag_qa）读正文**，且第二轮问题要保留用户原始意图，不能换成无关的固定话术。
+- 已通过 list_group_files 定位到具体文档/目录、而用户要的是该文档的详细用法/步骤/参数时，
+  **优先用 read_file 精读该文档**（内容更完整、更聚焦），而非仅用 rag_qa 全局检索；
+  rag_qa 更适合跨多文档综合检索或用户未指明具体文档的场景。
 - 涉及多个小组、设备或文档的对比/分别说明：目录或正文只覆盖其中一个实体时，
   **必须分别检索其余实体**，再综合，不能凭单一文档作答。
 - 正文检索结果与问题不相关、只命中同主题的其他文档、或目录未命中：信息仍不充分。
@@ -98,8 +102,8 @@ _PROMPT_TAIL = """
 
 ## 重要约束
 - 回答必须优先依据工具返回，不得凭空编造。
-- 「格式是什么/怎么写/要求/规范/步骤/方法」等是在查询文档内容，必须直接调用 rag_qa；
-  不能先调用 list_group_files 猜测模板文件。
+- 「格式是什么/怎么写/要求/规范/步骤/方法」等是在查询文档内容，必须直接调用内容工具（rag_qa 或 read_file）；
+  若已通过 list_group_files 定位到具体文档，用 read_file 精读该文档比 rag_qa 更直接。
 - 目录工具未找到结果不代表正文没有答案；应使用用户原始问题再调用 rag_qa，
   禁止改为输出通用模板、通用规范或知识库外常识。
 - 未获得知识库依据时，不得输出「通用规范」「通用模板」或虚构「主要参考」。
@@ -306,7 +310,10 @@ def ask_agent_stream(
     step_tool（工具调用 + 完整 observation + tool_call_id）、tool（目录结果）、
     final（含 agent_metrics）、error。协议见 AGENTS.md 第 7 节。
     """
-    initial_route = rule_based_route(question)
+    # 构建 LLM 实例（供路由与 ReAct 循环共用）；agent 模式强制走大模型路由（route_query force_llm），
+    # 由模型决定目录/正文/混合路径；仅在 LLM 路由完全失败时才回退到规则路由。
+    llm = build_qwen_llm()
+    initial_route = route_query(llm, question, force_llm=True)
     requires_rag_after_list = bool(initial_route and initial_route.get("route") == "hybrid")
 
     cfg = _agent_config()
@@ -365,11 +372,11 @@ def ask_agent_stream(
                    "file_result": latest_catalog_result,
                    "agent_metrics": {"llm_calls": 0, "tool_calls": 1, "idle_steps": 0,
                                      "context_chars_peak": 0, "converged": True,
+                                     "content_grounded": True, "catalog_grounded": False,
                                      "elapsed_s": 0.0, "deterministic_route": True}}
             return
 
         # ---- ReAct 循环 ----
-        llm = build_qwen_llm()
         messages = _initial_messages(question, chat_history, cfg)
         max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 6)))
         max_idle = max(0, int(cfg.get("AGENT_MAX_IDLE_STEPS", 2)))
@@ -392,6 +399,7 @@ def ask_agent_stream(
                 "llm_calls": llm_calls, "tool_calls": tool_calls,
                 "idle_steps": idle_steps, "context_chars_peak": context_chars_peak,
                 "converged": converged, "timed_out": timed_out,
+                "content_grounded": content_grounded, "catalog_grounded": catalog_grounded,
                 "elapsed_s": round(time.perf_counter() - started, 3),
             }
 
@@ -525,6 +533,13 @@ def ask_agent_stream(
             elif role == "content":
                 if used_list_tool:
                     used_rag_after_list = True
+                # 工具执行失败（ok=False，如 read_file 路径未命中）：视为无依据，提示换角度重试
+                if not result.get("ok"):
+                    if result["catalog_result"]:
+                        latest_catalog_result = result["catalog_result"]
+                    yield from emit_tool_step(step, name, arg, result)
+                    append_observation(result["observation"], _RECOVERY_HINT)
+                    continue
                 cov = result.get("coverage_level")
                 # 检索无命中（覆盖度 none）或返回空：提示换角度重试，不标记依据；
                 # 仅 none 触发（very_low 仍属有命中，交由底层可答性闸门与 LLM 判断，避免过度收敛）
