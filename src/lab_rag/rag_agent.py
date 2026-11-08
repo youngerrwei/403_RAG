@@ -722,6 +722,11 @@ def load_config() -> dict:
         "AGENT_MAX_STEPS": int(os.getenv("AGENT_MAX_STEPS", "4")),
         "AGENT_LEGACY_MAX_STEPS": int(os.getenv("AGENT_LEGACY_MAX_STEPS", "5")),
         "AGENT_REPEAT_ACTION_GUARD": _env_bool("AGENT_REPEAT_ACTION_GUARD", "true"),
+        # 多轮上下文有界：注入 LLM 的单条工具结果上限、保留完整结果的近期轮数
+        "AGENT_OBSERVATION_MAX_CHARS": int(os.getenv("AGENT_OBSERVATION_MAX_CHARS", "2000")),
+        "AGENT_KEEP_RECENT_OBSERVATIONS": int(os.getenv("AGENT_KEEP_RECENT_OBSERVATIONS", "2")),
+        # 空转（重复调用抑制/过早 Answer 拦截）允许的最大轮数，不占工具步数预算
+        "AGENT_MAX_IDLE_STEPS": int(os.getenv("AGENT_MAX_IDLE_STEPS", "2")),
         "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),
         "ADAPTIVE_LEXICAL_TOP_K": int(os.getenv("ADAPTIVE_LEXICAL_TOP_K", "16")),
 

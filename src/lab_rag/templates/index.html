@@ -1175,6 +1175,26 @@
                                 renderCoverageAndCitations(data.coverage, data.citations, ab);
                             }
 
+                            // Agent 多轮推理指标（可选字段，旧版后端不携带时静默忽略）
+                            const agentMetrics = data.agent_metrics;
+                            if (agentMetrics && document.getElementById('agent-reasoning-card').style.display !== 'none') {
+                                const metricsBody = document.getElementById('agent-reasoning-body');
+                                if (metricsBody) {
+                                    const metricsDiv = document.createElement('div');
+                                    metricsDiv.className = 'agent-step';
+                                    const parts = [
+                                        `LLM 轮次 ${agentMetrics.llm_calls ?? '-'}`,
+                                        `工具调用 ${agentMetrics.tool_calls ?? '-'}`,
+                                        `空转 ${agentMetrics.idle_steps ?? '-'}`,
+                                        `上下文峰值 ${agentMetrics.context_chars_peak ?? '-'} 字符`,
+                                        agentMetrics.converged ? '已收敛' : '预算用尽'
+                                    ];
+                                    metricsDiv.innerHTML = `<div style="margin:8px 0;font-size:12px;color:#64748b;">推理指标：${escapeHtml(parts.join(' · '))}</div>`;
+                                    metricsBody.appendChild(metricsDiv);
+                                    metricsBody.scrollTop = metricsBody.scrollHeight;
+                                }
+                            }
+
                             setStatus("回答完成。(记得点击保存以防丢失)", "success");
                             currentHistory.push({ role: "assistant", content: latestAnswerText });
                             historyState = HISTORY_STATE.MODIFIED; updateHistoryLabel();

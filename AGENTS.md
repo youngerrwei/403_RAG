@@ -204,6 +204,12 @@ data: {"type": "metadata", "stage": "coverage", "coverage": {...}, "citations": 
 // 结束标记（携带最终元数据）
 data: {"type": "final", "content": "...", "route": "...", "coverage": {...}, "citations": [...]}
 
+// Agent 模式扩展事件（仅 use_agent=true 时产生）
+data: {"type": "step_llm", "step": 1, "content": "Thought/Action/Answer 原文"}
+data: {"type": "step_tool", "step": 1, "tool": "rag_qa", "arg": "...", "observation": "..."}
+// final 事件额外携带 agent_metrics（前端可选读取，未知字段忽略）
+data: {"type": "final", "content": "...", "agent_metrics": {"llm_calls": 3, "tool_calls": 2, "idle_steps": 0, "context_chars_peak": 4258, "converged": true, "elapsed_s": 1.2}}
+
 // 心跳包（src/lab_rag/web_app.py 注入，保持连接活跃）
 data: {"type": "heartbeat"}
 
@@ -264,6 +270,9 @@ data: [DONE]
 | `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免噪声路径误命中 |
 | `AGENT_MAX_STEPS` | `4` | ReAct 流式入口的多轮检索步数预算 |
 | `AGENT_LEGACY_MAX_STEPS` | `5` | ReAct 非流式入口的步数预算 |
+| `AGENT_OBSERVATION_MAX_CHARS` | `2000` | 注入 LLM 的单条工具结果字符上限（SSE 事件仍传完整原文） |
+| `AGENT_KEEP_RECENT_OBSERVATIONS` | `2` | 保留完整工具结果的近期轮数，更早的折叠为占位，避免上下文随步数膨胀 |
+| `AGENT_MAX_IDLE_STEPS` | `2` | 空转轮上限；空转不占工具步数预算，另有 LLM 硬上限防死循环 |
 | `AGENT_REPEAT_ACTION_GUARD` | `true` | 抑制「同工具+完全相同参数」重复调用，避免多轮搜索空转 |
 | `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）在首轮召回身份字段零命中时，自动启用本地词边界匹配补召回（按词元形态判定，无用例语义） |
 | `ADAPTIVE_LEXICAL_MIN_DIGITS` | `6` | 触发自适应兜底的纯数字词元最小长度 |

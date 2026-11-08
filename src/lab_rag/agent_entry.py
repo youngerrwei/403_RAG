@@ -126,6 +126,51 @@ _REPEAT_ACTION_HINT = (
 )
 
 
+def _compact_observation(text: str, cfg: dict) -> str:
+    """有界裁剪「注入 LLM 上下文」的工具结果，保留首尾并标注省略量。
+
+    只压缩喂给模型的 messages；SSE 的 step_tool.observation 仍传完整原文，
+    保证前端与调用方能看到全部信息。判据是字符数，与具体内容无关。
+    """
+    text = str(text or "")
+    limit = max(0, int((cfg or {}).get("AGENT_OBSERVATION_MAX_CHARS", 2000)))
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = int(limit * 0.7)
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (f"{text[:head]}\n…（共 {len(text)} 字符，中间省略 {omitted} 字符；"
+            f"完整结果已在工具事件中展示）\n{text[-tail:] if tail else ''}")
+
+
+def _compact_agent_history(messages: List[Dict[str, str]],
+                           observation_indices: List[int], cfg: dict) -> None:
+    """只保留最近 N 轮完整工具结果，更早的 Observation 折叠为占位文本。
+
+    避免 messages 随多轮步数线性膨胀；system 提示、原始问题与对话历史不动。
+    """
+    keep = max(0, int((cfg or {}).get("AGENT_KEEP_RECENT_OBSERVATIONS", 2)))
+    stale = observation_indices[:-keep] if keep > 0 else list(observation_indices)
+    for idx in stale:
+        if 0 <= idx < len(messages):
+            content = str(messages[idx].get("content", ""))
+            if not content.startswith("[已折叠]"):
+                messages[idx]["content"] = (
+                    "[已折叠] 早期工具结果已用于推理；如需细节请用更具体的关键词重新检索。")
+
+
+def _agent_fallback_answer(question: str, tool_log: list) -> str:
+    """预算耗尽时基于已尝试的检索角度给出诚实说明，不回显原始 Observation、不编造。"""
+    lines = ["根据知识库检索结果，暂未能形成完整回答。", "", "已尝试的检索角度："]
+    for tool, arg in (tool_log or [])[:8]:
+        lines.append(f"- {tool}[{str(arg)[:60]}]")
+    if not tool_log:
+        lines.append("- （尚未成功执行工具）")
+    lines += ["", f"未在知识库中检索到充分依据的部分：{str(question)[:120]}",
+              "建议缩小范围，或改用更具体的设备名、日期、文档名再次提问。"]
+    return "\n".join(lines)
+
+
 def parse_action(text: str) -> Dict[str, Any]:
     """
     从模型输出中解析 Action 行，形如：
@@ -203,11 +248,25 @@ def run_react_once(
     cfg = _agent_config()
     if max_steps is None:
         max_steps = max(1, int(cfg.get("AGENT_LEGACY_MAX_STEPS", 5)))
+    max_idle = max(0, int(cfg.get("AGENT_MAX_IDLE_STEPS", 2)))
+    llm_budget = max_steps + max_idle + 1
     guard_repeat = bool(cfg.get("AGENT_REPEAT_ACTION_GUARD", True))
     seen_actions = set()
+    observation_indices: List[int] = []
+    tool_log = []
+    tool_calls = idle_steps = llm_calls = 0
+
+    def append_observation(raw: str, hint: str) -> None:
+        compact = _compact_observation(raw, cfg)
+        messages.append({"role": "user", "content": f"Observation: {compact}\n{hint}"})
+        observation_indices.append(len(messages) - 1)
+        _compact_agent_history(messages, observation_indices, cfg)
 
     observation_text = ""
-    for step in range(1, max_steps + 1):
+    # 步数预算只计有效工具调用；空转受 max_idle 与 llm_budget 双重保护
+    while tool_calls < max_steps and llm_calls < llm_budget:
+        step = llm_calls + 1
+        llm_calls += 1
         if debug:
             debug_log(f"ReAct Step {step}")
 
@@ -252,11 +311,17 @@ def run_react_once(
 
         action_key = (tool_name, arg)
         if guard_repeat and action_key in seen_actions:
+            if idle_steps >= max_idle:
+                debug_log("[AGENT] 空转预算耗尽，提前收敛")
+                break
+            idle_steps += 1
             debug_log(f"[AGENT] 重复调用被抑制: tool={tool_name}, arg={arg}")
             messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": f"Observation: {_REPEAT_ACTION_HINT}"})
+            append_observation(_REPEAT_ACTION_HINT, "请换一个检索角度或给出 Answer。")
             continue
         seen_actions.add(action_key)
+        tool_calls += 1
+        tool_log.append((tool_name, arg))
 
         tool = TOOLS.get(tool_name)
         if tool is None:
@@ -285,13 +350,27 @@ def run_react_once(
         if debug:
             debug_log("Observation:", observation_text)
 
-        # 将本轮 LLM 输出 + Observation 追加到对话历史，再继续下一轮
+        # 将本轮 LLM 输出 + 压缩后的 Observation 追加到对话历史
         messages.append({"role": "assistant", "content": content})
-        messages.append({"role": "user", "content": f"Observation: {observation_text}\n请继续推理，若可以则给出 Answer。"})
+        append_observation(observation_text, "请继续推理，若可以则给出 Answer。")
 
+    # 预算用尽后给一次收敛轮（不执行新工具）
+    if tool_log and llm_calls < llm_budget:
+        llm_calls += 1
+        try:
+            resp = llm.invoke(messages + [{
+                "role": "user",
+                "content": ("工具调用预算已用尽，请不要再发起新的 Action；"
+                            "请基于上面已经获得的 Observation 直接输出 Answer，"
+                            "并明确说明哪一部分未检索到依据。"),
+            }])
+            content = resp.content if hasattr(resp, "content") else str(resp)
+            if "Answer:" in content:
+                return parse_answer(content)
+        except Exception as e:
+            debug_log(f"[AGENT] 收敛轮失败，回退诚实说明: {e!r}")
 
-    # 超出 max_steps 仍无 Answer，则返回最后一次 observation + 提示
-    return f"工具调用达到最大步数，最后一次观察结果为：\n{observation_text}"
+    return _agent_fallback_answer(question, tool_log)
 
 
 def ask_agent(
@@ -380,152 +459,202 @@ def ask_agent_stream(
                 "type": "final",
                 "content": final_answer,
                 "file_result": latest_catalog_result,
+                "agent_metrics": {"llm_calls": 0, "tool_calls": 1, "idle_steps": 0,
+                                  "context_chars_peak": 0, "converged": True,
+                                  "elapsed_s": 0.0, "deterministic_route": True},
             }
             return
 
         llm = build_qwen_llm()
         messages = _initial_messages(question, chat_history)
         max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 4)))
+        max_idle = max(0, int(cfg.get("AGENT_MAX_IDLE_STEPS", 2)))
+        # LLM 硬上限：工具预算 + 空转预算 + 1（留一轮输出 Answer），防止空转死循环
+        llm_budget = max_steps + max_idle + 1
+        observation_indices: List[int] = []
+        tool_log = []
+        tool_calls = 0
+        idle_steps = 0
+        llm_calls = 0
+        context_chars_peak = 0
+        started = time.perf_counter()
 
-        for step in range(1, max_steps + 1):
-            # 1) 调 LLM
-            debug_log(
-                f"[stream] step={step} 开始, messages={len(messages)}, total_chars={sum(len(m.get('content', '')) for m in messages)}")
+        def append_observation(raw: str, hint: str) -> None:
+            """注入 LLM 的 Observation 有界压缩；SSE 事件仍传完整原文。"""
+            compact = _compact_observation(raw, cfg)
+            messages.append({"role": "user", "content": f"Observation: {compact}\n{hint}"})
+            observation_indices.append(len(messages) - 1)
+            _compact_agent_history(messages, observation_indices, cfg)
+
+        def run_tool(name: str, argument: str):
+            """执行单次工具，返回 (完整 observation, catalog_result)。"""
+            try:
+                tool_start = time.perf_counter()
+                result = None
+                if name == "list_group_files":
+                    result = list_catalog_entries(argument)
+                    obs = build_file_context(result)
+                elif name == "rag_qa":
+                    rag_result = ask_rag(argument, username=username)
+                    obs = rag_result.get("answer", "")
+                    result = rag_result.get("file_result")
+                else:
+                    tool = TOOLS.get(name)
+                    if tool is None:
+                        return f"[工具错误] 未找到名为 {name} 的工具。", None
+                    tool_input_key = list(tool.args.keys())[0]
+                    with agent_tool_context(username):
+                        obs = str(tool.invoke({tool_input_key: argument}))
+                tool_cost = time.perf_counter() - tool_start
+                debug_log(f"[stream] tool={name} 耗时={tool_cost:.3f}s, "
+                          f"observation字符数={len(obs)}")
+                return obs, result
+            except Exception as e:
+                _logger.error(f"Agent 工具执行异常: tool={name}, error={e!r}")
+                return "[工具执行异常] 服务暂时不可用，请稍后重试。", None
+
+        def agent_metrics(converged: bool) -> Dict[str, Any]:
+            return {
+                "llm_calls": llm_calls, "tool_calls": tool_calls,
+                "idle_steps": idle_steps, "context_chars_peak": context_chars_peak,
+                "converged": converged,
+                "elapsed_s": round(time.perf_counter() - started, 3),
+            }
+
+        # 步数预算只计「有效工具调用」；重复抑制/过早 Answer 拦截算空转，
+        # 不占用工具预算，但受 max_idle 与 llm_budget 双重上限保护。
+        while tool_calls < max_steps and llm_calls < llm_budget:
+            llm_calls += 1
+            step = llm_calls
+            context_chars_peak = max(
+                context_chars_peak, sum(len(m.get("content", "")) for m in messages))
+            debug_log(f"[stream] step={step} 开始, messages={len(messages)}, "
+                      f"total_chars={context_chars_peak}")
 
             llm_start = time.perf_counter()
             resp = llm.invoke(messages)
             llm_cost = time.perf_counter() - llm_start
-
             content = resp.content if hasattr(resp, "content") else str(resp)
             debug_log(f"[stream] step={step} LLM耗时={llm_cost:.3f}s, 输出字符数={len(content)}")
 
-            # 把本轮 LLM 输出先流出去
-            yield {
-                "type": "step_llm",
-                "step": step,
-                "content": content,
-            }
+            yield {"type": "step_llm", "step": step, "content": content}
 
-            # 2) 判断是否是最终 Answer
+            # 1) 最终 Answer
             if "Answer:" in content:
                 if requires_rag_after_list and used_list_tool and not used_rag_after_list:
-                    # 拦截过早的 Answer，强制继续 rag_qa
+                    # 确定性补 rag_qa：省掉一轮「让模型重新决定调什么工具」的 LLM 调用，
+                    # 且直接用原始问题检索，保证不丢失用户意图（README.md 的 Agent 边界契约）。
                     messages.append({"role": "assistant", "content": content})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "原始问题同时要求清单和内容说明，但你还没有调用 rag_qa 阅读正文。"
-                            f"请使用原始问题“{question}”及上面的目录结果构造准确检索问题并调用 rag_qa，"
-                            "再根据 rag_qa 的 Observation 输出 Answer。"
-                        )
-                    })
+                    arg = question
+                    observation_text, catalog_result = run_tool("rag_qa", arg)
+                    tool_calls += 1
+                    tool_log.append(("rag_qa", arg))
+                    seen_actions.add(("rag_qa", arg))
+                    used_rag_after_list = True
+                    if catalog_result:
+                        latest_catalog_result = catalog_result
+                    yield {"type": "step_tool", "step": step, "tool": "rag_qa",
+                           "arg": arg, "observation": observation_text}
+                    if catalog_result:
+                        yield {"type": "tool", "tool_name": "list_catalog_entries",
+                               "content": catalog_result}
+                    append_observation(observation_text, "请基于目录结果与正文给出 Answer。")
                     continue
 
                 final_answer = finalize_answer(parse_answer(content))
                 append_user_chat_history(username, "user", question)
                 append_user_chat_history(username, "assistant", final_answer)
-                yield {
-                    "type": "final",
-                    "content": final_answer,
-                    "file_result": latest_catalog_result,
-                }
+                yield {"type": "final", "content": final_answer,
+                       "file_result": latest_catalog_result,
+                       "agent_metrics": agent_metrics(True)}
                 return
 
-            # 3) 解析 Action
+            # 2) 解析 Action
             action = parse_action(content)
             if not action:
-                # 没有 Action，也没有 Answer，当作直接回答
                 final_answer = finalize_answer(content)
                 append_user_chat_history(username, "user", question)
                 append_user_chat_history(username, "assistant", final_answer)
-                yield {
-                    "type": "final",
-                    "content": final_answer,
-                    "file_result": latest_catalog_result,
-                }
+                yield {"type": "final", "content": final_answer,
+                       "file_result": latest_catalog_result,
+                       "agent_metrics": agent_metrics(True)}
                 return
 
             tool_name = action["tool_name"]
             arg = action["arg"]
-
             action_key = (tool_name, arg)
+
+            # 3) 重复调用抑制：算空转，不占工具预算
             if guard_repeat and action_key in seen_actions:
+                if idle_steps >= max_idle:
+                    debug_log("[AGENT][stream] 空转预算耗尽，提前收敛")
+                    break
+                idle_steps += 1
                 debug_log(f"[AGENT][stream] 重复调用被抑制: tool={tool_name}, arg={arg}")
                 messages.append({"role": "assistant", "content": content})
-                messages.append({"role": "user", "content": f"Observation: {_REPEAT_ACTION_HINT}"})
+                append_observation(_REPEAT_ACTION_HINT, "请换一个检索角度或给出 Answer。")
                 continue
             seen_actions.add(action_key)
 
-            tool = TOOLS.get(tool_name)
-            catalog_result = None
-            if tool is None:
-                observation_text = f"[工具错误] 未找到名为 {tool_name} 的工具。"
-            else:
-                try:
-                    tool_start = time.perf_counter()
-                    if tool_name == "list_group_files":
-                        catalog_result = list_catalog_entries(arg)
-                        observation_text = build_file_context(catalog_result)
-                    elif tool_name == "rag_qa":
-                        rag_result = ask_rag(arg, username=username)
-                        observation_text = rag_result.get("answer", "")
-                        catalog_result = rag_result.get("file_result")
-                    else:
-                        tool_input_key = list(tool.args.keys())[0]
-                        tool_input = {tool_input_key: arg}
-                        with agent_tool_context(username):
-                            obs = tool.invoke(tool_input)
-                        observation_text = str(obs)
-                    tool_cost = time.perf_counter() - tool_start
-                    debug_log(
-                        f"[stream] step={step} tool={tool_name} 耗时={tool_cost:.3f}s, observation字符数={len(observation_text)}")
-
-                    if tool_name == "list_group_files":
-                        used_list_tool = True
-                    if used_list_tool and tool_name == "rag_qa":
-                        used_rag_after_list = True
-                    if catalog_result:
-                        latest_catalog_result = catalog_result
-
-                except Exception as e:
-                    _logger.error(f"Agent 工具执行异常: tool={tool_name}, error={e!r}")
-                    observation_text = "[工具执行异常] 服务暂时不可用，请稍后重试。"
-
-            # 4) 把本次工具调用结果也流出去
-            yield {
-                "type": "step_tool",
-                "step": step,
-                "tool": tool_name,
-                "arg": arg,
-                "observation": observation_text,
-            }
+            # 4) 执行工具并记录状态
+            observation_text, catalog_result = run_tool(tool_name, arg)
+            tool_calls += 1
+            tool_log.append((tool_name, arg))
+            if tool_name == "list_group_files":
+                used_list_tool = True
+            if used_list_tool and tool_name == "rag_qa":
+                used_rag_after_list = True
             if catalog_result:
-                yield {
-                    "type": "tool",
-                    "tool_name": "list_catalog_entries",
-                    "content": catalog_result,
-                }
+                latest_catalog_result = catalog_result
 
-            # 5) 历史追加，进入下一轮
-            messages.append({"role": "assistant", "content": content})
-            messages.append({
-                "role": "user",
-                "content": (
-                    f"Observation: {observation_text}\n"
-                    "请继续思考并决定下一步：如果信息尚不足以回答，继续选择合适的工具调用；"
-                    "如果信息已经足够，并且（仅当原始问题同时要求清单和内容说明时）已在目录结果基础上调用过 rag_qa，"
-                    "则可以给出 Answer。"
-                )
-            })
+            yield {"type": "step_tool", "step": step, "tool": tool_name,
+                   "arg": arg, "observation": observation_text}
+            if catalog_result:
+                yield {"type": "tool", "tool_name": "list_catalog_entries",
+                       "content": catalog_result}
 
-        # 超出最大步数未得到 Answer
-        final_answer = finalize_answer(f"工具调用达到最大步数，最后一次观察结果为：\n{observation_text}")
+            append_observation(
+                observation_text,
+                "请继续思考并决定下一步：如果信息尚不足以回答，继续选择合适的工具调用；"
+                "如果信息已经足够，并且（仅当原始问题同时要求清单和内容说明时）已在目录结果基础上调用过 rag_qa，"
+                "则可以给出 Answer。")
+
+        # 工具预算用尽后，给模型一次「基于已有证据作答」的收敛轮（不执行新工具）。
+        # 避免明明已有依据却直接 fallback，提升有限预算内的收敛率。
+        if tool_log and llm_calls < llm_budget:
+            llm_calls += 1
+            step = llm_calls
+            context_chars_peak = max(
+                context_chars_peak, sum(len(m.get("content", "")) for m in messages))
+            try:
+                resp = llm.invoke(messages + [{
+                    "role": "user",
+                    "content": ("工具调用预算已用尽，请不要再发起新的 Action；"
+                                "请基于上面已经获得的 Observation 直接输出 Answer，"
+                                "并明确说明哪一部分未检索到依据。"),
+                }])
+                content = resp.content if hasattr(resp, "content") else str(resp)
+                yield {"type": "step_llm", "step": step, "content": content}
+                if "Answer:" in content:
+                    final_answer = finalize_answer(parse_answer(content))
+                    append_user_chat_history(username, "user", question)
+                    append_user_chat_history(username, "assistant", final_answer)
+                    yield {"type": "final", "content": final_answer,
+                           "file_result": latest_catalog_result,
+                           "agent_metrics": agent_metrics(True)}
+                    return
+            except Exception as e:
+                debug_log(f"[AGENT][stream] 收敛轮失败，回退诚实说明: {e!r}")
+
+        # 预算耗尽：基于已尝试的检索角度诚实收敛，不回显原始工具输出
+        final_answer = finalize_answer(_agent_fallback_answer(question, tool_log))
         append_user_chat_history(username, "user", question)
         append_user_chat_history(username, "assistant", final_answer)
         yield {
             "type": "final",
             "content": final_answer,
             "file_result": latest_catalog_result,
+            "agent_metrics": agent_metrics(False),
         }
 
     except Exception as e:

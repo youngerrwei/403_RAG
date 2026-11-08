@@ -76,6 +76,8 @@ class CompoundIntentMultiStepTests(unittest.TestCase):
         self.assertEqual(tools, ["list_group_files", "rag_qa"])
         rag.assert_called_once()
         self.assertEqual(len([e for e in events if e["type"] == "final"]), 1)
+        # 确定性补检索使用原始问题，保证不丢失用户意图
+        self.assertEqual(rag.call_args.args[0], MULTISTEP_QUERIES["compound"])
 
 
 class CrossGroupMultiStepTests(unittest.TestCase):
@@ -154,12 +156,16 @@ class StepBudgetTests(unittest.TestCase):
         outputs = [
             'Thought: 第一跳\nAction: rag_qa["A"]',
             'Thought: 第二跳\nAction: rag_qa["B"]',
-            'Answer: 不该走到这里',
+            'Thought: 收敛轮仍无依据\nAction: rag_qa["C"]',
         ]
         events, llm, rag, catalog = _events(outputs, MULTISTEP_QUERIES["multi_doc"], cfg=cfg)
-        self.assertEqual(llm.invoke.call_count, 2)
         self.assertEqual(events[-1]["type"], "final")
-        self.assertIn("工具调用达到最大步数", events[-1]["content"])
+        # 工具步数严格受预算约束（收敛轮不执行新工具）
+        self.assertEqual(events[-1]["agent_metrics"]["tool_calls"], 2)
+        # 预算耗尽时诚实收敛：不回显原始工具输出、不编造依据
+        self.assertIn("暂未能形成完整回答", events[-1]["content"])
+        self.assertIn("已尝试的检索角度", events[-1]["content"])
+        self.assertFalse(events[-1]["agent_metrics"]["converged"])
 
     def test_no_action_falls_back_to_final_answer(self):
         outputs = ['Thought: 直接作答\n根据知识库内容可概括为：已知信息']
