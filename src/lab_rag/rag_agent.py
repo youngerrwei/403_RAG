@@ -651,6 +651,8 @@ def load_config() -> dict:
         "MAX_CONTEXT_CHARS": int(os.getenv("MAX_CONTEXT_CHARS", "3000")),
 
         "RESPONSE_MAX_TOKENS": int(os.getenv("RESPONSE_MAX_TOKENS", "2048")),
+        # vLLM 上下文窗口上限；Agent 据此推导「可用输入 token 预算」
+        "VLLM_MAX_MODEL_LEN": int(os.getenv("VLLM_MAX_MODEL_LEN", "6000")),
         "LLM_TEMPERATURE": float(os.getenv("LLM_TEMPERATURE", "0.1")),
         "RERANKER_SCORE_THRESHOLD": float(os.getenv("RERANKER_SCORE_THRESHOLD", "0.3")),
 
@@ -744,6 +746,11 @@ def load_config() -> dict:
         "AGENT_HISTORY_MAX_TURNS": int(os.getenv("AGENT_HISTORY_MAX_TURNS", "20")),
         "AGENT_HISTORY_MAX_CHARS": int(os.getenv("AGENT_HISTORY_MAX_CHARS", "3000")),
         "AGENT_CONTEXT_MAX_CHARS": int(os.getenv("AGENT_CONTEXT_MAX_CHARS", "16000")),
+        # token 级上下文护栏（与 vLLM 窗口对齐，纠正「字符预算挡不住 token 溢出」）：
+        # 0 = 自动推导 = VLLM_MAX_MODEL_LEN - RESPONSE_MAX_TOKENS - AGENT_CONTEXT_SAFETY_TOKENS
+        "AGENT_CONTEXT_MAX_TOKENS": int(os.getenv("AGENT_CONTEXT_MAX_TOKENS", "0")),
+        # token 估算（tiktoken）与 Qwen 分词器、chat template 的误差余量
+        "AGENT_CONTEXT_SAFETY_TOKENS": int(os.getenv("AGENT_CONTEXT_SAFETY_TOKENS", "256")),
         # read_file 工具单次读取的字符预算（文件/目录拼接均受此上限约束）
         "READ_FILE_MAX_CHARS": int(os.getenv("READ_FILE_MAX_CHARS", "6000")),
         "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),

@@ -25,6 +25,7 @@ from .rag_agent import (
     route_query,
     rule_based_route,
     sanitize_generated_answer,
+    estimate_tokens,
 )
 from .agent_tools import (CONTENT_TOOL_NAME, dispatch_tool, render_tool_prompt_section,
                           tool_names, tool_role)
@@ -112,7 +113,27 @@ _PROMPT_TAIL = """
 - 若检索结果提供了来源，可在回答内引用；目录清单会由系统统一附在回答中，
   不要自行重复罗列或虚构参考路径。"""
 
+# 小上下文窗口（如单卡 3090 的 VLLM_MAX_MODEL_LEN=4096）下，完整提示词本身就会挤爆输入预算，
+# 此时改用精简版：保留工具清单、输出格式与核心约束，去掉知识库结构与链式规则的长篇说明。
+_PROMPT_HEAD_COMPACT = """你是实验室内部知识库助手，采用 ReAct 思维链 + 工具调用方式工作。
+检索结果带【文档/路径/章节/段落摘要】前缀；检索词保留原文中的小组名、设备型号、日期戳。"""
+
+_PROMPT_TAIL_COMPACT = """
+
+## 输出格式（ReAct）
+- 每轮先 Thought，再输出一个 Action 行：Action: 工具名[参数值]；信息足够时输出 Answer: 最终回答。
+- 工具结果以 Observation: 开头；Observation 过长会被截断，如需细节请换更聚焦的关键词重新检索。
+
+## 规则
+- 回答必须依据工具返回，不得凭空编造；未获得依据时明确说明未检索到。
+- 同时要求清单与内容说明：列目录后必须再调用内容工具（read_file 或 rag_qa）读正文。
+- 已定位到具体文档且用户要详细用法/步骤/参数时，优先 read_file 精读；rag_qa 适合跨文档综合。
+- 多实体/链式任务要分别检索后综合；换检索角度，禁止用完全相同的参数重复调用同一工具。
+- 总结时用「根据知识库内容可概括为」；目录清单由系统统一附在回答中，不要虚构参考路径。"""
+
 REACT_SYSTEM_PROMPT = _PROMPT_HEAD + render_tool_prompt_section() + _PROMPT_TAIL
+REACT_SYSTEM_PROMPT_COMPACT = (_PROMPT_HEAD_COMPACT + render_tool_prompt_section()
+                               + _PROMPT_TAIL_COMPACT)
 
 
 def _agent_config() -> Dict[str, Any]:
@@ -270,15 +291,135 @@ def _trim_agent_context(messages: List[Dict[str, str]], budget: int,
         m["content"] = new_c
 
 
-def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]] = None,
-                      cfg: dict = None):
-    """构建 Agent 初始消息：注入对话历史（受轮次与字符预算约束）。
+def _agent_input_token_budget(cfg: dict) -> int:
+    """计算 LLM 输入侧可用的 token 预算。
 
-    历史超 AGENT_HISTORY_MAX_CHARS 预算时，最旧的轮次折叠为紧凑占位而非丢弃，
-    支持更长对话上下文而不撑爆模型窗口；AGENT_HISTORY_MAX_TURNS 为总轮次护栏。
+    vLLM 按「messages tokens + RESPONSE_MAX_TOKENS(输出预留)」校验窗口，故
+    输入预算 = VLLM_MAX_MODEL_LEN - RESPONSE_MAX_TOKENS - 分词估算误差余量。
+    显式配置 AGENT_CONTEXT_MAX_TOKENS > 0 时优先使用（便于人工收紧）。
     """
     cfg = cfg or {}
-    messages: List[Dict[str, str]] = [{"role": "system", "content": REACT_SYSTEM_PROMPT}]
+    explicit = int(cfg.get("AGENT_CONTEXT_MAX_TOKENS", 0) or 0)
+    if explicit > 0:
+        return max(512, explicit)
+    # 仅在拿到真实模型窗口配置时启用 token 护栏：生产 cfg 来自 load_config（含
+    # VLLM_MAX_MODEL_LEN）；离线 mock 只给精简 cfg，沿用字符护栏以免扭曲对照实验。
+    has_window = any(k in cfg for k in ("VLLM_MAX_MODEL_LEN", "RESPONSE_MAX_TOKENS",
+                                        "AGENT_CONTEXT_SAFETY_TOKENS"))
+    if not has_window:
+        return 0
+    model_len = int(cfg.get("VLLM_MAX_MODEL_LEN", 6000) or 6000)
+    response = int(cfg.get("RESPONSE_MAX_TOKENS", 2048) or 2048)
+    safety = int(cfg.get("AGENT_CONTEXT_SAFETY_TOKENS", 256) or 0)
+    return max(512, model_len - response - safety)
+
+
+def _message_tokens(m: Dict[str, str]) -> int:
+    """单条消息 token 估算：内容 + 角色/chat template 固定开销。"""
+    return 4 + estimate_tokens(str(m.get("content", "")))
+
+
+def _messages_tokens(messages: List[Dict[str, str]]) -> int:
+    return sum(_message_tokens(m) for m in messages)
+
+
+def _clip_to_tokens(text: str, max_tokens: int) -> str:
+    """按 token 上限首尾保留地裁剪文本（字符级护栏的 token 级补充）。"""
+    text = str(text or "")
+    if max_tokens <= 0:
+        return "[已折叠] 内容因模型窗口限制已省略。"
+    est = estimate_tokens(text)
+    if est <= max_tokens:
+        return text
+    # 按「估算 token / 实际字符」比例换算可保留字符数：中文 1 字可能对应 >1 token，
+    # 直接以 max_tokens 当字符数裁剪会失效；估算偏差由安全余量吸收。
+    keep = max(0, min(len(text), int(len(text) * max_tokens / max(1, est))))
+    head = int(keep * 0.7)
+    tail = keep - head
+    omitted = len(text) - head - tail
+    return (f"{text[:head]}\n…（共 {len(text)} 字符，为适配模型窗口省略中间 {omitted} 字符；"
+            f"完整结果已在工具事件中展示）\n{text[-tail:] if tail else ''}")
+
+
+def _fit_agent_context_tokens(messages: List[Dict[str, str]], budget: int,
+                              protected_indices: set) -> None:
+    """按 token 预算折叠/裁剪 messages，保证 messages + 输出预留不超模型窗口。
+
+    顺序：折叠最旧的非系统/非受保护消息 → 仍超则裁剪受保护的最近工具结果 →
+    最后兜底裁剪系统提示词（保留工具清单部分）。返回值无意义，直接原地修改。
+    """
+    if budget <= 0:
+        return
+    # 最后一条永远保留：它是当前问题或最新 Observation，折叠后模型将无事可做
+    protected_indices = set(protected_indices or set())
+    if messages:
+        protected_indices.add(len(messages) - 1)
+
+    def _over() -> int:
+        return _messages_tokens(messages) - budget
+
+    if _over() <= 0:
+        return
+    # 1) 折叠最旧的非系统、非受保护消息
+    for i, m in enumerate(messages):
+        if _over() <= 0:
+            return
+        if i == 0 or i in protected_indices:
+            continue
+        c = str(m.get("content", ""))
+        if c.startswith("[已折叠]") or c.startswith("[早期历史压缩]"):
+            continue
+        new_c = ("[已折叠] 早期上下文已压缩以适配模型窗口（原 %d 字符），"
+                 "如需细节请换更具体的关键词重新检索。" % len(c))
+        m["content"] = new_c
+
+    if _over() <= 0:
+        return
+    # 2) 裁剪受保护的最近工具结果（从最旧的一条开始）；省略标记本身也占 token，
+    #    故留足余量并循环重算，保证裁剪后真正降到达标范围。
+    for _ in range(3):
+        if _over() <= 0:
+            return
+        for i in sorted(protected_indices):
+            if _over() <= 0:
+                return
+            if not (0 <= i < len(messages)) or i == 0:
+                continue
+            m = messages[i]
+            allowed = max(0, _message_tokens(m) - _over() - 128)
+            m["content"] = _clip_to_tokens(m["content"], allowed)
+
+    if _over() <= 0:
+        return
+    # 3) 最后兜底：系统提示词改用精简版（工具清单仍由注册表生成，保持不漂移）
+    if messages and estimate_tokens(str(messages[0].get("content", ""))) > 600:
+        messages[0]["content"] = REACT_SYSTEM_PROMPT_COMPACT
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """识别 vLLM / OpenAI 的「上下文超长」400 错误，避免误报成服务不可用。"""
+    text = f"{type(exc).__name__} {exc}".lower()
+    markers = ("maximum context length", "context length", "context_length",
+               "too many tokens", "reduce the length", "prompt is too long",
+               "exceeds the maximum", "requested", "tokens in the messages")
+    return any(k in text for k in markers)
+
+
+def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]] = None,
+                      cfg: dict = None):
+    """构建 Agent 初始消息：注入对话历史（受轮次、字符与 token 预算约束）。
+
+    系统提示词若已占满输入预算（小窗口场景），改用精简版；历史超
+    AGENT_HISTORY_MAX_CHARS 预算时最旧轮次折叠为紧凑占位，最后按 token
+    预算兜底折叠，保证 messages + 输出预留不超过 VLLM_MAX_MODEL_LEN。
+    """
+    cfg = cfg or {}
+    token_budget = _agent_input_token_budget(cfg)
+    system_prompt = REACT_SYSTEM_PROMPT
+    # 完整提示词约占 2.5k tokens；小窗口下它已吃满输入预算，换精简版给工具结果留空间
+    if token_budget > 0 and _message_tokens({"content": system_prompt}) > token_budget * 0.85:
+        system_prompt = REACT_SYSTEM_PROMPT_COMPACT
+    messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
     max_turns = max(1, int(cfg.get("AGENT_HISTORY_MAX_TURNS", 20)))
     max_chars = max(0, int(cfg.get("AGENT_HISTORY_MAX_CHARS", 3000)))
     turns = [it for it in (chat_history or [])[-max_turns:]
@@ -296,6 +437,8 @@ def _initial_messages(question: str, chat_history: Optional[List[Dict[str, str]]
         if m.get("content"):
             messages.append(m)
     messages.append({"role": "user", "content": question})
+    # 初始消息按 token 预算兜底折叠（保护最后一条当前问题）
+    _fit_agent_context_tokens(messages, token_budget, set())
     return messages
 
 
@@ -411,20 +554,41 @@ def ask_agent_stream(
             step = llm_calls
             context_chars_peak = max(
                 context_chars_peak, sum(len(m.get("content", "")) for m in messages))
-            # 总上下文预算护栏：多轮 RAG 结果 / 长历史累积超长时折叠最旧消息，防爆炸
-            context_budget = max(0, int(cfg.get("AGENT_CONTEXT_MAX_CHARS", 16000)))
+            # 双层上下文护栏：字符预算粗剪 + token 预算精剪（与 vLLM 窗口对齐）。
+            # token 护栏是防 400「maximum context length」的关键，字符预算无法反映中文分词。
             keep_obs = max(0, int(cfg.get("AGENT_KEEP_RECENT_OBSERVATIONS", 2)))
             protected = set(observation_indices[-keep_obs:]) if observation_indices else set()
-            _trim_agent_context(messages, context_budget, protected)
+            _trim_agent_context(messages, max(0, int(cfg.get("AGENT_CONTEXT_MAX_CHARS", 16000))),
+                                protected)
+            token_budget = _agent_input_token_budget(cfg)
+            _fit_agent_context_tokens(messages, token_budget, protected)
 
             llm_start = time.perf_counter()
             try:
                 resp = llm.invoke(messages)
                 content = resp.content if hasattr(resp, "content") else str(resp)
             except Exception as e:
-                debug_log(f"[AGENT] LLM 调用失败: {e!r}")
-                yield {"type": "error", "message": "模型服务暂时不可用，请稍后重试。"}
-                return
+                if not _is_context_overflow(e):
+                    debug_log(f"[AGENT] LLM 调用失败: {e!r}")
+                    yield {"type": "error", "message": "模型服务暂时不可用，请稍后重试。"}
+                    return
+                # 上下文超长：估算与真实分词有偏差时，激进折叠后再重试一次，避免整轮丢弃
+                debug_log(f"[AGENT] 上下文超长，紧急折叠后重试: {e!r}")
+                _fit_agent_context_tokens(messages, max(512, int(token_budget * 0.7)), set())
+                try:
+                    resp = llm.invoke(messages)
+                    content = resp.content if hasattr(resp, "content") else str(resp)
+                except Exception as e2:
+                    debug_log(f"[AGENT] 折叠重试仍失败: {e2!r}")
+                    # 不再误报「服务不可用」：基于已获得依据诚实收敛
+                    final_answer = finalize_answer(
+                        _agent_fallback_answer(question, tool_log, last_observation, cfg))
+                    append_user_chat_history(username, "user", question)
+                    append_user_chat_history(username, "assistant", final_answer)
+                    yield {"type": "final", "content": final_answer,
+                           "file_result": latest_catalog_result,
+                           "agent_metrics": agent_metrics(False)}
+                    return
             debug_log(f"[AGENT] step={step} LLM耗时={time.perf_counter()-llm_start:.3f}s")
             yield {"type": "step_llm", "step": step, "content": content}
 
@@ -581,13 +745,19 @@ def ask_agent_stream(
             step = llm_calls
             context_chars_peak = max(
                 context_chars_peak, sum(len(m.get("content", "")) for m in messages))
+            # 收敛轮追加提示后同样按 token 预算裁剪，避免预算耗尽时反而因超长报错
+            converge_messages = list(messages) + [{
+                "role": "user",
+                "content": ("工具调用预算已用尽，请不要再发起新的 Action；"
+                            "请基于上面已经获得的 Observation 直接输出 Answer，"
+                            "并明确说明哪一部分未检索到依据。"),
+            }]
+            keep_obs = max(0, int(cfg.get("AGENT_KEEP_RECENT_OBSERVATIONS", 2)))
+            converge_protected = set(observation_indices[-keep_obs:]) if observation_indices else set()
+            _fit_agent_context_tokens(converge_messages, _agent_input_token_budget(cfg),
+                                      converge_protected | {len(converge_messages) - 1})
             try:
-                resp = llm.invoke(messages + [{
-                    "role": "user",
-                    "content": ("工具调用预算已用尽，请不要再发起新的 Action；"
-                                "请基于上面已经获得的 Observation 直接输出 Answer，"
-                                "并明确说明哪一部分未检索到依据。"),
-                }])
+                resp = llm.invoke(converge_messages)
                 content = resp.content if hasattr(resp, "content") else str(resp)
                 yield {"type": "step_llm", "step": step, "content": content}
                 if "Answer:" in content:

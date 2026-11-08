@@ -546,5 +546,125 @@ class ReadFileToolTests(unittest.TestCase):
             os.unlink(path)
 
 
+class ContextOverflowGuardTests(unittest.TestCase):
+    """复现 2026-11-09 的 400「maximum context length」异常并验证修复。
+
+    事故配置：VLLM_MAX_MODEL_LEN=6000、RESPONSE_MAX_TOKENS=2048，输入侧仅 3952 tokens；
+    系统提示词约占 2546，list_group_files 返回大清单后 messages 达 4244 → 400 报错，
+    旧逻辑还误报「模型服务暂时不可用」并丢弃整轮回答。
+    """
+
+    REAL_CFG = {
+        "VLLM_MAX_MODEL_LEN": 6000,
+        "RESPONSE_MAX_TOKENS": 2048,
+        "AGENT_CONTEXT_SAFETY_TOKENS": 256,
+        "AGENT_MAX_STEPS": 4,
+        "AGENT_MAX_IDLE_STEPS": 2,
+        "AGENT_TOTAL_TIMEOUT_S": 240,
+        "AGENT_OBSERVATION_MAX_CHARS": 2000,
+        "AGENT_KEEP_RECENT_OBSERVATIONS": 2,
+    }
+
+    def _overflow_exc(self):
+        return RuntimeError(
+            "Error code: 400 - {'message': \"This model's maximum context length is 6000 "
+            "tokens. However, you requested 6292 tokens (4244 in the messages, 2048 in "
+            "the completion). Please reduce the length of the messages or completion.\"}")
+
+    def test_budget_derived_from_model_window(self):
+        # 6000 - 2048 - 256 = 3696，明确小于 3952，为分词误差留余量
+        self.assertEqual(ae._agent_input_token_budget(self.REAL_CFG), 3696)
+        self.assertEqual(ae._agent_input_token_budget(
+            dict(self.REAL_CFG, AGENT_CONTEXT_MAX_TOKENS=2000)), 2000)
+        # 离线 mock 精简 cfg 不启用 token 护栏，避免污染字符压缩对照实验
+        self.assertEqual(ae._agent_input_token_budget({"AGENT_MAX_STEPS": 4}), 0)
+
+    def test_context_overflow_is_recognized(self):
+        self.assertTrue(ae._is_context_overflow(self._overflow_exc()))
+        self.assertFalse(ae._is_context_overflow(RuntimeError("boom")))
+
+    def test_clip_to_tokens_handles_chinese(self):
+        text = "中文设备清单" * 500
+        out = ae._clip_to_tokens(text, 100)
+        self.assertLess(len(out), len(text))
+        self.assertLessEqual(ae._message_tokens({"content": out}), 160)
+
+    def test_token_guard_bounds_messages(self):
+        msgs = [{"role": "system", "content": ae.REACT_SYSTEM_PROMPT},
+                {"role": "user", "content": "VLC小组有哪些设备"},
+                {"role": "assistant", "content": 'Action: list_group_files["VLC小组"]'},
+                {"role": "user", "content": "Observation: " + "设备手册路径" * 1200}]
+        self.assertGreater(ae._messages_tokens(msgs), 3696)
+        ae._fit_agent_context_tokens(msgs, 3696, {3})
+        self.assertLessEqual(ae._messages_tokens(msgs), 3696)
+        # 系统提示词与最后一条（当前问题/最新观察）必须保留
+        self.assertIn("ReAct", msgs[0]["content"])
+        self.assertIn("Observation", msgs[-1]["content"])
+
+    def test_small_window_switches_to_compact_prompt(self):
+        cfg = dict(self.REAL_CFG, VLLM_MAX_MODEL_LEN=4096)
+        msgs = ae._initial_messages("周报怎么写", None, cfg)
+        self.assertEqual(msgs[0]["content"], ae.REACT_SYSTEM_PROMPT_COMPACT)
+
+    def test_overflow_error_retries_and_converges(self):
+        """模拟 step=2 抛 400：紧急折叠后重试成功，不得误报服务不可用。"""
+        from types import SimpleNamespace
+        long_obs = "目录：\n" + "\n".join(
+            f"- 设备操作指南/VLC小组/设备{i:03d}/Manuals/manual_{i:03d}.md"
+            for i in range(200))
+        call = {"n": 0}
+
+        def invoke(messages):
+            call["n"] += 1
+            if call["n"] == 2:
+                raise self._overflow_exc()
+            out = ('Thought: 列目录\nAction: list_group_files["VLC小组"]'
+                   if call["n"] == 1 else 'Answer: 根据知识库内容可概括为：设备清单')
+            return SimpleNamespace(content=out)
+
+        llm = Mock()
+        llm.invoke.side_effect = invoke
+        dispatch, _rag, _cat = make_dispatch(observation=long_obs)
+        with patch.object(ae, "route_query", return_value={"route": "file_list", "target": "VLC小组"}), \
+                patch.object(ae, "_agent_config", return_value=self.REAL_CFG), \
+                patch.object(ae, "build_qwen_llm", return_value=llm), \
+                patch.object(ae, "dispatch_tool", dispatch), \
+                patch.object(ae, "append_user_chat_history"):
+            events = list(ae.ask_agent_stream("VLC小组有哪些设备", username="tester"))
+        self.assertFalse([e for e in events if e["type"] == "error"],
+                         "上下文超长不得误报「模型服务暂时不可用」")
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertTrue(events[-1]["agent_metrics"]["converged"])
+        self.assertGreaterEqual(call["n"], 3, "应发生折叠重试")
+
+    def test_overflow_retry_exhausted_falls_back_honestly(self):
+        """折叠重试仍失败：诚实收敛并写入历史，而非 error 丢弃整轮。"""
+        llm = Mock()
+        llm.invoke.side_effect = self._overflow_exc()
+        dispatch, _rag, _cat = make_dispatch()
+        with patch.object(ae, "route_query", return_value={"route": "file_list", "target": "VLC小组"}), \
+                patch.object(ae, "_agent_config", return_value=self.REAL_CFG), \
+                patch.object(ae, "build_qwen_llm", return_value=llm), \
+                patch.object(ae, "dispatch_tool", dispatch), \
+                patch.object(ae, "append_user_chat_history"):
+            events = list(ae.ask_agent_stream("VLC小组有哪些设备", username="tester"))
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertFalse(events[-1]["agent_metrics"]["converged"])
+        self.assertNotIn("模型服务暂时不可用", events[-1]["content"])
+        self.assertFalse([e for e in events if e["type"] == "error"])
+
+    def test_non_context_llm_error_still_emits_error(self):
+        """非上下文错误保持原契约：报 error，不吞异常。"""
+        llm = Mock()
+        llm.invoke.side_effect = RuntimeError("boom")
+        with patch.object(ae, "route_query", return_value={"route": "file_list", "target": "VLC小组"}), \
+                patch.object(ae, "_agent_config", return_value=self.REAL_CFG), \
+                patch.object(ae, "build_qwen_llm", return_value=llm), \
+                patch.object(ae, "dispatch_tool", make_dispatch()[0]), \
+                patch.object(ae, "append_user_chat_history"):
+            events = list(ae.ask_agent_stream("VLC小组有哪些设备", username="tester"))
+        self.assertEqual([e["type"] for e in events][-1], "error")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

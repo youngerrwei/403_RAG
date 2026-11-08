@@ -4,6 +4,46 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.11] 修复 Agent 400「maximum context length」上下文超长异常
+
+### 事故与根因
+
+- 现象：`2026-11-09 00:26` 一次 agent query（`list_group_files("VLC小组")` 返回大清单后）在 step=2 报
+  `BadRequestError: This model's maximum context length is 6000 tokens. However, you requested 6292 tokens (4244 in the messages, 2048 in the completion)`，
+  前端收到误导性的「模型服务暂时不可用，请稍后重试。」且**整轮回答被丢弃**。
+- 根因：`VLLM_MAX_MODEL_LEN=6000`、`RESPONSE_MAX_TOKENS=2048` → 输入侧仅 3952 tokens；
+  ReAct 系统提示词固定占约 **2546 tokens**（64%）；而现有护栏 `AGENT_CONTEXT_MAX_CHARS=16000`
+  按**字符**计算，中文 1 字≈1 token，`list_group_files` 的清单 + 历史注入轻松突破窗口，
+  字符护栏完全无法反映真实分词长度。目录快照 142681 条、单次枚举 254 条匹配放大了输入。
+
+### Fixed
+
+- **token 级上下文护栏**：新增 `_agent_input_token_budget`（0=自动推导
+  `模型窗口 - 输出预留 - 误差余量`）、`_fit_agent_context_tokens`（折叠最旧消息 → 裁剪最近
+  Observation → 必要时切换精简系统提示词），在**每轮 LLM 调用前**（含收敛轮）保证
+  messages + 输出预留不超窗口。中文按估算比例换算字符数，避免 token/字符错配。
+- **400 超长自愈**：识别 `maximum context length` 一类错误后，激进折叠并**重试一次**；
+  重试仍失败则基于已获得依据**诚实收敛**（`final` + 写入历史），不再误报「服务不可用」、
+  不再丢整轮。非上下文类 LLM 错误保持原有 `error` 契约。
+- **小窗口适配**：新增 `REACT_SYSTEM_PROMPT_COMPACT`（保留工具清单/输出格式/核心约束），
+  当完整提示词几乎占满输入预算时自动切换；初始消息与收敛轮均按 token 预算兜底。
+- 修正报错语义：上下文超长属于可恢复的输入问题，与「模型服务不可用」区分处理。
+
+### Added
+
+- 配置 `AGENT_CONTEXT_MAX_TOKENS`(0)、`AGENT_CONTEXT_SAFETY_TOKENS`(256)，并在
+  `load_config` 注册 `VLLM_MAX_MODEL_LEN`；同步 `.env(.3090).example` 与 `AGENTS.md` 配置共识表。
+  token 护栏仅在 cfg 含真实窗口参数时启用，离线 mock 沿用字符护栏以免扭曲对照实验。
+- 单测新增 `ContextOverflowGuardTests`（8 例）：预算推导、错误识别、中文裁剪、
+  messages 有界、小窗口精简提示词、400 折叠重试收敛、重试耗尽诚实收敛、非上下文错误契约。
+
+### 验证
+
+- 端到端复现本次场景：messages 峰值 **4244 → 3625 tokens**（< 3952 上限），0 个 error 事件、正常收敛、工具链完整。
+- 全量单测 148 个，7 个预存失败（与基线一致），无新增回归；离线评测 24 场景收敛率 0.958，`max_context_chars_peak` 5258。
+
+---
+
 ## [3.4.10] rag_search 纳入 ReAct 循环（统一全意图编排范式）
 
 ### Changed
