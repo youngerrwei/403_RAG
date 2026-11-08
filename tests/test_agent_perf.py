@@ -19,6 +19,7 @@ CFG = {
     "AGENT_REPEAT_ACTION_GUARD": True,
     "AGENT_OBSERVATION_MAX_CHARS": 2000,
     "AGENT_KEEP_RECENT_OBSERVATIONS": 2,
+    "AGENT_FINAL_CONVERGE_ROUND": True,
 }
 
 
@@ -166,6 +167,17 @@ class GracefulFallbackTests(unittest.TestCase):
     def test_fallback_without_tool_log_is_honest(self):
         out = ae._agent_fallback_answer("某问题", [])
         self.assertIn("尚未成功执行工具", out)
+
+    def test_final_converge_round_can_be_disabled(self):
+        cfg = dict(CFG, AGENT_MAX_STEPS=1, AGENT_FINAL_CONVERGE_ROUND=False)
+        outputs = [
+            'Thought: 第一跳\nAction: rag_qa["A"]',
+            "Answer: 根据知识库内容可概括为：结论",
+        ]
+        events, llm, rag = _drive(outputs, cfg=cfg)
+        # 关闭后不再追加收敛轮，直接进入诚实收敛
+        self.assertEqual(llm.invoke.call_count, 1)
+        self.assertIn("暂未能形成完整回答", events[-1]["content"])
 
     def test_budget_exhaustion_answer_is_not_raw_observation_echo(self):
         cfg = dict(CFG, AGENT_MAX_STEPS=1)

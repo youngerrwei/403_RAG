@@ -11,8 +11,8 @@
 """
 
 import argparse
+import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +21,20 @@ from unittest.mock import patch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from lab_rag import agent_entry as ae  # noqa: E402
+
+def load_agent_module(path=None):
+    """加载待评测的 agent_entry；path 指向历史版本源码时用于可比基线。"""
+    if not path:
+        from lab_rag import agent_entry
+        return agent_entry
+    spec = importlib.util.spec_from_file_location("lab_rag.agent_entry", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["lab_rag.agent_entry"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ae = None  # 由 main() 按 --agent-module 注入
 
 
 class RecordingLLM:
@@ -113,10 +126,25 @@ SCENARIOS = {
         ],
         "observation": LONG_OBSERVATION,
     },
+    # 小预算 + 一次空转：基线会因空转占掉步数而提前耗尽，优化后仍能完成两次有效检索
+    "idle_then_recover": {
+        "question": "A2X小组有哪些设备，并说明 USRP RIO 入门指南的安装步骤",
+        "route": "hybrid",
+        "max_steps": 2,
+        "outputs": [
+            _action("list_group_files", "A2X小组"),
+            _action("list_group_files", "A2X小组", "再查一次"),
+            _action("rag_qa", "USRP RIO 入门指南的安装步骤"),
+            "Answer: 根据知识库内容可概括为：设备清单与安装步骤",
+        ],
+    },
 }
 
 
 def run_scenario(name, spec, cfg):
+    scenario_cfg = dict(cfg)
+    if spec.get("max_steps"):
+        scenario_cfg["AGENT_MAX_STEPS"] = spec["max_steps"]
     llm = RecordingLLM(spec["outputs"])
     rag_answer = "正文依据"
     catalog = {"mode": "filesystem_directory"}
@@ -124,7 +152,7 @@ def run_scenario(name, spec, cfg):
     rag = lambda *a, **kw: {"answer": rag_answer, "file_result": None}  # noqa: E731
 
     with patch.object(ae, "rule_based_route", return_value={"route": spec["route"], "target": "VLC小组"}), \
-            patch.object(ae, "_agent_config", return_value=cfg), \
+            patch.object(ae, "_agent_config", return_value=scenario_cfg), \
             patch.object(ae, "build_qwen_llm", return_value=llm), \
             patch.object(ae, "ask_rag", side_effect=rag), \
             patch.object(ae, "list_catalog_entries", return_value=catalog), \
@@ -153,7 +181,12 @@ def main():
     parser.add_argument("--label", default="baseline", help="本次评测标签")
     parser.add_argument("--out", default="logs/agent_multistep_metrics.json")
     parser.add_argument("--max-steps", type=int, default=4)
+    parser.add_argument("--agent-module", default=None,
+                        help="历史版本 agent_entry.py 源码路径，用于生成可比基线")
     args = parser.parse_args()
+
+    global ae
+    ae = load_agent_module(args.agent_module)
 
     cfg = {"AGENT_MAX_STEPS": args.max_steps,
            "AGENT_REPEAT_ACTION_GUARD": True,
@@ -169,6 +202,14 @@ def main():
         "max_context_chars_peak": max(v["context_chars_peak"] for v in results.values()),
         "total_idle_steps": sum(v["idle_steps"] for v in results.values()),
         "convergence_rate": round(sum(1 for v in results.values() if v["converged"]) / n, 3),
+        # 只在已收敛场景上统计轮次，避免把「基线直接 fallback（轮次少但没答案）」
+        # 与「优化后继续推理到收敛（轮次多但有答案）」混在一起比较
+        "avg_llm_calls_converged": round(
+            sum(v["llm_calls"] for v in results.values() if v["converged"]) /
+            max(1, sum(1 for v in results.values() if v["converged"])), 2),
+        "avg_context_chars_peak_converged": round(
+            sum(v["context_chars_peak"] for v in results.values() if v["converged"]) /
+            max(1, sum(1 for v in results.values() if v["converged"])), 1),
         "per_scenario": results,
     }
     out_path = PROJECT_ROOT / args.out

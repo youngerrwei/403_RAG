@@ -272,6 +272,7 @@ data: [DONE]
 | `AGENT_LEGACY_MAX_STEPS` | `5` | ReAct 非流式入口的步数预算 |
 | `AGENT_OBSERVATION_MAX_CHARS` | `2000` | 注入 LLM 的单条工具结果字符上限（SSE 事件仍传完整原文） |
 | `AGENT_KEEP_RECENT_OBSERVATIONS` | `2` | 保留完整工具结果的近期轮数，更早的折叠为占位，避免上下文随步数膨胀 |
+| `AGENT_FINAL_CONVERGE_ROUND` | `true` | 预算用尽后给一次收敛轮（不执行新工具）；关闭可省一次 LLM 调用，但收敛率下降 |
 | `AGENT_MAX_IDLE_STEPS` | `2` | 空转轮上限；空转不占工具步数预算，另有 LLM 硬上限防死循环 |
 | `AGENT_REPEAT_ACTION_GUARD` | `true` | 抑制「同工具+完全相同参数」重复调用，避免多轮搜索空转 |
 | `ENABLE_ADAPTIVE_LEXICAL_RECALL` | `true` | 长纯数字词元（日期戳/编号）在首轮召回身份字段零命中时，自动启用本地词边界匹配补召回（按词元形态判定，无用例语义） |

@@ -355,7 +355,8 @@ def run_react_once(
         append_observation(observation_text, "请继续推理，若可以则给出 Answer。")
 
     # 预算用尽后给一次收敛轮（不执行新工具）
-    if tool_log and llm_calls < llm_budget:
+    if (tool_log and llm_calls < llm_budget
+            and bool(cfg.get("AGENT_FINAL_CONVERGE_ROUND", True))):
         llm_calls += 1
         try:
             resp = llm.invoke(messages + [{
@@ -621,7 +622,8 @@ def ask_agent_stream(
 
         # 工具预算用尽后，给模型一次「基于已有证据作答」的收敛轮（不执行新工具）。
         # 避免明明已有依据却直接 fallback，提升有限预算内的收敛率。
-        if tool_log and llm_calls < llm_budget:
+        if (tool_log and llm_calls < llm_budget
+                and bool(cfg.get("AGENT_FINAL_CONVERGE_ROUND", True))):
             llm_calls += 1
             step = llm_calls
             context_chars_peak = max(

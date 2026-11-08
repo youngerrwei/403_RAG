@@ -727,6 +727,8 @@ def load_config() -> dict:
         "AGENT_KEEP_RECENT_OBSERVATIONS": int(os.getenv("AGENT_KEEP_RECENT_OBSERVATIONS", "2")),
         # 空转（重复调用抑制/过早 Answer 拦截）允许的最大轮数，不占工具步数预算
         "AGENT_MAX_IDLE_STEPS": int(os.getenv("AGENT_MAX_IDLE_STEPS", "2")),
+        # 预算用尽后是否给模型一次「基于已有证据作答」的收敛轮（时延敏感场景可关闭）
+        "AGENT_FINAL_CONVERGE_ROUND": _env_bool("AGENT_FINAL_CONVERGE_ROUND", "true"),
         "ADAPTIVE_LEXICAL_MIN_DIGITS": int(os.getenv("ADAPTIVE_LEXICAL_MIN_DIGITS", "6")),
         "ADAPTIVE_LEXICAL_TOP_K": int(os.getenv("ADAPTIVE_LEXICAL_TOP_K", "16")),
 
