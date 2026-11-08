@@ -4,23 +4,23 @@
 ``rag_agent`` 的运行时和用户级历史，保留旧函数名以兼容外部调用。
 """
 
-from typing import Dict, Generator
+from typing import Dict, Generator, Optional
 
-from .logger import get_logger
-from .rag_agent import ask_stream, clear_user_history
-
-_logger = get_logger("rag_tool")
+from .rag_agent import ask_stream
 
 
-def ask_rag_stream(question: str, username: str = "legacy-agent") -> Generator[Dict, None, None]:
+def ask_rag_stream(question: str, username: str = "legacy-agent",
+                   route_hint: Optional[dict] = None) -> Generator[Dict, None, None]:
     # Agent 内部构造的问题不应写入用户的正式对话历史。
-    yield from ask_stream(question, username=username, persist_history=False)
+    yield from ask_stream(question, username=username, persist_history=False,
+                          route_hint=route_hint)
 
 
-def ask_rag(question: str, username: str = "legacy-agent") -> Dict:
+def ask_rag(question: str, username: str = "legacy-agent",
+            route_hint: Optional[dict] = None) -> Dict:
     answer = ""
     final = {}
-    for item in ask_rag_stream(question, username=username):
+    for item in ask_rag_stream(question, username=username, route_hint=route_hint):
         if item.get("type") == "chunk":
             answer += item.get("content", "")
         elif item.get("type") == "final":
@@ -33,14 +33,3 @@ def ask_rag(question: str, username: str = "legacy-agent") -> Dict:
     final.setdefault("history", [])
     return final
 
-
-def clear_history(username: str = "legacy-agent") -> None:
-    clear_user_history(username)
-
-
-def rag_qa_tool(question: str, username: str = "legacy-agent") -> str:
-    try:
-        return ask_rag(question, username=username).get("answer", "")
-    except Exception as exc:
-        _logger.error(f"Agent RAG 工具调用失败: {exc!r}")
-        return "知识库服务暂时不可用，请稍后重试。"

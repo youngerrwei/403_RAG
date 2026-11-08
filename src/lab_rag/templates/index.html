@@ -1072,8 +1072,8 @@
                 for (const line of lines) {
                     if (!line.startsWith("data: ")) continue;
                     const jsonStr = line.substring(6);
-                    // [DONE] 为流结束标记，非 JSON，直接跳过
-                    if (jsonStr === "[DONE]") continue;
+                    // [DONE] 为流结束标记，非 JSON；协议保证它是最后一条，直接终止
+                    if (jsonStr === "[DONE]") break;
                     try {
                         const data = JSON.parse(jsonStr);
                         if (data.type === "heartbeat") {
@@ -1203,6 +1203,28 @@
                         // 处理独立的 coverage 元数据事件（流式回答结束后发送）
                         else if (data.type === "metadata" && data.stage === "coverage") {
                             renderCoverageAndCitations(data.coverage, data.citations, ab);
+                        }
+                        else if (data.type === "route_direct") {
+                            // 编排器确定性路由决策（非模型输出），单独标注避免误认为 LLM 思考过程
+                            const directDiv = document.createElement('div');
+                            directDiv.className = 'agent-step';
+                            directDiv.innerHTML = `
+                                <details open style="margin:8px 0;border:1px solid #e2e8f0;border-radius:6px;padding:8px 12px;background:#f1f5f9;">
+                                    <summary style="cursor:pointer;font-size:13px;color:#475569;font-weight:500;">
+                                        确定性路由 · ${escapeHtml(data.tool || '')}
+                                    </summary>
+                                    <pre style="margin:8px 0 0;white-space:pre-wrap;font-size:12px;color:#334155;line-height:1.5;">${escapeHtml(data.reason || '')}\n检索问题：${escapeHtml(data.arg || '')}</pre>
+                                </details>
+                            `;
+                            const directBody = document.getElementById('agent-reasoning-body');
+                            if (directBody && document.getElementById('agent-reasoning-card').style.display !== 'none') {
+                                if (directBody.querySelector('.muted')) directBody.innerHTML = '';
+                                directBody.appendChild(directDiv);
+                                directBody.scrollTop = directBody.scrollHeight;
+                            } else {
+                                ab.appendChild(directDiv);
+                                ab.scrollTop = ab.scrollHeight;
+                            }
                         }
                         else if (data.type === "step_llm") {
                             const stepDiv = document.createElement('div');

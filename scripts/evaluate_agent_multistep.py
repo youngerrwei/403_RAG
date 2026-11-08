@@ -146,23 +146,32 @@ def run_scenario(name, spec, cfg):
     if spec.get("max_steps"):
         scenario_cfg["AGENT_MAX_STEPS"] = spec["max_steps"]
     llm = RecordingLLM(spec["outputs"])
-    rag_answer = "正文依据"
-    catalog = {"mode": "filesystem_directory"}
     observation = spec.get("observation", "目录：A设备/B设备")
-    rag = lambda *a, **kw: {"answer": rag_answer, "file_result": None}  # noqa: E731
+
+    def dispatch(name, arg, username, route_hint=None, tool_call_id=""):
+        # 统一分派点：目录工具返回长清单，正文工具返回固定答案
+        obs = observation if name == "list_group_files" else "正文依据"
+        return {"ok": True, "observation": obs, "catalog_result": None,
+                "elapsed_s": 0.0, "tool_call_id": tool_call_id or "tc-perf"}
 
     with patch.object(ae, "rule_based_route", return_value={"route": spec["route"], "target": "VLC小组"}), \
             patch.object(ae, "_agent_config", return_value=scenario_cfg), \
             patch.object(ae, "build_qwen_llm", return_value=llm), \
-            patch.object(ae, "ask_rag", side_effect=rag), \
-            patch.object(ae, "list_catalog_entries", return_value=catalog), \
-            patch.object(ae, "build_file_context", return_value=observation), \
+            patch.object(ae, "dispatch_tool", side_effect=dispatch), \
             patch.object(ae, "append_user_chat_history"):
         events = list(ae.ask_agent_stream(spec["question"], username="agent-perf"))
 
     final = [e for e in events if e["type"] == "final"]
     tool_steps = [e for e in events if e["type"] == "step_tool"]
-    converged = bool(final) and "工具调用达到最大步数" not in final[-1]["content"]
+    # 优先读编排器自带的结构化指标；历史模块无该字段时回退到文案判据。
+    # 旧版按 "工具调用达到最大步数" 判断，在优雅收敛文案上线后会误判为已收敛。
+    metrics = (final[-1].get("agent_metrics") if final else None) or {}
+    if "converged" in metrics:
+        converged = bool(metrics["converged"])
+    else:
+        content = final[-1]["content"] if final else ""
+        converged = bool(final) and ("工具调用达到最大步数" not in content
+                                     and "暂未能形成完整回答" not in content)
     llm_calls = len(llm.context_chars)
     idle = max(0, llm_calls - len(tool_steps) - (1 if converged else 0))
     return {
@@ -190,7 +199,7 @@ def main():
 
     cfg = {"AGENT_MAX_STEPS": args.max_steps,
            "AGENT_REPEAT_ACTION_GUARD": True,
-           "AGENT_LEGACY_MAX_STEPS": 5}
+           "AGENT_TOTAL_TIMEOUT_S": 240}
     results = {name: run_scenario(name, spec, cfg) for name, spec in SCENARIOS.items()}
     n = len(results)
     summary = {

@@ -720,8 +720,11 @@ def load_config() -> dict:
         "ENABLE_ADAPTIVE_LEXICAL_RECALL": _env_bool("ENABLE_ADAPTIVE_LEXICAL_RECALL", "true"),
         # ReAct Agent 编排层：步数预算与重复调用抑制（不硬编码可调参数）
         "AGENT_MAX_STEPS": int(os.getenv("AGENT_MAX_STEPS", "4")),
-        "AGENT_LEGACY_MAX_STEPS": int(os.getenv("AGENT_LEGACY_MAX_STEPS", "5")),
         "AGENT_REPEAT_ACTION_GUARD": _env_bool("AGENT_REPEAT_ACTION_GUARD", "true"),
+        # 整个 Agent 轮次的总耗时预算（秒），与 web_app 300s 上游超时错开
+        "AGENT_TOTAL_TIMEOUT_S": float(os.getenv("AGENT_TOTAL_TIMEOUT_S", "240")),
+        # 预算耗尽兜底里附带的部分依据摘要长度（0 表示不附带）
+        "AGENT_FALLBACK_SNIPPET_CHARS": int(os.getenv("AGENT_FALLBACK_SNIPPET_CHARS", "300")),
         # 多轮上下文有界：注入 LLM 的单条工具结果上限、保留完整结果的近期轮数
         "AGENT_OBSERVATION_MAX_CHARS": int(os.getenv("AGENT_OBSERVATION_MAX_CHARS", "2000")),
         "AGENT_KEEP_RECENT_OBSERVATIONS": int(os.getenv("AGENT_KEEP_RECENT_OBSERVATIONS", "2")),
@@ -2940,6 +2943,7 @@ def ask_stream(
     question: str,
     username: str = "anonymous",
     persist_history: bool = True,
+    route_hint: Optional[dict] = None,
 ) -> Generator[dict, None, None]:
     total_start = time.perf_counter()
 
@@ -2962,7 +2966,12 @@ def ask_stream(
         reranker = runtime["reranker"]
 
         with Timer("stage_route"):
-            route_result = route_query(llm, question)
+            # 调用方（Agent 编排层）已确定路由时直接复用，避免同一问句重复路由
+            if route_hint and route_hint.get("route"):
+                route_result = dict(route_hint)
+                debug_log(f"[ROUTE] 复用调用方路由: {route_result.get('route')}")
+            else:
+                route_result = route_query(llm, question)
         route = route_result["route"]
         target = route_result["target"]
         route_reason = route_result.get("reason", "")
@@ -3319,7 +3328,7 @@ def ask_stream(
         debug_log(traceback.format_exc())
         yield {
             "type": "error",
-            "content": "服务暂时不可用，请稍后重试。",
+            "message": "服务暂时不可用，请稍后重试。",
         }
 
 

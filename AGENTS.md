@@ -202,20 +202,23 @@ data: {"type": "chunk", "content": "..."}
 data: {"type": "metadata", "stage": "coverage", "coverage": {...}, "citations": [...]}
 
 // 结束标记（携带最终元数据）
-data: {"type": "final", "content": "...", "route": "...", "coverage": {...}, "citations": [...]}
+data: {"type": "final", "content": "...", "route": "...", "coverage": {...}, "citations": [...], "file_result": {...}}
 
 // Agent 模式扩展事件（仅 use_agent=true 时产生）
+// route_direct：编排器确定性路由决策，不是模型输出（不再伪造 Thought）
+data: {"type": "route_direct", "step": 1, "tool": "rag_qa", "arg": "...", "route": "rag_search", "reason": "..."}
+// step_llm：仅承载模型真实输出
 data: {"type": "step_llm", "step": 1, "content": "Thought/Action/Answer 原文"}
-data: {"type": "step_tool", "step": 1, "tool": "rag_qa", "arg": "...", "observation": "..."}
+// step_tool：observation 为完整原文；tool_call_id 串联一次调用的可追溯链
+data: {"type": "step_tool", "step": 1, "tool": "rag_qa", "arg": "...", "observation": "...", "tool_call_id": "tc-1", "elapsed_s": 0.4, "ok": true}
 // final 事件额外携带 agent_metrics（前端可选读取，未知字段忽略）
-data: {"type": "final", "content": "...", "agent_metrics": {"llm_calls": 3, "tool_calls": 2, "idle_steps": 0, "context_chars_peak": 4258, "converged": true, "elapsed_s": 1.2}}
+data: {"type": "final", "content": "...", "agent_metrics": {"llm_calls": 3, "tool_calls": 2, "idle_steps": 0, "context_chars_peak": 4258, "converged": true, "timed_out": false, "elapsed_s": 1.2}}
 
 // 心跳包（src/lab_rag/web_app.py 注入，保持连接活跃）
 data: {"type": "heartbeat"}
 
-// 错误通知（src/lab_rag/web_app.py 使用 "message" 字段，src/lab_rag/rag_agent.py 使用 "content" 字段）
-data: {"type": "error", "message": "..."}  // src/lab_rag/web_app.py 超时/异常
-data: {"type": "error", "content": "..."}  // src/lab_rag/rag_agent.py 内部异常
+// 错误通知：统一使用 "message" 字段（前端仍兼容读取 content）
+data: {"type": "error", "message": "..."}
 
 // 流结束信号（固定格式，不是 JSON）
 data: [DONE]
@@ -268,8 +271,9 @@ data: [DONE]
 | `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照，消除重复全盘遍历 |
 | `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒）；键含索引版本 |
 | `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免噪声路径误命中 |
-| `AGENT_MAX_STEPS` | `4` | ReAct 流式入口的多轮检索步数预算 |
-| `AGENT_LEGACY_MAX_STEPS` | `5` | ReAct 非流式入口的步数预算 |
+| `AGENT_MAX_STEPS` | `4` | ReAct 单一编排器的多轮检索步数预算（流式/非流式共用） |
+| `AGENT_TOTAL_TIMEOUT_S` | `240` | Agent 轮次总耗时预算（秒），超时优雅收敛；与 web_app 300s 上游超时错开 |
+| `AGENT_FALLBACK_SNIPPET_CHARS` | `300` | 预算耗尽兜底附带的部分依据摘要长度；0 表示不附带 |
 | `AGENT_OBSERVATION_MAX_CHARS` | `2000` | 注入 LLM 的单条工具结果字符上限（SSE 事件仍传完整原文） |
 | `AGENT_KEEP_RECENT_OBSERVATIONS` | `2` | 保留完整工具结果的近期轮数，更早的折叠为占位，避免上下文随步数膨胀 |
 | `AGENT_FINAL_CONVERGE_ROUND` | `true` | 预算用尽后给一次收敛轮（不执行新工具）；关闭可省一次 LLM 调用，但收敛率下降 |

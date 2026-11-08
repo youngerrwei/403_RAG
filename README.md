@@ -613,8 +613,9 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照 + TTL 缓存，消除两次全盘 `os.walk` 的网络盘 IO |
 | `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒），缓存键含根目录与索引版本 |
 | `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免版本控制噪声被误当成设备目录 |
-| `AGENT_MAX_STEPS` | `4` | ReAct 流式入口多轮检索步数预算 |
-| `AGENT_LEGACY_MAX_STEPS` | `5` | ReAct 非流式入口步数预算 |
+| `AGENT_MAX_STEPS` | `4` | ReAct 单一编排器多轮检索步数预算（流式/非流式共用） |
+| `AGENT_TOTAL_TIMEOUT_S` | `240` | Agent 轮次总耗时预算（秒），超时优雅收敛 |
+| `AGENT_FALLBACK_SNIPPET_CHARS` | `300` | 预算耗尽兜底附带的部分依据摘要长度；0 表示不附带 |
 | `AGENT_OBSERVATION_MAX_CHARS` | `2000` | 注入 LLM 的单条工具结果字符上限；SSE 事件仍传完整原文 |
 | `AGENT_KEEP_RECENT_OBSERVATIONS` | `2` | 保留完整工具结果的近期轮数，更早的折叠为占位 |
 | `AGENT_FINAL_CONVERGE_ROUND` | `true` | 预算用尽后的收敛轮开关；关闭可省一次 LLM 调用 |

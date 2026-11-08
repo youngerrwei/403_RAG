@@ -5,10 +5,10 @@
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from lab_rag import agent_entry as ae
+from agent_test_helpers import _llm, drive as _drive, tool_steps as _tool_steps
 
 
 MULTISTEP_QUERIES = {
@@ -20,30 +20,9 @@ MULTISTEP_QUERIES = {
 }
 
 
-def _llm(outputs):
-    llm = Mock()
-    llm.invoke.side_effect = [SimpleNamespace(content=o) for o in outputs]
-    return llm
-
-
 def _events(outputs, question, route="hybrid", cfg=None, ask_rag_answer="正文依据"):
-    """驱动流式 ReAct，返回 (events, llm, ask_rag_mock, list_catalog_mock)。"""
-    llm = _llm(outputs)
-    rag = Mock(return_value={"answer": ask_rag_answer, "file_result": None})
-    catalog = Mock(return_value={"mode": "filesystem_directory"})
-    cfg = cfg or {"AGENT_MAX_STEPS": 4, "AGENT_REPEAT_ACTION_GUARD": True}
-    with patch.object(ae, "rule_based_route", return_value={"route": route, "target": "VLC小组"}), \
-            patch.object(ae, "_agent_config", return_value=cfg), \
-            patch.object(ae, "build_qwen_llm", return_value=llm), \
-            patch.object(ae, "ask_rag", rag), \
-            patch.object(ae, "list_catalog_entries", catalog), \
-            patch.object(ae, "build_file_context", return_value="目录：A设备/B设备"), \
-            patch.object(ae, "append_user_chat_history"):
-        return list(ae.ask_agent_stream(question, username="tester")), llm, rag, catalog
-
-
-def _tool_steps(events):
-    return [e for e in events if e["type"] == "step_tool"]
+    """兼容旧签名：驱动单一编排器，返回 (events, llm, rag_recorder, catalog_recorder)。"""
+    return _drive(outputs, question, route=route, cfg=cfg, rag_answer=ask_rag_answer)
 
 
 class CompoundIntentMultiStepTests(unittest.TestCase):
@@ -179,37 +158,46 @@ class DeterministicRouteTests(unittest.TestCase):
 
     def test_rag_search_route_uses_single_direct_call(self):
         llm = Mock()
-        rag = Mock(return_value={"answer": "周报格式正文", "file_result": None})
+        from agent_test_helpers import make_dispatch
+        dispatch, rag, _catalog = make_dispatch(rag_answer="周报格式正文")
         with patch.object(ae, "rule_based_route", return_value={"route": "rag_search", "target": "周报"}), \
                 patch.object(ae, "build_qwen_llm", return_value=llm), \
-                patch.object(ae, "ask_rag", rag), \
+                patch.object(ae, "dispatch_tool", dispatch), \
                 patch.object(ae, "append_user_chat_history"):
             events = list(ae.ask_agent_stream("周报怎么写", username="tester"))
-        rag.assert_called_once_with("周报怎么写", username="tester")
+        rag.assert_called_once_with("周报怎么写", username="tester", route_hint={"route": "rag_search", "target": "周报"})
         llm.invoke.assert_not_called()
+        # 不再伪造模型思考：首条是编排器确定性路由事件，且带可追溯 tool_call_id
+        self.assertEqual(events[0]["type"], "route_direct")
+        self.assertEqual(events[1]["tool_call_id"], "tc-1")
         self.assertEqual([e["type"] for e in events][-1], "final")
 
 
-class LegacyReActOnceTests(unittest.TestCase):
-    """非流式入口同样受重复抑制与配置化步数约束。"""
+class NonStreamAdapterTests(unittest.TestCase):
+    """非流式入口只是消费同一事件流的薄适配器，不再另写一套循环。"""
 
-    def test_repeat_action_suppressed_in_legacy_loop(self):
-        llm = _llm([
+    def test_adapter_uses_the_same_orchestrator(self):
+        events, llm, rag, catalog = _events([
+            'Thought: 检索\nAction: rag_qa["A"]',
+            'Answer: 根据知识库内容可概括为：结论',
+        ], MULTISTEP_QUERIES["multi_doc"])
+        self.assertEqual(events[-1]["content"], "根据知识库内容可概括为：结论")
+        with patch.object(ae, "ask_agent_stream", return_value=iter([
+                {"type": "step_llm", "step": 1, "content": "Thought"},
+                {"type": "final", "content": "适配器结果"}])) as stream:
+            answer = ae.ask_agent("任意问题", username="tester")
+        self.assertEqual(answer, "适配器结果")
+        stream.assert_called_once()
+
+    def test_repeat_suppression_applies_to_adapter_path(self):
+        events, llm, rag, catalog = _events([
             'Thought: 第一次\nAction: rag_qa["同一问题"]',
             'Thought: 重复\nAction: rag_qa["同一问题"]',
             'Thought: 换角度\nAction: rag_qa["换一个角度"]',
             'Answer: 完成',
-        ])
-        tool = Mock()
-        tool.args = {"query": str}  # 非流式入口按 tool.args 取参数名
-        tool.invoke.return_value = "工具结果"
-        with patch.object(ae, "_agent_config", return_value={
-                "AGENT_LEGACY_MAX_STEPS": 5, "AGENT_REPEAT_ACTION_GUARD": True}), \
-                patch.object(ae, "TOOLS", {"rag_qa": tool}), \
-                patch.object(ae, "agent_tool_context", return_value=_nullcontext()):
-            answer = ae.run_react_once(llm, MULTISTEP_QUERIES["multi_doc"], debug=False)
-        self.assertEqual(answer, "完成")
-        self.assertEqual(tool.invoke.call_count, 2)
+        ], MULTISTEP_QUERIES["multi_doc"])
+        args = [c.args[0] for c in rag.call_args_list]
+        self.assertEqual(args, ["同一问题", "换一个角度"])
 
 
 class PromptContractTests(unittest.TestCase):
@@ -236,13 +224,6 @@ class PromptContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, p)
 
-
-class _nullcontext:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
 
 
 if __name__ == "__main__":

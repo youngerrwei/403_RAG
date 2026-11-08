@@ -5,12 +5,10 @@
 """
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from langchain_core.documents import Document
-
 from lab_rag import agent_entry as ae
+from agent_test_helpers import _llm, make_dispatch
 
 
 CFG = {
@@ -20,25 +18,18 @@ CFG = {
     "AGENT_OBSERVATION_MAX_CHARS": 2000,
     "AGENT_KEEP_RECENT_OBSERVATIONS": 2,
     "AGENT_FINAL_CONVERGE_ROUND": True,
+    "AGENT_TOTAL_TIMEOUT_S": 240,
 }
-
-
-def _llm(outputs):
-    llm = Mock()
-    llm.invoke.side_effect = [SimpleNamespace(content=o) for o in outputs]
-    return llm
 
 
 def _drive(outputs, question="复合意图问题：有哪些设备并说明安装步骤",
            route="hybrid", cfg=None, observation="目录：A设备/B设备"):
     llm = _llm(outputs)
-    rag = Mock(return_value={"answer": "正文依据", "file_result": None})
+    dispatch, rag, _catalog = make_dispatch(observation=observation)
     with patch.object(ae, "rule_based_route", return_value={"route": route, "target": "VLC小组"}), \
             patch.object(ae, "_agent_config", return_value=cfg or CFG), \
             patch.object(ae, "build_qwen_llm", return_value=llm), \
-            patch.object(ae, "ask_rag", rag), \
-            patch.object(ae, "list_catalog_entries", return_value={"mode": "filesystem_directory"}), \
-            patch.object(ae, "build_file_context", return_value=observation), \
+            patch.object(ae, "dispatch_tool", dispatch), \
             patch.object(ae, "append_user_chat_history"):
         events = list(ae.ask_agent_stream(question, username="tester"))
     return events, llm, rag
@@ -209,14 +200,79 @@ class AgentMetricsContractTests(unittest.TestCase):
 
     def test_deterministic_route_exposes_metrics(self):
         llm = Mock()
+        dispatch, _rag, _catalog = make_dispatch(rag_answer="周报格式正文")
         with patch.object(ae, "rule_based_route", return_value={"route": "rag_search", "target": "周报"}), \
                 patch.object(ae, "build_qwen_llm", return_value=llm), \
-                patch.object(ae, "ask_rag", return_value={"answer": "周报格式正文", "file_result": None}), \
+                patch.object(ae, "dispatch_tool", dispatch), \
                 patch.object(ae, "append_user_chat_history"):
             events = list(ae.ask_agent_stream("周报怎么写", username="tester"))
         m = events[-1]["agent_metrics"]
         self.assertTrue(m["converged"])
         self.assertTrue(m["deterministic_route"])
+        self.assertEqual(events[0]["type"], "route_direct")
+
+
+class UnifiedOrchestratorContractTests(unittest.TestCase):
+    """单一编排器 + 统一工具注册表的契约。"""
+
+    def test_no_duplicate_loop_or_legacy_tool_layer(self):
+        import inspect
+        src = inspect.getsource(ae)
+        self.assertNotIn("def run_react_once", src)
+        self.assertNotIn("agent_tool_context", src)
+        self.assertEqual(src.count("def ask_agent_stream"), 1)
+        self.assertEqual(src.count("def ask_agent("), 1)
+
+    def test_prompt_tool_section_is_generated_from_registry(self):
+        from lab_rag import agent_tools
+        for spec in agent_tools.TOOL_SPECS:
+            with self.subTest(tool=spec.name):
+                self.assertIn(spec.name, ae.REACT_SYSTEM_PROMPT)
+                self.assertIn(spec.description, ae.REACT_SYSTEM_PROMPT)
+
+    def test_unknown_tool_is_degraded_by_registry(self):
+        from lab_rag import agent_tools
+        result = agent_tools.dispatch_tool("does_not_exist", "x", "tester")
+        self.assertFalse(result["ok"])
+        self.assertIn("可用工具", result["observation"])
+
+    def test_dispatch_returns_traceable_result(self):
+        dispatch, _rag, _catalog = make_dispatch()
+        with patch.object(ae, "rule_based_route", return_value={"route": "llm_fallback", "target": "x"}), \
+                patch.object(ae, "_agent_config", return_value=CFG), \
+                patch.object(ae, "build_qwen_llm", return_value=_llm([
+                    'Action: rag_qa["A"]', "Answer: 完成"])), \
+                patch.object(ae, "dispatch_tool", dispatch), \
+                patch.object(ae, "append_user_chat_history"):
+            events = list(ae.ask_agent_stream("问题", username="tester"))
+        steps = [e for e in events if e["type"] == "step_tool"]
+        self.assertTrue(all("tool_call_id" in e and "elapsed_s" in e and "ok" in e
+                            for e in steps))
+
+    def test_error_event_uses_unified_message_field(self):
+        with patch.object(ae, "rule_based_route", return_value={"route": "llm_fallback", "target": "x"}), \
+                patch.object(ae, "_agent_config", return_value=CFG), \
+                patch.object(ae, "build_qwen_llm", return_value=Mock(
+                    invoke=Mock(side_effect=RuntimeError("boom")))), \
+                patch.object(ae, "append_user_chat_history"):
+            events = list(ae.ask_agent_stream("问题", username="tester"))
+        err = [e for e in events if e["type"] == "error"]
+        self.assertEqual(len(err), 1)
+        self.assertIn("message", err[0])
+        self.assertNotIn("content", err[0])
+
+    def test_total_timeout_budget_stops_loop(self):
+        cfg = dict(CFG, AGENT_TOTAL_TIMEOUT_S=0.001, AGENT_FINAL_CONVERGE_ROUND=False)
+        import time as _time
+        original = ae.time.perf_counter
+        values = iter([0.0, 0.0, 999.0])
+        try:
+            ae.time.perf_counter = lambda: next(values, 999.0)
+            events, llm, rag = _drive(["Action: rag_qa[\"A\"]"], cfg=cfg)
+        finally:
+            ae.time.perf_counter = original
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertTrue(events[-1]["agent_metrics"]["timed_out"])
 
 
 if __name__ == "__main__":
