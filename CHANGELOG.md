@@ -4,6 +4,44 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.15] 修复 read_file 读目录只覆盖部分设备（均衡取样）
+
+### 现象
+
+- 复合意图补读改为优先 `read_file(设备操作指南/VLC小组)` 后，用户反馈「这次只读了一个文件就返回了」。
+- 实测 `设备操作指南/VLC小组` 目录下有 **47 个 md 文件、分布在 15 个设备子目录**，
+  但旧 `read_file` 目录分支 `md_files.sort()[:10]` 按全路径字母序取前 10 个，实际只覆盖
+  字母序靠前的 5 个设备（Agilent / DaHeng / HOLOEYE …），其余 10 个设备完全没读到；
+  且 `per_file = max(1000, max_chars // 10)` 让每文件实际取 1000 字、总字数远超 6000 预算。
+
+### Fixed
+
+- `read_file` 目录分支改为**按顶层子目录（设备）均衡取样**：`os.walk` 按第一层目录分组，
+  每个设备取 1 份代表文档（优先 Manual / 用户指南 / 使用 / 操作 / 指南 / Datasheet 类），
+  再按 `READ_FILE_MAX_DIR_CHILDREN`(默认 15) 上限截断，保证覆盖全部设备而非仅前几个。
+- 预算改为扣除真实文件头开销：`per_file = max(400, (max_chars - header_overhead) // 设备数)`
+  （`max_chars` 为 README 约定的每文档软上限，总正文逼近该值）。
+- 新增配置 `READ_FILE_MAX_DIR_CHILDREN`（默认 15，注册 `load_config`）。
+
+### Added
+
+- 单测 `ReadFileDirTests`（2 例）：目录读取覆盖全部顶层子目录、同设备优先代表手册、
+  空目录抛 `ValueError`。
+
+### 验证
+
+- 真实调用 `read_file("设备操作指南/VLC小组")`：返回覆盖 **15 个设备**各 1 份代表手册
+  （共覆盖 15 个子目录/设备），耗时 0.06s；旧逻辑仅覆盖 5 个。
+- 全量单测 166 个，7 个预存失败（Lexicon 测试，与基线一致），无新增回归；
+  离线评测 24 场景收敛率 0.958。
+
+### 注意
+
+- 本修复需**重启 web_app** 才能生效（进程仍加载旧代码）。重启命令：
+  `bash scripts/start_rag.sh restart`（不影响 vLLM）。
+
+---
+
 ## [3.4.14] 修复 rag_qa「服务暂时不可用」异常 + 复合补读改用 read_file
 
 ### 现象

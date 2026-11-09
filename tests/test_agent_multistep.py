@@ -6,11 +6,13 @@
 
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from lab_rag import agent_entry as ae
 from lab_rag import rag_agent as ra
+from lab_rag import agent_tools as at
 from agent_test_helpers import (_llm, drive as _drive, tool_steps as _tool_steps,
                                 load_assoc_scenarios, drive_assoc, make_dispatch)
 
@@ -880,6 +882,48 @@ class RouteHintCompatTests(unittest.TestCase):
         self.assertIn("read_file", tools)
         self.assertIn("rag_qa", tools, "read_file 失败应回退 rag_qa")
         self.assertTrue(events[-1]["agent_metrics"]["content_grounded"])
+
+
+class ReadFileDirTests(unittest.TestCase):
+    """read_file 读目录应按顶层子目录（设备）均衡取样，而非按字母序只取前几个。"""
+
+    def test_read_file_dir_covers_all_top_children(self):
+        tmp = tempfile.mkdtemp()
+        base = os.path.join(tmp, "grp")
+        os.makedirs(base)
+        structure = {
+            "DevA": ["Manual.md", "Other.md"],
+            "DevB": ["Guide.md"],
+            "DevC": ["Datasheet.md"],
+        }
+        for dev, files in structure.items():
+            d = os.path.join(base, dev)
+            os.makedirs(d)
+            for fn in files:
+                with open(os.path.join(d, fn), "w", encoding="utf-8") as f:
+                    f.write((f"{dev} {fn} 内容：使用方法概述 " * 8))
+        with patch.object(at, "_resolve_kb_roots", return_value=[tmp]):
+            obs, _ = at._handle_read_file("grp", "tester", {"route": "rag_search"})
+        self.assertIn("共覆盖 3 个子目录", obs, "应覆盖全部 3 个顶层设备目录")
+        picked = []
+        for l in obs.splitlines():
+            if l.startswith("--- 文件: "):
+                inner = l[len("--- 文件: "):]
+                if inner.endswith(" ---"):
+                    inner = inner[:-4]
+                picked.append(inner)
+        tops = sorted({p.split("/")[0] for p in picked})
+        self.assertEqual(tops, ["DevA", "DevB", "DevC"], "不应只覆盖字母序靠前的子目录")
+        # DevA 有两份文件，应优先选 Manual（rank 最高）
+        deva = [p for p in picked if p.startswith("DevA/")][0]
+        self.assertTrue(deva.endswith("Manual.md"), "同设备应优先代表手册")
+
+    def test_read_file_dir_empty_raises(self):
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "empty"))
+        with patch.object(at, "_resolve_kb_roots", return_value=[tmp]):
+            with self.assertRaises(ValueError):
+                at._handle_read_file("empty", "tester", {"route": "rag_search"})
 
 
 if __name__ == "__main__":

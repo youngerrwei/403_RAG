@@ -108,23 +108,44 @@ def _handle_read_file(arg: str, username: str,
             raise ValueError(f"读取文件失败：{rel_path}")
         return (f"[文档] {rel_path}\n" + text, None)
 
-    # 目录：拼接其下全部文本文档（受预算与数量上限约束）
-    md_files = []
+    # 目录：按顶层子目录（设备）均衡取样——每个设备取 1 份代表手册，
+    # 优先 Manual/用户指南/使用/操作类文档，避免按全路径字母序只覆盖前几个设备。
+    # 同时修正预算：每文件份额 = max_chars // 设备数，保证总字数不超预算。
+    def _doc_rank(name: str) -> int:
+        n = name.lower()
+        keys = ("manual", "用户指南", "使用", "操作", "指南", "datasheet",
+                "手册", "guide", "用户", "配置")
+        for i, k in enumerate(keys):
+            if k in n:
+                return i
+        return len(keys)
+
+    groups: dict = {}
     for dp, _dirs, fns in os.walk(target):
         for fn in fns:
             if fn.lower().endswith((".md", ".markdown", ".txt")):
-                md_files.append(os.path.join(dp, fn))
-    md_files.sort()
-    md_files = md_files[:10]
-    if not md_files:
+                full = os.path.join(dp, fn)
+                rel = os.path.relpath(full, target)
+                top = rel.split(os.sep)[0]
+                groups.setdefault(top, []).append((rel, full))
+    if not groups:
         raise ValueError(f"目录 {rel_path} 下未发现可读取的文档。")
-    per_file = max(1000, max_chars // len(md_files))
-    parts = [f"[目录] {rel_path}（共读取 {len(md_files)} 个文档）"]
-    for fp in md_files:
-        sub = _read_markdown_text(fp, per_file)
+    max_children = max(5, int(config.get("READ_FILE_MAX_DIR_CHILDREN", 15)))
+    selected = []
+    for top in sorted(groups):
+        cand = sorted(groups[top], key=lambda x: (_doc_rank(x[0].lower()), x[0].lower()))
+        selected.append(cand[0])
+        if len(selected) >= max_children:
+            break
+    # 预留每文档分隔符/文件头开销（约 60 字），使正文总额逼近 max_chars
+    overhead = 60 * len(selected)
+    per_file = max(400, (max_chars - overhead) // len(selected))
+    parts = [f"[目录] {rel_path}（共覆盖 {len(selected)} 个子目录/设备，每文档约 {per_file} 字）"]
+    for rel, full in selected:
+        sub = _read_markdown_text(full, per_file)
         if sub is None:
             continue
-        parts.append(f"\n--- 文件: {os.path.relpath(fp, target)} ---\n" + sub)
+        parts.append(f"\n--- 文件: {rel} ---\n" + sub)
     return ("\n".join(parts), None)
 
 
