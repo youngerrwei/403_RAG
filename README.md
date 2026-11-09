@@ -572,7 +572,7 @@ PYTHONPATH=src conda run -n rag-mcp mcp dev src/lab_rag/mcp_server.py
 | `VLLM_API_KEY` | `lab-secret-key` | vLLM 服务密钥 |
 | `VLLM_PORT` | `8000` | vLLM 端口 |
 | `VLLM_GPU_UTIL` | `0.85` | GPU 显存利用率 |
-| `VLLM_MAX_MODEL_LEN` | `6000` | 最大上下文长度 |
+| `VLLM_MAX_MODEL_LEN` | `16384` | 最大上下文长度（Qwen3-8B 原生 40960；24GB 单卡实测 KV 池约 22752） |
 | `VLLM_INFERENCE_PROBE_TIMEOUT` | `15` | vLLM 最小真实生成探针超时；用于识别“接口可达但推理引擎卡死” |
 | `VLLM_ENABLE_THINKING` | `false` | 是否让 Qwen3 输出思考过程；Web 问答默认关闭，避免内部推理混入最终答案 |
 | `QDRANT_HOST` | `172.18.216.71` | Qdrant 服务地址 |

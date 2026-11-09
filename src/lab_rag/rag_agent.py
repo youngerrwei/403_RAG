@@ -652,7 +652,7 @@ def load_config() -> dict:
 
         "RESPONSE_MAX_TOKENS": int(os.getenv("RESPONSE_MAX_TOKENS", "2048")),
         # vLLM 上下文窗口上限；Agent 据此推导「可用输入 token 预算」
-        "VLLM_MAX_MODEL_LEN": int(os.getenv("VLLM_MAX_MODEL_LEN", "6000")),
+        "VLLM_MAX_MODEL_LEN": int(os.getenv("VLLM_MAX_MODEL_LEN", "16384")),
         "LLM_TEMPERATURE": float(os.getenv("LLM_TEMPERATURE", "0.1")),
         "RERANKER_SCORE_THRESHOLD": float(os.getenv("RERANKER_SCORE_THRESHOLD", "0.3")),
 

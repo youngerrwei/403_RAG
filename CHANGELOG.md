@@ -4,6 +4,58 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.12] 上下文窗口 6000 → 16384（不换模型，保留 8B 质量）
+
+### 背景与选型
+
+- 用户提出「窗口太小，能否换更小模型来增大上下文」。调研结论：**不需要换模型，换模型反而有害**。
+- 实测证据：
+  - `Qwen3-8B-Instruct` 原生 `max_position_embeddings=40960`、tokenizer `model_max_length=131072`；
+  - vLLM 启动日志 `GPU KV cache size: 22,752 tokens`、`Maximum concurrency for 6,000 tokens per request: 3.79x`，
+    GPU KV 峰值利用率仅 18% —— **6000 只是保守配置，不是显存瓶颈**；
+  - 4× RTX 3090 24GB，vLLM 独占 GPU3，KV 池余量充足。
+- 换 4B 的代价：需下载约 8GB 权重、重启生产服务、重新验证 63+ 条真实路由测试集；
+  而本 RAG 依赖复杂 ReAct 提示词、结构化路由 JSON、中文长文档问答与摘要，
+  4B 在这类任务上明显弱于 8B，与「在本 RAG 中有效」冲突。
+- 因此选择**直接放大窗口**：零下载、零质量损失、零权重变更，且 3.4.11 的 token 级护栏
+  会从 `VLLM_MAX_MODEL_LEN` 自动推导输入预算，无需改编排逻辑。
+
+### Changed
+
+- `VLLM_MAX_MODEL_LEN`：`6000` → **`16384`**（< KV 池 22752、< 模型原生 40960 无需 YaRN / rope scaling），
+  输入侧预算由 `3696` → **`14080` tokens（约 3.8×）**，系统提示词占比由 64% 降至约 18%。
+- 同步落点：`.env`、`.env.example`、`scripts/start_vllm.sh` 默认值、
+  `rag_agent.load_config` 默认值、`agent_entry._agent_input_token_budget` 默认值、
+  `AGENTS.md` 配置共识表、`README.md`、`docs/TROUBLESHOOTING.md`。
+- 单卡 3090 模板 `VLLM_MAX_MODEL_LEN`：`4096` → `8192`（4-bit 量化后权重约 5.7GB，
+  KV 余量更充裕），并修正模板中「vLLM 总容量 8192」与配置值矛盾的过时注释。
+- 字符级预算（`AGENT_CONTEXT_MAX_CHARS` / `AGENT_OBSERVATION_MAX_CHARS` /
+  `AGENT_HISTORY_MAX_CHARS` / `READ_FILE_MAX_CHARS`）保持不变：token 护栏是权威上限，
+  字符预算作为单条工具结果的粗剪，避免无谓放大导致 RAG 结果爆炸。
+
+### Added
+
+- 单测 `EnlargedWindowTests`（3 例）：窗口放大后的预算推导、同一份长上下文在新窗口保留更多原文、
+  大清单 observation 在新窗口下无 400 且工具链完整收敛。
+- `AGENTS.md` 配置共识表注明「不要靠换更小的模型来换窗口」及选型依据。
+
+### 验证
+
+- 配置一致性检查：9 个落点全部同步（单卡模板 8192 为独立取值）。
+- `load_config()` 实读 `16384`，自动推导输入预算 `14080`。
+- 全量单测 151 个，7 个预存失败（与基线一致），无新增回归；离线评测 24 场景收敛率 0.958，
+  `max_context_chars_peak` 5258。
+
+### 运维提示
+
+- **配置改动需重启 vLLM 才生效**：`bash scripts/start_vllm.sh stop` 后
+  `bash scripts/start_rag.sh`（脚本会按 `.env` 以 16384 重新启动并做健康探针）。
+- 单请求可用上下文变长后并发上限下降（约 22752/16384 ≈ 1.4× 满长度请求）；
+  已启用 `VLLM_ENABLE_PREFIX_CACHING=true`，ReAct 系统提示词前缀可复用，实测命中率约 55%。
+  若并发成为瓶颈，可调低 `VLLM_MAX_MODEL_LEN` 或提高 `VLLM_GPU_UTIL`。
+
+---
+
 ## [3.4.11] 修复 Agent 400「maximum context length」上下文超长异常
 
 ### 事故与根因

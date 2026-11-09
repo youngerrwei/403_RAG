@@ -94,7 +94,7 @@ RuntimeError: No CUDA GPUs are available
 
 | 问题 | 解决方案 |
 |------|---------|
-| 显存不足 | 降低 `VLLM_GPU_UTIL`（当前 0.85），或减小 `VLLM_MAX_MODEL_LEN`（当前 6000） |
+| 显存不足 | 降低 `VLLM_GPU_UTIL`（当前 0.85），或减小 `VLLM_MAX_MODEL_LEN`（当前 16384） |
 | 端口占用 | `kill $(lsof -ti :8000)` 或修改 `.env` 中的 `VLLM_PORT` |
 | 模型路径错误 | 确认模型已下载到本地，检查 `VLLM_MODEL_NAME` 路径是否正确 |
 | CUDA 不可用 | 检查 `VLLM_CUDA_DEVICES=3` 配置，确认 `nvidia-smi` 能正常显示 GPU |
@@ -429,7 +429,7 @@ grep "Semaphore\|等待" logs/rag_web.log | tail -10
 | 配置项 | 当前值 | 说明 |
 |--------|--------|------|
 | `MAX_CONCURRENT_REQUESTS` | 20 | 最大并发请求数 |
-| `VLLM_MAX_MODEL_LEN` | 6000 | 影响 vLLM 并发吞吐 |
+| `VLLM_MAX_MODEL_LEN` | 16384 | 影响 vLLM 并发吞吐（越大单请求可用上下文越长，并发上限越低） |
 | `VLLM_GPU_UTIL` | 0.85 | GPU 显存利用率 |
 | `VLLM_ENABLE_PREFIX_CACHING` | true | 启用前缀缓存提升并发效率 |
 

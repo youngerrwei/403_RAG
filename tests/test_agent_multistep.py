@@ -666,5 +666,65 @@ class ContextOverflowGuardTests(unittest.TestCase):
         self.assertEqual([e["type"] for e in events][-1], "error")
 
 
+class EnlargedWindowTests(unittest.TestCase):
+    """窗口从 6000 放大到 16384 后，token 护栏自动适配、agent 可用上下文显著增加。
+
+    Qwen3-8B 原生 40960，24GB 单卡实测 KV 池 22752；无需换更小的模型。
+    """
+
+    NEW_CFG = {"VLLM_MAX_MODEL_LEN": 16384,
+               "RESPONSE_MAX_TOKENS": 2048,
+               "AGENT_CONTEXT_SAFETY_TOKENS": 256}
+    OLD_CFG = {"VLLM_MAX_MODEL_LEN": 6000,
+               "RESPONSE_MAX_TOKENS": 2048,
+               "AGENT_CONTEXT_SAFETY_TOKENS": 256}
+
+    def test_enlarged_window_raises_input_budget(self):
+        self.assertEqual(ae._agent_input_token_budget(self.NEW_CFG), 14080)
+        self.assertEqual(ae._agent_input_token_budget(self.OLD_CFG), 3696)
+        self.assertGreater(ae._agent_input_token_budget(self.NEW_CFG),
+                           ae._agent_input_token_budget(self.OLD_CFG) * 3)
+
+    def test_guard_keeps_more_context_in_enlarged_window(self):
+        """同一份长上下文，在 16384 窗口下比 6000 窗口保留更多原文。"""
+        def build():
+            return [
+                {"role": "system", "content": ae.REACT_SYSTEM_PROMPT},
+                {"role": "user", "content": "VLC小组有哪些设备"},
+                {"role": "assistant", "content": 'Action: list_group_files["VLC小组"]'},
+                {"role": "user", "content": "Observation: " + "设备手册路径与参数说明" * 500},
+                {"role": "assistant", "content": "Thought: 继续读正文"},
+                {"role": "user", "content": "Observation: " + "示波器使用方法与步骤" * 500},
+            ]
+        old_msgs, new_msgs = build(), build()
+        ae._fit_agent_context_tokens(old_msgs, 3696, set())
+        ae._fit_agent_context_tokens(new_msgs, 14080, set())
+        self.assertLessEqual(ae._messages_tokens(new_msgs), 14080)
+        self.assertGreater(sum(len(m["content"]) for m in new_msgs),
+                           sum(len(m["content"]) for m in old_msgs))
+
+    def test_long_observation_converges_without_overflow_in_new_window(self):
+        """新窗口下大清单 observation 不会触发 400，工具链完整且正常收敛。"""
+        long_obs = "目录：\n" + "\n".join(
+            f"- 设备操作指南/VLC小组/设备{i:03d}/Manuals/manual_{i:03d}.md"
+            for i in range(200))
+        outputs = [
+            'Thought: 列设备\nAction: list_group_files["VLC小组"]',
+            'Thought: 读正文\nAction: rag_qa["VLC小组设备使用方法"]',
+            'Answer: 根据知识库内容可概括为：设备清单与使用方法',
+        ]
+        cfg = dict(self.NEW_CFG, AGENT_MAX_STEPS=4, AGENT_MAX_IDLE_STEPS=2,
+                   AGENT_TOTAL_TIMEOUT_S=240, AGENT_OBSERVATION_MAX_CHARS=2000,
+                   AGENT_KEEP_RECENT_OBSERVATIONS=2)
+        events, llm, rag, catalog = _drive(
+            outputs, "vlc小组有什么设备 怎么用", route="hybrid",
+            cfg=cfg, observation=long_obs)
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertTrue(events[-1]["agent_metrics"]["converged"])
+        self.assertFalse([e for e in events if e["type"] == "error"])
+        self.assertEqual([e["tool"] for e in events if e["type"] == "step_tool"],
+                         ["list_group_files", "rag_qa"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

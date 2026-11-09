@@ -265,7 +265,7 @@ data: [DONE]
 | `VLLM_API_KEY` | `lab-secret-key` | vLLM 服务密钥 |
 | `VLLM_MODEL_NAME` | `./models/Qwen3-8B-Instruct` | vLLM 推理模型本地路径 |
 | `VLLM_GPU_UTIL` | `0.85` | vLLM 显存占用比例；单卡（如 RTX 3090）可上调至 ~0.90 |
-| `VLLM_MAX_MODEL_LEN` | `6000` | 上下文窗口上限；单卡想省 KV 显存可下调（如 4096） |
+| `VLLM_MAX_MODEL_LEN` | `16384` | 上下文窗口上限；Qwen3-8B 原生 40960、24GB 单卡实测 KV 池约 22752，16384 安全且留并发余量；单卡同栈省显存可下调（3090 模板 8192）。**不要靠换更小的模型来换窗口**——8B 的 ReAct/路由/中文问答质量对 RAG 有效性关键 |
 | `VLLM_ENABLE_PREFIX_CACHING` | `true` | 前缀缓存；多步 Agent 复用系统提示词前缀，是连锁场景的关键优化 |
 | `VLLM_QUANTIZATION` | `（空）` | 模型量化；单卡 3090 首选 `bitsandbytes`（vLLM 用本地 fp16 实时量化 4-bit，权重 16GB→约 5.7GB，免下载）；亦支持 awq/gptq/fp8 预量化权重（需先获取） |
 | `VLLM_DTYPE` | `auto` | 计算精度（auto=fp16 / half / bfloat16） |

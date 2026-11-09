@@ -308,7 +308,7 @@ def _agent_input_token_budget(cfg: dict) -> int:
                                         "AGENT_CONTEXT_SAFETY_TOKENS"))
     if not has_window:
         return 0
-    model_len = int(cfg.get("VLLM_MAX_MODEL_LEN", 6000) or 6000)
+    model_len = int(cfg.get("VLLM_MAX_MODEL_LEN", 16384) or 16384)
     response = int(cfg.get("RESPONSE_MAX_TOKENS", 2048) or 2048)
     safety = int(cfg.get("AGENT_CONTEXT_SAFETY_TOKENS", 256) or 0)
     return max(512, model_len - response - safety)
