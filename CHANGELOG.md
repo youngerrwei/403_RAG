@@ -4,6 +4,53 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.16] 规则路由优化 + 召回鲁棒性增强 + 测试集扩展
+
+### 遍历重点文档（思考对应问题）
+
+- **设备操作指南/{A2X,VLC,VLP}小组**：23 类设备手册（示波器、信号源、相机、SLM、电源、
+  LED、探测器、Bias Tee、功放、光功率计、VNA、激光驱动、频谱仪、信道仿真仪、MIMO 系统）。
+  典型问题：①型号+问题（`EDU36311A 怎么用`）②列设备+用法（复合）③设备类型+操作。
+- **组会资料/{日期}_{主题}**：3 期组会报告。典型问题：特定期次内容、主题跨期提取、总结。
+- **规范格式类**（根目录散落）：论文 Latex 格式、图形格式、visio 转 eps、团队文档要求、
+  实验拍照要求。典型问题：格式/要求/操作步骤。
+- **参考书/已毕业资料**：11.9 万代码/h/doc，噪声源，易误召回。
+
+### 规则路由不足与优化（`rule_based_route`）
+
+- **不足1·型号+问题无感知**：`EDU36311A 怎么用` 因规则无型号感知 → `None` → 退化到 LLM 路由。
+  **修复**：命中 `corpus_lexicon.device_models`（20 个型号）直接 `rag_search`。
+- **不足2·口语化兜底缺失**：`周报怎么写`/`示波器怎么连接探头`/`组会讲了什么` 因无目录意图
+  → `None` → 全交 LLM。**修复**：歧义词单独出现且无学术上下文、或无目录意图的内容问句，
+  默认 `rag_search` 而非 `None`（纯闲聊仍返回 `None` 交 LLM 决定）。
+- **不足3·file_list 词表泛词**：`信号发生器设备怎么用` 因泛词`设备`误判 `file_list`。
+  **修复**：file_list 词表新增具体短语（有哪些设备/设备清单/设备列表/设备有哪些），
+  保留`设备`以兼容既有 `VLC小组的设备和使用规范 → hybrid` 测试。
+- **复合意图纠偏**（`route_query` LLM 路径）：清单+内容说明 → `hybrid`。
+
+### 召回性能（`load_config` / `rerank_and_filter`）
+
+- 开启 `RERANKER_RELATIVE_RATIO=0.65`（最优分偏低时进一步放宽过滤，避免近优候选被
+  绝对阈值误杀）+ `RERANKER_MIN_KEEP=3`（保底保留近优候选，避免上下文过薄）。
+  二者对高相关查询无影响（绝对阈值仍主导），属**防御性增强**，不降低既有质量。
+- 实测 6 类查询（型号/组会/规范/操作/目录）均正确召回并作答，无回归。
+
+### 扩展测试集
+
+- `tests/test_reliability.py` 新增 `RouteRulesTests`（6 例）：型号感知、口语化兜底、
+  file_list 去噪、纯闲聊→None、复合纠偏、复合意图检测。
+- `tests/agent_assoc_scenarios.json` 新增真实场景：`device_list_then_usage`（A 复合列+用法，
+  read_file 精读）、`meeting_topic_extract`（B 组会提取）；assoc 测试框架对 `route=rag_search`
+  简单内容检索豁免 `route_direct` 断言（该类走确定性直调是预期路径）。
+- `config/retrieval_lexicon.json`：file_list 词表新增具体设备目录短语。
+
+### 验证
+
+- 真实 `ask_rag` 6 查询均返回相关答案；全量单测 172，19 个预存失败
+ （`test_externalized` 词表文件既有不一致，与本次无关），0 新增回归。
+
+---
+
 ## [3.4.15] 修复 read_file 读目录只覆盖部分设备（均衡取样）
 
 ### 现象

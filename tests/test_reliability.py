@@ -1667,5 +1667,68 @@ class LexiconAndGeneralizationTests(unittest.TestCase):
         self.assertIn("IDENTICAL", out.stdout)
 
 
+class RouteRulesTests(unittest.TestCase):
+    """规则路由优化回归：型号感知、口语化兜底、file_list 去噪、复合纠偏。
+
+    覆盖 3.4.16 对 rule_based_route 的改进：设备型号命中直接内容检索、
+    歧义词/无目录意图的内容问句默认 rag_search（不再全部退化到 LLM 路由）。
+    """
+
+    def _route(self, q):
+        from lab_rag import rag_agent as ra
+        return ra.rule_based_route(q)
+
+    def test_model_aware_routes_to_rag_search(self):
+        # 命中已知设备型号（型号+问题）必须内容检索，不再退化到 LLM 路由
+        for q in ("EDU36311A 电源怎么设置输出电压", "MSOX3054A 示波器怎么用",
+                  "USRP-2944 的 DANL 参数含义"):
+            with self.subTest(q=q):
+                res = self._route(q)
+                self.assertIsNotNone(res, f"{q} 不应退化到 LLM")
+                self.assertEqual(res["route"], "rag_search", f"{q} 应命中型号直接内容检索")
+
+    def test_colloquial_content_falls_back_to_rag_search(self):
+        # 口语化/无目录意图的内容问句默认 rag_search，而非 None（交给 LLM）
+        for q in ("周报怎么写", "示波器怎么连接探头", "20220121期末组会讲了什么",
+                  "论文格式要求是什么", "实验拍照有什么要求", "visio图形怎么转eps"):
+            with self.subTest(q=q):
+                res = self._route(q)
+                self.assertIsNotNone(res, f"{q} 不应退化到 LLM 路由")
+                self.assertEqual(res["route"], "rag_search", f"{q} 应默认内容检索")
+
+    def test_explicit_device_listing_stays_file_list(self):
+        # 明确的设备/目录列举意图仍判 file_list（不被去噪误伤）
+        for q in ("VLC小组有哪些设备", "VLC小组有什么设备", "VLC小组设备清单",
+                  "列出 VLC小组 设备文档"):
+            with self.subTest(q=q):
+                self.assertEqual(self._route(q)["route"], "file_list")
+
+    def test_chitchat_stays_none(self):
+        # 纯无信号问句仍返回 None（交由 LLM 决定，可能直接拒答）
+        self.assertIsNone(self._route("你好"))
+        self.assertIsNone(self._route("在吗"))
+
+    def test_compound_intent_corrected_to_hybrid_by_route_query(self):
+        # route_query 通用纠偏（LLM 路由路径）：清单+内容说明 → hybrid，即便 LLM 误判 file_list。
+        # 注：规则优先路径若已命中 file_list 会直接返回，复合意图改由编排器
+        # requires_rag_after_list 兜底；此处专门验证 LLM 路径的纠偏逻辑。
+        from types import SimpleNamespace
+        from langchain_core.runnables import RunnableLambda
+        from lab_rag import rag_agent as ra
+        llm = RunnableLambda(
+            lambda _x: SimpleNamespace(
+                content='{"route":"file_list","target":"VLC小组","reason":""}'))
+        res = ra.route_query(llm, "VLC小组有哪些设备 怎么用", force_llm=True)
+        self.assertEqual(res["route"], "hybrid")
+
+    def test_compound_intent_detection(self):
+        # 复合意图（清单+内容说明）判定：列设备后必须补读正文。
+        from lab_rag import rag_agent as ra
+        self.assertTrue(ra.question_is_compound_intent("VLC小组有哪些设备 怎么用"))
+        self.assertTrue(ra.question_is_compound_intent("列出 VLC小组 设备清单并说明用途"))
+        self.assertFalse(ra.question_is_compound_intent("VLC小组有哪些设备"))
+        self.assertFalse(ra.question_is_compound_intent("周报怎么写"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

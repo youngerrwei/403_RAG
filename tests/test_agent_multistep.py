@@ -292,7 +292,10 @@ class AssociativeScenarioTests(unittest.TestCase):
                 self.assertTrue(final["agent_metrics"]["converged"])
                 self.assertLessEqual(final["agent_metrics"]["tool_calls"],
                                      sc.get("max_steps", 4))
-                self.assertNotEqual(events[0]["type"], "route_direct")
+                # 简单内容检索（route=rag_search）走 route_direct 确定性直调是预期路径，
+                # 仅关联性/链式任务（hybrid/file_list）要求进入多轮 Agent 循环。
+                if sc.get("route") != "rag_search":
+                    self.assertNotEqual(events[0]["type"], "route_direct")
 
     def test_chain_preserves_original_intent_on_supplementary_search(self):
         """链式任务以 list 起手、过早 Answer 时，复合补检索必须保留原始问题。"""

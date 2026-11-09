@@ -163,5 +163,57 @@
       {"thought": "列出 VLC 小组设备文档", "tool": "list_group_files", "arg": "VLC小组 设备"},
       {"answer": "根据目录枚举结果，VLC小组设备文档涵盖示波器、信号源与调制器等多类手册与清单。"}
     ]
+  },
+  {
+    "id": "device_usage_by_model",
+    "category": "设备型号+问题（型号感知路由）",
+    "question": "EDU36311A 电源怎么设置输出电压和电流上限",
+    "route": "rag_search",
+    "steps": [
+      {"thought": "命中设备型号，直接检索该电源的使用说明", "tool": "rag_qa", "arg": "EDU36311A 电源 设置 输出电压 电流上限"},
+      {"answer": "根据知识库内容可概括为：EDU36311A 电源通过前面板或远程指令设置电压/电流上限，需先进入保护配置菜单设定 OVP/OCP 阈值，再输出。"}
+    ]
+  },
+  {
+    "id": "device_list_then_usage",
+    "category": "复合意图：列设备+说明用途（read_file 精读）",
+    "question": "VLC小组有什么设备，分别说明其主要用途",
+    "route": "hybrid",
+    "steps": [
+      {"thought": "先列出 VLC 小组设备", "tool": "list_group_files", "arg": "VLC小组"},
+      {"thought": "已定位目录，read_file 精读总目录获得各设备手册", "tool": "read_file", "arg": "设备操作指南/VLC小组"},
+      {"answer": "根据知识库内容可概括为：VLC小组设备涵盖示波器、信号源、空间光调制器、相机与光电探测器等，分别用于信号采集、发生、光场调制与成像探测。"}
+    ]
+  },
+  {
+    "id": "meeting_topic_extract",
+    "category": "组会资料：主题跨期提取总结",
+    "question": "提取 20220121 期末组会中关于 MIMO 与水下通信的内容并总结",
+    "route": "hybrid",
+    "steps": [
+      {"thought": "检索该期组会关于 MIMO 与水下通信的内容", "tool": "rag_qa", "arg": "20220121 期末组会 MIMO 水下通信"},
+      {"thought": "提取并总结相关要点", "tool": "rag_qa", "arg": "20220121 期末组会 MIMO 水下通信 内容 总结"},
+      {"answer": "根据知识库内容可概括为：该期组会围绕 MIMO 信道建模与水下光/声通信链路展开，重点讨论了阵列增益与低信噪比下的稳健性。"}
+    ]
+  },
+  {
+    "id": "latex_format_spec",
+    "category": "规范格式：论文排版要求",
+    "question": "论文、报告撰写格式规范 Latex 版 有哪些排版要求",
+    "route": "rag_search",
+    "steps": [
+      {"thought": "检索 Latex 格式规范的正文要求", "tool": "rag_qa", "arg": "论文 报告 格式规范 Latex 排版要求"},
+      {"answer": "根据知识库内容可概括为：Latex 版规范要求使用指定文档类、统一图表编号与参考文献样式，正文采用结构化章节并附可复现的实验章节。"}
+    ]
+  },
+  {
+    "id": "visio_to_eps",
+    "category": "操作类：格式转换步骤",
+    "question": "visio 绘制的图形怎么转成 eps 格式插入论文",
+    "route": "rag_search",
+    "steps": [
+      {"thought": "检索 visio 转 eps 的操作步骤", "tool": "rag_qa", "arg": "visio 图形 转 eps 格式 步骤"},
+      {"answer": "根据知识库内容可概括为：先在 Visio 中另存为增强图元或 PDF，再通过虚拟打印机/转换工具导出 eps，并嵌入字体以保证论文中清晰可缩放。"}
+    ]
   }
 ]

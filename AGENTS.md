@@ -310,8 +310,8 @@ data: [DONE]
 | `ENABLE_HISTORY_AWARE_REWRITE` | `true` | 改写阶段使用对话历史消解代词 |
 | `HISTORY_SOFT_TURN_LIMIT` | `16` | 对话历史软轮次上限；超过该轮数的最旧轮次在 token 截断前先折叠压缩，保留意图线索 |
 | `HISTORY_COMPACT_ENABLED` | `true` | 历史超预算时折叠旧轮而非直接丢弃（关闭则退化为旧的硬截断行为） |
-| `RERANKER_RELATIVE_RATIO` | `0` | 重排相对 Top-1 比例阈值（0=关闭） |
-| `RERANKER_MIN_KEEP` | `0` | 重排最少保留条数（0=关闭） |
+| `RERANKER_RELATIVE_RATIO` | `0.65` | 重排相对 Top-1 比例：最优分偏低时放宽过滤，避免近优候选被绝对阈值误杀（高相关查询无影响） |
+| `RERANKER_MIN_KEEP` | `3` | 重排最少保留条数：保证至少保留 N 条近优候选，避免上下文过薄 |
 | `ENABLE_ANSWERABILITY_GATE` | `true` | 关键词零证据 + 低分时判为知识库无答案，避免假引用 |
 | `ANSWERABILITY_TOP_SCORE_FLOOR` | `0.90` | 拒答闸门的 Top-1 分数下限（双证据策略下上调） |
 | `ANSWERABILITY_MIN_KEYWORD_HITS` | `1` | 判定可答所需的关键词最少命中数 |

@@ -796,9 +796,12 @@ def load_config() -> dict:
         "COVERAGE_LOW_THRESHOLD": float(os.getenv("COVERAGE_LOW_THRESHOLD", "0.3")),
         "RERANK_QUERY_MODE": os.getenv("RERANK_QUERY_MODE", "both"),
         "RERANKER_ALLOW_LOW_SCORE_FALLBACK": os.getenv("RERANKER_ALLOW_LOW_SCORE_FALLBACK", "false").lower() == "true",
-        # 重排过滤策略：绝对阈值 + 相对 Top-1 比例 + 保底条数（后两项默认关闭，保持既有行为）
-        "RERANKER_RELATIVE_RATIO": float(os.getenv("RERANKER_RELATIVE_RATIO", "0")),
-        "RERANKER_MIN_KEEP": int(os.getenv("RERANKER_MIN_KEEP", "0")),
+        # 重排过滤策略：绝对阈值 + 相对 Top-1 比例 + 保底条数
+        # 相对比例：当最优分偏低（<阈值/ratio）时进一步放宽，避免近优候选被绝对阈值误杀；
+        # 保底条数：保证至少保留 N 条近优候选，避免单篇高分时上下文过薄。
+        # 二者对高相关查询无影响（绝对阈值仍主导），属防御性召回增强。
+        "RERANKER_RELATIVE_RATIO": float(os.getenv("RERANKER_RELATIVE_RATIO", "0.65")),
+        "RERANKER_MIN_KEEP": int(os.getenv("RERANKER_MIN_KEEP", "3")),
         # 拒答闸门：最终父块中关键词零命中且 Top-1 分数偏低时判为知识库无答案
         "ENABLE_ANSWERABILITY_GATE": os.getenv("ENABLE_ANSWERABILITY_GATE", "true").lower() == "true",
         "ANSWERABILITY_TOP_SCORE_FLOOR": float(os.getenv("ANSWERABILITY_TOP_SCORE_FLOOR", "0.90")),
@@ -1385,6 +1388,15 @@ def rule_based_route(question: str) -> Optional[dict]:
             and any(verb in question for verb in _COMPOUND_PROCESS_VERBS)):
         return None
 
+    # 型号感知：问句命中已知设备型号（如 EDU36311A、MSOX3054A）必为内容检索，
+    # 直接路由 rag_search，避免「型号+问题」因规则无型号感知而退化到 LLM 路由。
+    corpus = lexicon.load_corpus_lexicon()
+    if corpus:
+        for model in corpus.get("device_models", ()):
+            if model and model in question:
+                return {"route": "rag_search", "target": question,
+                        "reason": f"命中设备型号 {model}，内容检索"}
+
     # 四张词表统一来自检索词典，代码只保留通用判定逻辑
     keywords = lexicon.load_lexicon()["route_keywords"]
     file_list_keywords = keywords["file_list"]
@@ -1410,6 +1422,12 @@ def rule_based_route(question: str) -> Optional[dict]:
             academic_context_count = sum(1 for w in academic_context if w in question)
             if academic_context_count >= 2:
                 return {"route": "rag_search", "target": question, "reason": "规则匹配(学术上下文)"}
+            # 歧义词单独出现且无学术上下文：大概率是口语化内容问句（如「示波器怎么用」、
+            # 「组会讲了什么」），默认内容检索而非全交 LLM 路由；仅当明确带目录意图时交 LLM。
+            has_catalog_intent = hit_file or any(t in question for t in CATALOG_INTENT_TERMS)
+            if not has_catalog_intent:
+                return {"route": "rag_search", "target": question,
+                        "reason": "歧义词口语问句，默认内容检索"}
             return None  # 交给LLM兜底
 
     if hit_file and hit_rag:
@@ -1419,6 +1437,13 @@ def rule_based_route(question: str) -> Optional[dict]:
     elif hit_rag:
         return {"route": "rag_search", "target": question, "reason": "规则匹配"}
 
+    # 规则未命中目录意图、但问句带内容/口语信号时，默认内容检索而非全交 LLM 路由，
+    # 修复「周报怎么写」「某设备怎么用」类口语化问句退化到 LLM 路由的空耗。
+    # 纯无信号问句（如闲聊）仍返回 None 交由 LLM 决定（可能直接拒答）。
+    has_catalog_intent = hit_file or any(t in question for t in CATALOG_INTENT_TERMS)
+    if (hit_rag or hit_ambiguous
+            or any(t in question for t in CONTENT_INTENT_TERMS)) and not has_catalog_intent:
+        return {"route": "rag_search", "target": question, "reason": "规则未命中目录意图，默认内容检索"}
     return None
 
 
