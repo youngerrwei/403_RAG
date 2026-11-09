@@ -3283,11 +3283,18 @@ def ask_stream(
             # 调用方（Agent 编排层）已确定路由时直接复用，避免同一问句重复路由
             if route_hint and route_hint.get("route"):
                 route_result = dict(route_hint)
+                # 调用方（Agent 编排层）的 hint 可能只有 {"route": "rag_search"}，
+                # 缺少 target/reason；统一补齐，否则下方取键会抛 KeyError 让整轮 RAG
+                # 降级成「服务暂时不可用」，表现为工具反复失败。
+                route_result.setdefault("target", question)
+                route_result.setdefault("reason", "复用调用方内容路由")
+                if not str(route_result.get("target") or "").strip():
+                    route_result["target"] = question
                 debug_log(f"[ROUTE] 复用调用方路由: {route_result.get('route')}")
             else:
                 route_result = route_query(llm, question)
-        route = route_result["route"]
-        target = route_result["target"]
+        route = route_result.get("route", "rag_search")
+        target = route_result.get("target") or question
         route_reason = route_result.get("reason", "")
 
         # [FIX] 获取用户历史并截断，防止历史token无限累积超出预算

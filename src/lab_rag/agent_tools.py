@@ -148,8 +148,9 @@ TOOL_SPECS: Tuple[ToolSpec, ...] = (
         bullets=(
             "参数 rel_path：来自文件清单的路径，如 设备操作指南/VLC小组/.../Manual.md，或某个设备目录。",
             "读取文件返回其完整正文（超长会截断并标注）；读取目录则返回该目录下全部手册的拼接正文，便于一次性获取某设备的完整用法。",
-            "需要某一设备/文档的具体用法、步骤、参数时，优先用 list_group_files 定位路径再用 read_file 精读，而非仅用 rag_qa 全局检索；"
-            "rag_qa 更适合跨多文档综合检索或用户未指明具体文档的场景。",
+            "目录枚举返回的 rel_path 本身就是合法参数：设备目录/已定位目录可直接交给 read_file，无需再找具体文件名；"
+            "需要某一设备/文档的具体用法、步骤、参数时，优先 list_group_files 定位路径再 read_file 精读，"
+            "仅当 read_file 未命中或需要跨多文档综合时才用 rag_qa。",
         ),
         role="content",
         emits_catalog=False,

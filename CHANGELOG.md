@@ -4,6 +4,56 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.14] 修复 rag_qa「服务暂时不可用」异常 + 复合补读改用 read_file
+
+### 现象
+
+- 一次 `vlc小组有什么设备 怎么用`：step=1 `list_group_files` 成功列出 10 台设备，
+  step=2/3/4 三次 `rag_qa` 全部返回 `[工具执行异常] 服务暂时不可用，请稍后重试。`，
+  step=5 模型仍凭目录清单编造了 10 台设备的「使用方法」。
+- 用户疑问：为什么工具异常、为什么不用已定位的目录去读文件而反复用 rag。
+
+### 根因
+
+- **工具异常（真实代码 bug）**：`AGENT_REUSE_ROUTE_HINT=true` 时编排器把
+  `{"route": "rag_search"}` 作为 `route_hint` 传给 `ask_stream`；`ask_stream` 复用该 hint 后
+  直接取 `route_result["target"]` → **`KeyError('target')`** → 生成器发 error 事件 →
+  `ask_rag` 转成 `RuntimeError("RAG 服务暂时不可用")` → 工具层显示「服务暂时不可用」。
+  与模型服务、vLLM、Qdrant 均无关，三次调用是同一个键缺失。
+  日志实证：`[ROUTE] 复用调用方路由: rag_search` 紧接 `ask_stream error: KeyError('target')`。
+- **不用 read_file**：提示词把 `read_file` 描述成「已定位到具体文档」，而目录结果给的是
+  目录路径，模型误以为还需先找具体文件；且编排器的复合意图强制补读固定使用
+  `CONTENT_TOOL_NAME`（`rag_qa`），没有利用已有 `matched_dir` / `rel_path`。
+- **改动未生效**：web_app 自 11/8 13:21 起未重启，仍加载旧代码（日志显示两次扫描、
+  `list_catalog_entries elapsed=26.8s`），3.4.13 的提速与复合意图守卫均未落地。
+
+### Fixed
+
+- `ask_stream` 复用调用方路由时用 `setdefault` 补齐 `target`(默认 question) / `reason`，
+  并把 `route` / `target` 取值改为 `.get(...)` 兜底；编排器 `tool_route_hint` 也自带完整字段，双保险。
+- 复合意图强制补读改为**优先 `read_file` 精读已定位目录**：新增 `_preferred_content_action()`
+  从 `matched_dir` / `directories[].rel_path` 取路径；`read_file` 失败或无内容时自动回退
+  `rag_qa`。去重与工步预算记账同步适配。
+- 提示词与 `read_file` 工具描述明确：目录枚举返回的 `rel_path`（设备目录/已定位目录）
+  本身就是 `read_file` 的合法参数，无需再找具体文件名；仅当未命中或需跨文档综合才用 `rag_qa`。
+- 重启 web_app（PID 3219879 → 93886），全部代码改动生效；vLLM 未动。
+
+### Added
+
+- 单测 `RouteHintCompatTests`（3 例）：不完整 hint 不触发 `KeyError('target')`、
+  复合补读优先 `read_file` 精读目录、`read_file` 失败自动回退 `rag_qa`。
+- 更新 2 处 hint 契约断言：`route_hint` 现在必须包含 `route` / `target` / `reason`。
+
+### 验证
+
+- `ask_rag` 用 `{"route": "rag_search"}` 与完整 hint 均不再抛异常，正常返回知识库正文。
+- 真实链路端到端（真实 LLM + 真实目录/文档工具）：工具链
+  `list_group_files → read_file`，`read_file` 读到 10 份手册正文，
+  `content_grounded=True`、`converged=True`、**0 个 error 事件**，总耗时 18.1s。
+- 全量单测 164 个，7 个预存失败（与基线一致），无新增回归；离线评测 24 场景收敛率 0.958。
+
+---
+
 ## [3.4.13] 目录枚举提速 28s → 2s + 修复复合意图「只列目录就作答」
 
 ### 现象

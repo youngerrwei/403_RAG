@@ -172,7 +172,8 @@ class RagSearchLoopTests(unittest.TestCase):
         llm.invoke.assert_called()
         # 由模型自主发起内容工具调用，并透传内容路由 hint 避免重复路由
         rag.assert_called_once_with("周报格式规范", username="tester",
-                                    route_hint={"route": "rag_search"})
+                                    route_hint={"route": "rag_search", "target": "周报怎么写",
+                                                "reason": "Agent 已选择内容工具，等价于内容路由"})
         final = events[-1]
         self.assertEqual(final["type"], "final")
         self.assertTrue(final["agent_metrics"]["converged"])
@@ -326,10 +327,14 @@ class CompoundRouteTests(unittest.TestCase):
             'Thought: 摘要\nAction: rag_qa["A2X小组 水下 论文一 摘要"]',
             'Answer: 根据知识库内容可概括为：摘要',
         ]
-        events, llm, rag, catalog = _events(
-            outputs, "A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结")
+        q = "A2X小组在水下方向有哪些论文，提取这些论文并对每篇做摘要总结"
+        events, llm, rag, catalog = _events(outputs, q)
         for c in rag.call_args_list:
-            self.assertEqual(c.kwargs.get("route_hint"), {"route": "rag_search"})
+            hint = c.kwargs.get("route_hint") or {}
+            self.assertEqual(hint.get("route"), "rag_search")
+            # hint 必须自带 target，否则 ask_stream 复用路由时会抛 KeyError('target')
+            self.assertEqual(hint.get("target"), q)
+            self.assertTrue(hint.get("reason"))
 
     def test_loop_route_hint_can_be_disabled(self):
         """关闭后恢复历史逐轮子路由行为（route_hint=None）。"""
@@ -798,6 +803,83 @@ class CompoundIntentGuardTests(unittest.TestCase):
         self.assertFalse(final["agent_metrics"]["converged"])
         # 守卫应在空转上限内提前收敛，不应耗尽全部 LLM 预算
         self.assertLessEqual(final["agent_metrics"]["llm_calls"], 4)
+
+
+class RouteHintCompatTests(unittest.TestCase):
+    """复现「rag_qa 反复报服务暂时不可用」：复用路由 hint 缺 target 导致 KeyError。"""
+
+    def test_ask_stream_accepts_route_hint_without_target(self):
+        """Agent 循环只传 {"route": "rag_search"}，stage_route 不得抛 KeyError('target')。"""
+        class _Sentinel(Exception):
+            pass
+
+        runtime = {"config": ra.load_config(), "llm": Mock(), "vectorstore": Mock(),
+                   "client": Mock(), "reranker": Mock()}
+        # 在 stage_route 之后立即中断，避免依赖 Qdrant/Embedding；
+        # 若路由复用处仍取 route_result["target"]，会先抛 KeyError 而非哨兵。
+        with patch.object(ra, "get_runtime", return_value=runtime), \
+                patch.object(ra, "get_user_chat_history", side_effect=_Sentinel):
+            events = list(ra.ask_stream("示波器使用方法",
+                                        route_hint={"route": "rag_search"},
+                                        persist_history=False))
+        self.assertFalse([e for e in events if e["type"] == "error"
+                          and "target" in str(e)], "不得出现 KeyError('target')")
+        self.assertTrue(events, "应产出事件流")
+
+    def test_content_supplement_prefers_read_file_with_catalog_path(self):
+        """复合意图列目录后，强制补读应优先 read_file(已定位目录)。"""
+        outputs = [
+            'Thought: 列设备\nAction: list_group_files["VLC小组"]',
+            'Answer: 根据知识库内容可概括为：设备清单与使用方法',
+            'Answer: 根据知识库内容可概括为：设备清单与使用方法（已补读正文）',
+        ]
+        cat_result = {"mode": "filesystem_directory",
+                      "matched_dir": "设备操作指南/VLC小组", "directories": [], "files": []}
+        dispatch, _rag, _cat = make_dispatch()
+        dispatch_with_catalog = Mock(side_effect=lambda name, arg, *a, **k: {
+            "ok": True,
+            "observation": ("已定位目录: 设备操作指南/VLC小组"
+                            if name == "list_group_files" else "文档正文：使用方法"),
+            "catalog_result": cat_result if name == "list_group_files" else None,
+            "coverage_level": None, "elapsed_s": 0.0,
+            "tool_call_id": k.get("tool_call_id", "tc-x")})
+        events, llm, rag, catalog = _drive(
+            outputs, "vlc小组有什么设备 怎么用", route="file_list",
+            dispatch=dispatch_with_catalog)
+        tools = [e["tool"] for e in events if e["type"] == "step_tool"]
+        self.assertIn("list_group_files", tools)
+        self.assertIn("read_file", tools, "已有目录 rel_path 应优先 read_file 精读")
+        self.assertEqual(events[-1]["type"], "final")
+        self.assertTrue(events[-1]["agent_metrics"]["converged"])
+
+    def test_read_file_failure_falls_back_to_rag_qa(self):
+        """read_file 未命中时应自动回退 rag_qa，而非直接放弃正文依据。"""
+        outputs = [
+            'Thought: 列设备\nAction: list_group_files["VLC小组"]',
+            'Answer: 根据知识库内容可概括为：设备清单与使用方法',
+            'Answer: 根据知识库内容可概括为：设备清单与使用方法（已补读正文）',
+        ]
+        cat_result = {"mode": "filesystem_directory",
+                      "matched_dir": "设备操作指南/VLC小组", "directories": [], "files": []}
+
+        def dispatch(name, arg, *a, **k):
+            if name == "list_group_files":
+                return {"ok": True, "observation": "已定位目录", "catalog_result": cat_result,
+                        "coverage_level": None, "elapsed_s": 0.0, "tool_call_id": "tc-1"}
+            if name == "read_file":
+                return {"ok": False, "observation": "[工具执行异常] 未找到路径",
+                        "catalog_result": None, "coverage_level": None,
+                        "elapsed_s": 0.0, "tool_call_id": "tc-2"}
+            return {"ok": True, "observation": "正文依据", "catalog_result": None,
+                    "coverage_level": None, "elapsed_s": 0.0, "tool_call_id": "tc-3"}
+
+        events, llm, rag, catalog = _drive(
+            outputs, "vlc小组有什么设备 怎么用", route="file_list",
+            dispatch=Mock(side_effect=dispatch))
+        tools = [e["tool"] for e in events if e["type"] == "step_tool"]
+        self.assertIn("read_file", tools)
+        self.assertIn("rag_qa", tools, "read_file 失败应回退 rag_qa")
+        self.assertTrue(events[-1]["agent_metrics"]["content_grounded"])
 
 
 if __name__ == "__main__":

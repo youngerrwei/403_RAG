@@ -78,9 +78,11 @@ _PROMPT_TAIL = """
 - 只有列出/定位类问题：目录结果已给出完整清单即算充分。
 - 同时要求清单与内容说明（如「有哪些设备及使用规范」）：目录结果只回答了清单部分，
   **必须再调用内容工具（read_file 或 rag_qa）读正文**，且第二轮问题要保留用户原始意图，不能换成无关的固定话术。
-- 已通过 list_group_files 定位到具体文档/目录、而用户要的是该文档的详细用法/步骤/参数时，
-  **优先用 read_file 精读该文档**（内容更完整、更聚焦），而非仅用 rag_qa 全局检索；
-  rag_qa 更适合跨多文档综合检索或用户未指明具体文档的场景。
+- 已通过 list_group_files 得到目录结果、而用户要的是详细用法/步骤/参数时，
+  **直接把结果里的 rel_path（设备目录或已定位目录）交给 read_file 精读**——目录路径本身
+  就是合法参数，无需再找具体文件名；read_file 会读取该目录下全部手册，比 rag_qa 全局
+  检索更完整、更聚焦。仅当 read_file 未命中、或需要跨多文档综合、或用户未指明具体
+  文档时才用 rag_qa。
 - 涉及多个小组、设备或文档的对比/分别说明：目录或正文只覆盖其中一个实体时，
   **必须分别检索其余实体**，再综合，不能凭单一文档作答。
 - 正文检索结果与问题不相关、只命中同主题的其他文档、或目录未命中：信息仍不充分。
@@ -129,7 +131,8 @@ _PROMPT_TAIL_COMPACT = """
 ## 规则
 - 回答必须依据工具返回，不得凭空编造；未获得依据时明确说明未检索到。
 - 同时要求清单与内容说明：列目录后必须再调用内容工具（read_file 或 rag_qa）读正文。
-- 已定位到具体文档且用户要详细用法/步骤/参数时，优先 read_file 精读；rag_qa 适合跨文档综合。
+- 已得到目录 rel_path 且用户要详细用法/步骤/参数时，直接把该目录路径交给 read_file 精读
+  （目录路径是合法参数）；read_file 失败或需跨文档综合时才用 rag_qa。
 - 多实体/链式任务要分别检索后综合；换检索角度，禁止用完全相同的参数重复调用同一工具。
 - 总结时用「根据知识库内容可概括为」；目录清单由系统统一附在回答中，不要虚构参考路径。"""
 
@@ -474,7 +477,11 @@ def ask_agent_stream(
     # 多步连锁场景优化：循环内 rag_qa 子问题复用内容路由，跳过冗余规则/LLM 重路由。
     # 模型已显式选择 rag_qa（内容工具），语义等价于内容路由；该 hint 对 list_group_files 无副作用。
     reuse_route_hint = bool(cfg.get("AGENT_REUSE_ROUTE_HINT", True))
-    tool_route_hint = {"route": "rag_search"} if reuse_route_hint else None
+    # hint 必须自带 target/reason：ask_stream 复用路由时会读取这些键，
+    # 只给 route 会触发 KeyError('target') 并让整轮工具调用失败。
+    tool_route_hint = ({"route": "rag_search", "target": question,
+                        "reason": "Agent 已选择内容工具，等价于内容路由"}
+                       if reuse_route_hint else None)
     seen_actions = set()
     latest_catalog_result = None
     used_list_tool = False
@@ -497,6 +504,23 @@ def ask_agent_stream(
         if (initial_route and initial_route.get("route") == "file_list") and catalog_grounded:
             return True
         return False
+
+    def _preferred_content_action():
+        """复合意图强制补读时的工具选择：已定位目录则优先 read_file 精读，否则 rag_qa。
+
+        list_group_files 返回的 matched_dir / directories[].rel_path 本身就是
+        read_file 可直接使用的路径，无需再靠 rag_qa 全局检索去猜文档。
+        """
+        cat = latest_catalog_result
+        if isinstance(cat, dict):
+            rel = cat.get("matched_dir")
+            if not rel:
+                items = cat.get("directories") or cat.get("files") or []
+                if items and isinstance(items[0], dict):
+                    rel = items[0].get("rel_path")
+            if rel and str(rel).strip():
+                return "read_file", str(rel)
+        return CONTENT_TOOL_NAME, question
 
     def finalize_answer(value: str) -> str:
         answer = sanitize_generated_answer(value)
@@ -639,26 +663,39 @@ def ask_agent_stream(
             if "Answer:" in content:
                 need_read_after_list = (
                     requires_rag_after_list or (used_list_tool and question_wants_content))
-                if need_read_after_list and used_list_tool and not used_rag_after_list \
-                        and (CONTENT_TOOL_NAME, question) not in seen_actions:
+                if need_read_after_list and used_list_tool and not used_rag_after_list:
                     messages.append({"role": "assistant", "content": content})
-                    result = dispatch_tool(CONTENT_TOOL_NAME, question, username,
-                                           route_hint=tool_route_hint,
-                                           tool_call_id=f"tc-{tool_calls + 1}")
-                    tool_calls += 1
-                    tool_log.append((CONTENT_TOOL_NAME, question))
-                    seen_actions.add((CONTENT_TOOL_NAME, question))
+                    # 已定位目录 → 先 read_file 精读；失败/无内容再回退 rag_qa 全局检索。
+                    primary_name, primary_arg = _preferred_content_action()
+                    attempts = [(primary_name, primary_arg)]
+                    if primary_name != CONTENT_TOOL_NAME:
+                        attempts.append((CONTENT_TOOL_NAME, question))
+                    last_result = None
+                    for name, arg in attempts:
+                        if (name, arg) in seen_actions:
+                            continue
+                        result = dispatch_tool(name, arg, username,
+                                               route_hint=tool_route_hint,
+                                               tool_call_id=f"tc-{tool_calls + 1}")
+                        tool_calls += 1
+                        tool_log.append((name, arg))
+                        seen_actions.add((name, arg))
+                        last_result = result
+                        last_observation = result["observation"]
+                        res_cov = result.get("coverage_level")
+                        valid = bool(result.get("ok") and res_cov not in ("none", "very_low")
+                                     and (result["observation"] or "").strip())
+                        if valid:
+                            content_grounded = True
+                        if result["catalog_result"]:
+                            latest_catalog_result = result["catalog_result"]
+                        yield from emit_tool_step(step, name, arg, result)
+                        if valid:
+                            break
                     used_rag_after_list = True
-                    last_observation = result["observation"]
-                    # 与 step-4 一致的记账：有效正文结果记为依据，避免最终作答被误判无依据
-                    res_cov = result.get("coverage_level")
-                    if result.get("ok") and res_cov not in ("none", "very_low") \
-                            and (result["observation"] or "").strip():
-                        content_grounded = True
-                    if result["catalog_result"]:
-                        latest_catalog_result = result["catalog_result"]
-                    yield from emit_tool_step(step, CONTENT_TOOL_NAME, question, result)
-                    append_observation(result["observation"], "请基于目录结果与正文给出 Answer。")
+                    if last_result is not None:
+                        append_observation(last_observation,
+                                           "请基于目录结果与正文给出 Answer。")
                     continue
 
                 # 无依据却要作答：拒绝凭空作答，转入诚实收敛。
