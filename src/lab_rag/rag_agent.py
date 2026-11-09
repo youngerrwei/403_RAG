@@ -4,6 +4,7 @@ import re
 import json
 import time
 import fcntl
+import gzip
 import shutil
 import hashlib
 import threading
@@ -530,6 +531,9 @@ class TTLCache:
 _retrieval_cache = TTLCache(maxsize=128, ttl=300)
 # 目录树快照缓存：value 为 (timestamp, snapshot)，实际 TTL 由 CATALOG_SNAPSHOT_TTL 在读取时判定
 _catalog_snapshot_cache = TTLCache(maxsize=8, ttl=86400)
+# 后台刷新去重：同一缓存键同时只允许一个 CIFS 全盘遍历任务
+_catalog_refresh_lock = threading.Lock()
+_catalog_refreshing = set()
 
 # 目录树快照的遍历上限（目录数）；配置化后默认大幅提高以覆盖完整语料目录树，
 # 否则大共享盘下靠后的目录（如 设备操作指南/VLP小组）不会被纳入快照，
@@ -574,27 +578,138 @@ def _build_catalog_snapshot(root_dir: str, exclude_hidden: bool = True, cfg: dic
     return entries
 
 
+def _catalog_disk_cache_path(key: str):
+    """磁盘快照落在本地 data/（非 CIFS 共享盘），避免重启后重新全盘遍历。
+
+    采用 gzip 压缩：14 万条路径的明文 JSON 约 40MB，压缩后约 4MB，
+    重启加载由 ~0.7s 降到 ~0.2s，且节省磁盘。
+    """
+    return PROJECT_ROOT / "data" / f"catalog_snapshot_{key[:12]}.json.gz"
+
+
+def _load_disk_catalog_snapshot(key: str, max_age: int):
+    """读取磁盘快照，返回 (snapshot, built_at)；缺失/过期/损坏均返回 None。"""
+    path = _catalog_disk_cache_path(key)
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            payload = json.load(f)
+        if payload.get("key") != key:
+            return None
+        built_at = float(payload.get("built_at", 0))
+        if max_age > 0 and time.time() - built_at > max_age:
+            return None
+        entries = [tuple(item) for item in payload.get("entries", [])]
+        if not entries:
+            return None
+        return entries, built_at
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        debug_log(f"[CATALOG] 磁盘快照读取失败（将重建）: {e!r}")
+        return None
+
+
+def _save_disk_catalog_snapshot(key: str, snapshot: list, built_at: float) -> None:
+    """原子写入 gzip 磁盘快照；写失败只记日志，不影响检索可用性。"""
+    path = _catalog_disk_cache_path(key)
+    tmp = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".catalog_snapshot_", suffix=".tmp",
+                                   dir=str(path.parent))
+        os.close(fd)
+        with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=1) as f:
+            json.dump({"key": key, "built_at": built_at,
+                       "entries": [list(item) for item in snapshot]},
+                      f, ensure_ascii=False)
+        os.replace(tmp, path)
+        tmp = None
+        debug_log(f"[CATALOG] 磁盘快照已写入 entries={len(snapshot)}")
+    except Exception as e:
+        debug_log(f"[CATALOG] 磁盘快照写入失败（不影响检索）: {e!r}")
+    finally:
+        if tmp and os.path.exists(tmp):
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+
+
+def _schedule_catalog_refresh(root_dir: str, key: str, exclude: bool,
+                              cfg: dict, persist: bool) -> None:
+    """后台异步重建快照（stale-while-revalidate）；同一 key 同时只允许一个刷新任务。
+
+    CIFS 全盘遍历约 20s+，若让请求线程同步等待会直接拖垮一次问答，
+    因此过期时先返回旧快照，由守护线程刷新内存与磁盘缓存。
+    """
+    with _catalog_refresh_lock:
+        if key in _catalog_refreshing:
+            return
+        _catalog_refreshing.add(key)
+
+    def _worker():
+        try:
+            with Timer("build_catalog_snapshot_async"):
+                snapshot = _build_catalog_snapshot(root_dir, exclude, cfg=cfg)
+            built_at = time.time()
+            _catalog_snapshot_cache.set(key, (built_at, snapshot))
+            if persist:
+                _save_disk_catalog_snapshot(key, snapshot, built_at)
+            debug_log(f"[CATALOG] 后台刷新完成 entries={len(snapshot)}")
+        except Exception as e:
+            debug_log(f"[CATALOG] 后台刷新失败，继续沿用旧快照: {e!r}")
+        finally:
+            with _catalog_refresh_lock:
+                _catalog_refreshing.discard(key)
+
+    threading.Thread(target=_worker, daemon=True, name="catalog-snapshot-refresh").start()
+
+
 def _get_catalog_snapshot(root_dir: str, cfg: dict = None) -> list:
-    """取目录树快照；缓存键纳入根目录、索引版本与排除开关，TTL 由配置控制。"""
+    """取目录树快照。
+
+    三级策略：内存新鲜 → 直接返回；内存过期 → stale-while-revalidate（返回旧值 +
+    后台刷新）；内存未命中 → 本地磁盘快照（进程重启免全盘遍历）；都没有才同步构建。
+    缓存键纳入根目录、索引版本与排除开关。
+    """
     cfg = cfg or {}
     enabled = bool(cfg.get("ENABLE_CATALOG_SNAPSHOT_CACHE", True))
+    persist = enabled and bool(cfg.get("ENABLE_CATALOG_SNAPSHOT_DISK_CACHE", True))
     ttl = max(0, int(cfg.get("CATALOG_SNAPSHOT_TTL", 300)))
+    disk_max_age = max(0, int(cfg.get("CATALOG_SNAPSHOT_DISK_MAX_AGE", 86400)))
     exclude = bool(cfg.get("CATALOG_EXCLUDE_HIDDEN_DIRS", True))
     version = str(cfg.get("RETRIEVAL_INDEX_VERSION", "1"))
     key = hashlib.md5(f"{root_dir}|{version}|{exclude}".encode()).hexdigest()
+    now = time.time()
 
     if enabled:
         cached = _catalog_snapshot_cache.get(key)
         if cached is not None:
-            ts, snapshot = cached
-            if time.time() - ts < ttl:
+            built_at, snapshot = cached
+            if now - built_at < ttl:
                 debug_log(f"[CATALOG][CACHE HIT] root={root_dir} entries={len(snapshot)}")
+                return snapshot
+            debug_log(f"[CATALOG][STALE HIT] 返回旧快照并后台刷新 entries={len(snapshot)}")
+            _schedule_catalog_refresh(root_dir, key, exclude, cfg, persist)
+            return snapshot
+
+        if persist:
+            disk = _load_disk_catalog_snapshot(key, disk_max_age)
+            if disk is not None:
+                snapshot, built_at = disk
+                _catalog_snapshot_cache.set(key, (built_at, snapshot))
+                debug_log(f"[CATALOG][DISK HIT] root={root_dir} entries={len(snapshot)}")
+                if now - built_at >= ttl:
+                    _schedule_catalog_refresh(root_dir, key, exclude, cfg, persist)
                 return snapshot
 
     with Timer("build_catalog_snapshot"):
         snapshot = _build_catalog_snapshot(root_dir, exclude, cfg=cfg)
+    built_at = time.time()
     if enabled:
-        _catalog_snapshot_cache.set(key, (time.time(), snapshot))
+        _catalog_snapshot_cache.set(key, (built_at, snapshot))
+    if persist:
+        _save_disk_catalog_snapshot(key, snapshot, built_at)
     return snapshot
 
 
@@ -636,6 +751,9 @@ def load_config() -> dict:
         # 目录树单次遍历快照：消除 catalog 每次请求两次全盘 os.walk 的 IO
         "ENABLE_CATALOG_SNAPSHOT_CACHE": os.getenv("ENABLE_CATALOG_SNAPSHOT_CACHE", "true").lower() == "true",
         "CATALOG_SNAPSHOT_TTL": int(os.getenv("CATALOG_SNAPSHOT_TTL", "300")),
+        # 快照落本地磁盘 + 过期后台刷新：避免 CIFS 全盘遍历（约 20s）阻塞每次请求
+        "ENABLE_CATALOG_SNAPSHOT_DISK_CACHE": os.getenv("ENABLE_CATALOG_SNAPSHOT_DISK_CACHE", "true").lower() == "true",
+        "CATALOG_SNAPSHOT_DISK_MAX_AGE": int(os.getenv("CATALOG_SNAPSHOT_DISK_MAX_AGE", "86400")),
         # 排除 .svn/.git 等版本控制与隐藏目录，避免路径匹配把噪声目录当成设备
         "CATALOG_EXCLUDE_HIDDEN_DIRS": os.getenv("CATALOG_EXCLUDE_HIDDEN_DIRS", "true").lower() == "true",
         # 目录树快照遍历上限（目录数）；默认大幅提高以覆盖完整语料目录树，避免靠后
@@ -1304,6 +1422,31 @@ def rule_based_route(question: str) -> Optional[dict]:
     return None
 
 
+# 通用意图词表（不绑定具体小组/设备名）：用于识别「清单 + 内容说明」复合意图。
+# LLM 路由与 Agent 编排器共用，避免两处判定漂移。
+CATALOG_INTENT_TERMS = (
+    "目录", "文件列表", "文件清单", "有哪些文件", "文件有哪些", "列出文件", "列出目录",
+    "路径", "在哪里", "位置", "有哪些设备", "有什么设备", "设备清单", "多少篇", "几篇",
+    "清单",
+)
+CONTENT_INTENT_TERMS = (
+    "格式", "规范", "要求", "步骤", "方法", "如何", "怎么", "说明", "原理", "参数",
+    "使用", "用法", "操作", "教程", "区别", "对比", "总结", "摘要", "干什么", "做什么",
+)
+
+
+def question_has_content_intent(question: str) -> bool:
+    """问题是否要求文档内容说明（而非只要目录清单）。"""
+    return any(t in str(question or "") for t in CONTENT_INTENT_TERMS)
+
+
+def question_is_compound_intent(question: str) -> bool:
+    """是否同时要求「目录/清单」与「文档内容说明」——列目录后必须补读正文。"""
+    q = str(question or "")
+    return (question_has_content_intent(q)
+            and any(t in q for t in CATALOG_INTENT_TERMS))
+
+
 def route_query(llm, question: str, force_llm: bool = False) -> dict:
     # 规则优先：尝试基于关键词快速路由（agent 模式可强制走 LLM 路由）
     if not force_llm:
@@ -1355,17 +1498,20 @@ def route_query(llm, question: str, force_llm: bool = False) -> dict:
         if not isinstance(reason, str):
             reason = ""
 
-        # LLM 偶尔会把“格式/要求是什么”误解成查找模板文件；对无明确目录意图的内容问题做保守纠偏。
-        content_terms = ("格式", "规范", "要求", "步骤", "方法", "如何", "怎么", "说明", "原理", "参数")
-        explicit_catalog_terms = (
-            "目录", "文件列表", "文件清单", "有哪些文件", "文件有哪些", "列出文件", "列出目录",
-            "路径", "在哪里", "位置", "有哪些设备", "有什么设备", "设备清单", "多少篇", "几篇",
-        )
-        if (
+        # 通用意图纠偏（不针对具体小组/设备）：LLM 常把「有什么设备 怎么用」这类
+        # 「既要清单又要内容说明」的复合问题压成单一 file_list，导致只列目录就作答。
+        has_catalog = any(t in question for t in CATALOG_INTENT_TERMS)
+        has_content = question_has_content_intent(question)
+        if has_catalog and has_content and route != "hybrid":
+            route = "hybrid"
+            target = question
+            reason = "既要求目录/设备清单，又要求文档内容说明，属复合意图。"
+        elif (
                 route in {"file_list", "hybrid"}
-                and any(term in question for term in content_terms)
-                and not any(term in question for term in explicit_catalog_terms)
+                and has_content
+                and not has_catalog
         ):
+            # LLM 偶尔会把“格式/要求是什么”误解成查找模板文件；对无明确目录意图的内容问题做保守纠偏
             route = "rag_search"
             target = question
             reason = "查询格式、规范或方法等文档内容，且未明确要求枚举目录或文件。"
@@ -2489,6 +2635,76 @@ def path_match_score(query: str, candidate_path: str) -> float:
     return max(token_score * 0.9, seq_score * 0.8)
 
 
+def _path_score_upper_bound(q: str, c: str, q_tokens: List[str], base: str) -> float:
+    """path_match_score 的严格数学上界（用于零误剪的快速跳过）。
+
+    - token 项：c_tokens 的元素都是 c 的子串，故 `t in c_tokens` ⟹ `t in c`，
+      用 `t in c` 统计得到 hit 的上界，token_score 不会超过它。
+    - seq 项：SequenceMatcher.ratio() <= real_quick_ratio() =
+      2*min(len(a),len(b))/(len(a)+len(b))，故 0.8*ratio 不超过该上界。
+    - 另外覆盖「无 token」分支（直接对整串 ratio，无 0.8 系数）的上界。
+
+    上界 < 阈值时真实分数必 < 阈值，可安全跳过昂贵的 SequenceMatcher。
+    """
+    if q == c or q in c or base == q:
+        return 1.0
+    hit_ub = sum(1 for t in q_tokens if t in c)
+    token_ub = hit_ub / max(1, len(q_tokens)) * 0.9
+    seq_ub = (0.8 * 2.0 * min(len(q), len(base)) / (len(q) + len(base))
+              if (len(q) + len(base)) else 0.0)
+    seq_full_ub = (2.0 * min(len(q), len(c)) / (len(q) + len(c))
+                   if (len(q) + len(c)) else 0.0)
+    return max(token_ub, seq_ub, seq_full_ub)
+
+
+def catalog_matches(keyword: str, entries: list, dir_limit: int = 10,
+                    entry_limit: int = 200, threshold: float = 0.45):
+    """一次遍历同时产出「目录匹配」与「全部条目匹配」，复用同一份打分。
+
+    原先 list_catalog_entries 对同一快照分别调用 find_best_matching_dirs 与
+    list_fs_entries_by_keyword（两次全量扫描、重复打分）；本函数合并为一次，
+    并用严格上界剪枝跳过数学上不可能达阈值的路径，结果与两次独立扫描一致。
+    """
+    q = path_to_unix(keyword).lower().strip()
+    q_tokens = normalize_query_tokens(q)
+    dirs, items = [], []
+    for kind, name, rel_path in entries:
+        c = path_to_unix(rel_path).lower().strip()
+        if not c:
+            continue
+        base = c.rsplit("/", 1)[-1]
+        # 剪枝与打分融合：先用严格上界跳过不可能达标者，再一次性算出精确分数，
+        # 避免对 6 万+ 候选重复做字符串规范化与分词。
+        if q == c:
+            score = 1.0
+        elif q in c:
+            score = 0.95
+        elif base == q:
+            score = 0.98
+        elif _path_score_upper_bound(q, c, q_tokens, base) < threshold:
+            continue
+        else:
+            c_tokens = normalize_query_tokens(c)
+            if not q_tokens or not c_tokens:
+                score = SequenceMatcher(None, q, c).ratio()
+            else:
+                hit = sum(1 for t in q_tokens if t in c)
+                score = max(hit / max(1, len(q_tokens)) * 0.9,
+                            SequenceMatcher(None, q, base).ratio() * 0.8)
+        if score < threshold:
+            continue
+        rounded = round(score, 4)
+        if kind == "directory":
+            dirs.append({"rel_path": rel_path, "score": rounded})
+        items.append({"type": kind, "name": name,
+                      "rel_path": rel_path, "score": rounded})
+    dirs.sort(key=lambda x: (-x["score"], len(x["rel_path"])))
+    items.sort(key=lambda x: (-x["score"], len(x["rel_path"])))
+    debug_log(f"catalog_matches keyword={keyword} dirs={len(dirs)} items={len(items)} "
+              f"from_snapshot={len(entries)}")
+    return dirs[:dir_limit], items[:entry_limit]
+
+
 def find_best_matching_dirs(keyword: str, root_dir: str, limit: int = 20,
                             snapshot: list = None, cfg: dict = None) -> List[Dict]:
     """从目录树快照筛出最佳匹配目录；snapshot 省略时自行构建（保持旧调用方式可用）。"""
@@ -2740,17 +2956,12 @@ def list_catalog_entries(target: str) -> Dict:
             checked_roots.append(root_state)
             if not (root_state["exists"] and root_state["is_dir"] and root_state["readable"]):
                 continue
-            # 单次遍历 + 快照缓存：原先两个函数各自全盘 os.walk，改为共用一份快照
+            # 一次遍历同时产出目录/条目匹配（原先两次全量扫描 + 重复打分）；
+            # 快照由内存 → 磁盘 → CIFS 三级获取，过期时后台刷新不阻塞本次请求。
             snapshot = _get_catalog_snapshot(root_dir, config)
-            matched_dirs = find_best_matching_dirs(
-                target, root_dir, limit=10, snapshot=snapshot, cfg=config)
-            entries = list_fs_entries_by_keyword(
-                target,
-                root_dir=root_dir,
-                limit=config["FILE_SEARCH_LIMIT"],
-                snapshot=snapshot,
-                cfg=config,
-            )
+            matched_dirs, entries = catalog_matches(
+                target, snapshot, dir_limit=10,
+                entry_limit=config["FILE_SEARCH_LIMIT"])
 
             best_dir = matched_dirs[0] if matched_dirs else None
             best_entry = entries[0] if entries else None

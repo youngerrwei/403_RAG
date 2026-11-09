@@ -280,7 +280,9 @@ data: [DONE]
 | `INGEST_MAX_FAILED_FILES` | `0` | 允许的文档加载失败数，超出即中止入库 |
 | `QDRANT_INDEX_FAIL_FAST` | `true` | payload 索引缺失时中止入库 |
 | `ENABLE_CATALOG_SNAPSHOT_CACHE` | `true` | 目录枚举共用单次遍历快照，消除重复全盘遍历 |
-| `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒）；键含索引版本 |
+| `CATALOG_SNAPSHOT_TTL` | `300` | 目录树快照缓存 TTL（秒）；键含索引版本；过期后 stale-while-revalidate（返回旧值 + 后台刷新），不阻塞请求 |
+| `ENABLE_CATALOG_SNAPSHOT_DISK_CACHE` | `true` | 快照 gzip 落本地 `data/`，进程重启免于重新遍历 CIFS 共享盘（约 20s+） |
+| `CATALOG_SNAPSHOT_DISK_MAX_AGE` | `86400` | 磁盘快照最大滞留秒数，超过视为过期并重建 |
 | `CATALOG_EXCLUDE_HIDDEN_DIRS` | `true` | 排除 `.svn`/`.git`/隐藏目录，避免噪声路径误命中 |
 | `AGENT_MAX_STEPS` | `6` | ReAct 单一编排器的多轮检索步数预算（流式/非流式共用）；单次「工具调用」计 1 步，最终作答不占步数，故 6 步可支撑 5 次检索+1 次作答，覆盖更长链式/多实体任务 |
 | `AGENT_TOTAL_TIMEOUT_S` | `240` | Agent 轮次总耗时预算（秒），超时优雅收敛；与 web_app 300s 上游超时错开 |

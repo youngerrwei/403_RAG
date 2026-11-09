@@ -90,7 +90,9 @@ class SseObservationFidelityTests(unittest.TestCase):
             'Thought: 列目录\nAction: list_group_files["VLC小组"]',
             "Answer: 根据知识库内容可概括为：设备清单",
         ]
-        events, llm, rag = _drive(outputs, route="file_list", observation=long_obs)
+        # 纯目录问句：本用例只验证 SSE observation 原文保真，不引入复合意图补读
+        events, llm, rag = _drive(outputs, question="VLC小组设备清单",
+                                  route="file_list", observation=long_obs)
         tool_events = [e for e in events if e["type"] == "step_tool"]
         self.assertEqual(len(tool_events), 1)
         self.assertEqual(tool_events[0]["observation"], long_obs)
@@ -102,13 +104,15 @@ class SseObservationFidelityTests(unittest.TestCase):
             'Thought: 第二跳\nAction: list_group_files["HOLOEYE LETO-3 Manuals"]',
             "Answer: 根据知识库内容可概括为：结论",
         ]
-        events, llm, rag = _drive(outputs, route="file_list", observation=long_obs)
+        events, llm, rag = _drive(outputs, question="VLC小组设备清单",
+                                  route="file_list", observation=long_obs)
         compacted_peak = events[-1]["agent_metrics"]["context_chars_peak"]
         # 对照：关闭压缩后，同样的两轮长 Observation 会原样累加
         no_compact_cfg = dict(CFG, AGENT_OBSERVATION_MAX_CHARS=0,
                               AGENT_KEEP_RECENT_OBSERVATIONS=99)
-        events_raw, _, _ = _drive(outputs, route="file_list",
-                                  cfg=no_compact_cfg, observation=long_obs)
+        events_raw, _, _ = _drive(outputs, question="VLC小组设备清单",
+                                  route="file_list", cfg=no_compact_cfg,
+                                  observation=long_obs)
         raw_peak = events_raw[-1]["agent_metrics"]["context_chars_peak"]
         self.assertGreater(raw_peak, compacted_peak)
         self.assertLess(compacted_peak, raw_peak * 0.8)

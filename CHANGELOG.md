@@ -4,6 +4,71 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/)，版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [3.4.13] 目录枚举提速 28s → 2s + 修复复合意图「只列目录就作答」
+
+### 现象
+
+- `2026-11-09 11:11` 一次 `vlc小组有什么设备 怎么用`：单次 `list_group_files` 耗时 **28.2s**，
+  随后 step=2 直接 `Answer`（14s 生成）凭清单编造各设备用法，全程无 `rag_qa` / `read_file`。
+- 日志：`build_catalog_snapshot elapsed=22.942s`（142681 条目 / 22891 目录）、
+  `list_fs_entries_by_keyword elapsed=4.436s`、`find_best_matching_dirs elapsed=0.744s`。
+
+### 根因
+
+- **慢**：知识库是 CIFS 网络挂载（`actimeo=1`、`cache=strict`），`os.walk` 全盘遍历约 22s；
+  快照是**进程内**缓存且 TTL 300s 过期后**同步**重建，进程重启也全丢 → 每次冷请求都阻塞 22s。
+  另有两个匹配函数对同一份 14 万条快照各扫一遍、重复打分，未命中路径都走 `SequenceMatcher`。
+- **漏答正文**：真实 LLM 把复合意图判成 `file_list`（reason「查询设备清单」），忽略「怎么用」；
+  旧守卫 `requires_rag_after_list = (route == "hybrid")` 只认路由标签，
+  且 `route_query` 的既有纠偏要求「有内容词且**无**明确目录词」，复合问题两者都有 → 纠偏不触发。
+
+### Fixed
+
+- **复合意图通用守卫（不依赖路由标签、不针对具体小组/设备）**：
+  - 新增模块级通用词表 `CATALOG_INTENT_TERMS` / `CONTENT_INTENT_TERMS` 及
+    `question_has_content_intent` / `question_is_compound_intent`；
+  - `route_query` 纠偏：「清单意图 + 内容意图」→ `hybrid`；
+  - 编排器 `requires_rag_after_list` 与 Answer 分支改为动态判定：
+    只要已列目录且问题要求内容说明，就强制补一次正文检索；
+  - `_grounded_for_answer()`：要求内容说明的问题**不能只凭目录清单作答**；
+  - content-first 守卫覆盖复合意图，并加连续挡回上限（`AGENT_MAX_IDLE_STEPS+1`）及时诚实收敛。
+  - 词表刻意不含「有哪些/有什么/列出」等泛化疑问词，避免把「规格参数有什么区别」误判为目录问题。
+
+### Changed（提速）
+
+- **快照三级缓存**：内存新鲜 → 直接返回；内存过期 → **stale-while-revalidate**
+  （立即返回旧快照 + 守护线程后台刷新，请求不再等待 22s）；内存未命中 → 本地 gzip 磁盘快照
+  （重启免全盘遍历）；都没有才同步构建。刷新按缓存键去重，磁盘写入原子替换，失败仅记日志。
+- **单次扫描 + 严格上界剪枝**：新增 `catalog_matches` 一次遍历同时产出目录/条目匹配，
+  用 `path_match_score` 的数学上界（`token` 上界 + `SequenceMatcher.real_quick_ratio` 上界）
+  跳过不可能达阈值的路径；结果与原先两次独立扫描**逐条完全一致**（零误剪）。
+- `list_catalog_entries` 改用上述合并扫描；`find_best_matching_dirs` /
+  `list_fs_entries_by_keyword` 保持签名不变（外部与既有测试兼容）。
+
+### Added
+
+- 配置 `ENABLE_CATALOG_SNAPSHOT_DISK_CACHE`(true)、`CATALOG_SNAPSHOT_DISK_MAX_AGE`(86400)，
+  注册 `load_config` / `.env.example` / `AGENTS.md` 配置共识表。
+- 单测 `CompoundIntentGuardTests`（5 例）与 `CatalogPerformanceTests`（5 例）：
+  意图判定、路由纠偏、列目录后强制补读、纯目录不误触发、目录不算依据、
+  单次扫描等价性、上界零误剪、磁盘快照往返/过期、过期立即返回且触发后台刷新。
+
+### 验证
+
+- `list_catalog_entries("VLC小组")` 实测 **28.2s → 2.63s**（重启后首次约 2.6s，
+  内存命中约 1.9s）；gzip 快照 1.8MB、加载 0.6s，内存命中 0.000s。
+- 端到端模拟路由仍误判 `file_list`：工具链由 `["list_group_files"]` 变为
+  `["list_group_files", "rag_qa"]`，正常收敛、0 个 error 事件。
+- 全量单测 161 个，7 个预存失败（与基线一致），无新增回归；离线评测 24 场景收敛率 0.958。
+
+### 运维提示
+
+- 新增/删除语料文件后目录树会变化，快照最多滞后 `CATALOG_SNAPSHOT_TTL`(300s)；
+  如需立即生效可删除 `data/catalog_snapshot_*.json.gz` 或重启服务。
+- 这些改动纯代码/配置生效，vLLM 无需重启。
+
+---
+
 ## [3.4.12] 上下文窗口 6000 → 16384（不换模型，保留 8B 质量）
 
 ### 背景与选型

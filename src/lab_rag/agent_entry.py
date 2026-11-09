@@ -26,6 +26,8 @@ from .rag_agent import (
     rule_based_route,
     sanitize_generated_answer,
     estimate_tokens,
+    question_has_content_intent,
+    question_is_compound_intent,
 )
 from .agent_tools import (CONTENT_TOOL_NAME, dispatch_tool, render_tool_prompt_section,
                           tool_names, tool_role)
@@ -457,7 +459,12 @@ def ask_agent_stream(
     # 由模型决定目录/正文/混合路径；仅在 LLM 路由完全失败时才回退到规则路由。
     llm = build_qwen_llm()
     initial_route = route_query(llm, question, force_llm=True)
-    requires_rag_after_list = bool(initial_route and initial_route.get("route") == "hybrid")
+    # 复合意图守卫不依赖 LLM 路由标签：LLM 常把「有什么设备 怎么用」误判为纯 file_list，
+    # 因此只要问题本身同时要求清单与内容说明，列目录后就必须补读正文。
+    question_wants_content = question_has_content_intent(question)
+    requires_rag_after_list = bool(
+        (initial_route and initial_route.get("route") == "hybrid")
+        or question_is_compound_intent(question))
     # 内容型路由：进入循环后仍须先由模型调用内容工具取得正文依据，不得凭空作答
     content_intent = bool(initial_route and initial_route.get("route") == "rag_search")
 
@@ -478,9 +485,15 @@ def ask_agent_stream(
     catalog_grounded = False
 
     def _grounded_for_answer() -> bool:
-        """是否已有作答依据：正文依据，或目录型问题已获得目录枚举结果。"""
+        """是否已有作答依据：正文依据，或目录型问题已获得目录枚举结果。
+
+        问题本身要求内容说明时，仅有目录清单不足以作答（目录只回答「有哪些」），
+        必须有正文依据，避免模型凭清单编造用法。
+        """
         if content_grounded:
             return True
+        if question_wants_content:
+            return False
         if (initial_route and initial_route.get("route") == "file_list") and catalog_grounded:
             return True
         return False
@@ -511,6 +524,9 @@ def ask_agent_stream(
                     break
         max_steps = max(1, int(cfg.get("AGENT_MAX_STEPS", 6)))
         max_idle = max(0, int(cfg.get("AGENT_MAX_IDLE_STEPS", 2)))
+        # content-first 守卫连续挡回的次数上限：模型反复凭空 Answer 时及时诚实收敛，
+        # 避免把 LLM 预算全耗在无工具空转上。
+        guard_hits = 0
         llm_budget = max_steps + max_idle + 1
         observation_indices: List[int] = []
         tool_log = []
@@ -597,7 +613,19 @@ def ask_agent_stream(
             # content-first 守卫：内容型路由必须先由模型调用内容工具取得正文依据。
             # 覆盖 Answer 与不带前缀的自由文本，避免模型绕过检索凭空作答；一旦已调用过工具
             # （成功或失败），则交给后续覆盖度判定与「无依据诚实收敛」逻辑处理。
-            if content_intent and tool_calls == 0 and not content_grounded and not action:
+            if (content_intent or question_is_compound_intent(question)) and tool_calls == 0 \
+                    and not content_grounded and not action:
+                guard_hits += 1
+                if guard_hits > max_idle + 1:
+                    debug_log("[AGENT] 反复凭空作答，提前诚实收敛")
+                    final_answer = finalize_answer(
+                        _agent_fallback_answer(question, tool_log, last_observation, cfg))
+                    append_user_chat_history(username, "user", question)
+                    append_user_chat_history(username, "assistant", final_answer)
+                    yield {"type": "final", "content": final_answer,
+                           "file_result": latest_catalog_result,
+                           "agent_metrics": agent_metrics(False)}
+                    return
                 messages.append({"role": "assistant", "content": content})
                 append_observation(
                     "你尚未检索知识库正文，请先调用 rag_qa（若已通过 list_group_files 定位到具体文档也可调用 "
@@ -605,9 +633,13 @@ def ask_agent_stream(
                     "请先调用内容工具检索知识库正文，再给出 Answer。")
                 continue
 
-            # 1) 最终 Answer（hybrid 清单+内容问题必须先补读正文）
+            # 1) 最终 Answer（清单+内容说明的复合问题必须先补读正文）
+            # 动态守卫：只要已列目录且问题要求内容说明，不论 LLM 路由判成什么，
+            # 都强制补一次正文检索，避免「搜一轮 file 就直接 answer」凭清单编造用法。
             if "Answer:" in content:
-                if requires_rag_after_list and used_list_tool and not used_rag_after_list \
+                need_read_after_list = (
+                    requires_rag_after_list or (used_list_tool and question_wants_content))
+                if need_read_after_list and used_list_tool and not used_rag_after_list \
                         and (CONTENT_TOOL_NAME, question) not in seen_actions:
                     messages.append({"role": "assistant", "content": content})
                     result = dispatch_tool(CONTENT_TOOL_NAME, question, username,

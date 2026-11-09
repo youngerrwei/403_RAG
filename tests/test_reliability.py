@@ -1,5 +1,6 @@
 import ast
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1056,6 +1057,90 @@ class RagPipelineQualityTests(unittest.TestCase):
         table = "| 参数 | 单位 |\n| --- | --- |\n| 功率 | dBm |\n" + "补充说明" * 100
         truncated = rag_agent._truncate_at_boundary(table, 100)
         self.assertTrue(truncated.startswith("| 参数 | 单位 |"))
+
+
+class CatalogPerformanceTests(unittest.TestCase):
+    """目录树枚举提速回归：单次扫描等价性、严格剪枝零误剪、磁盘快照、后台刷新。"""
+
+    def setUp(self):
+        import hashlib
+        from lab_rag import rag_agent as ra
+        self.ra = ra
+        self.root = tempfile.mkdtemp(prefix="catalog_perf_")
+        for grp in ("VLC小组", "A2X小组"):
+            for dev in ("Agilent MSO-X 3054A 示波器", "Keysight EDU36311A 电源"):
+                d = Path(self.root) / "设备操作指南" / grp / dev / "Manuals"
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "Manual.md").write_text("x", encoding="utf-8")
+        for i in range(30):
+            (Path(self.root) / "组会资料" / f"2023010{i}期末组会" / "总结.md").parent.mkdir(
+                parents=True, exist_ok=True)
+            (Path(self.root) / "组会资料" / f"2023010{i}期末组会" / "总结.md").write_text(
+                "中文内容设备参数说明手册" * 3, encoding="utf-8")
+        self.snap = ra._build_catalog_snapshot(self.root, True, cfg={})
+        self.key = hashlib.md5(f"{self.root}|1|True".encode()).hexdigest()
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+        p = self.ra._catalog_disk_cache_path(self.key)
+        if p.exists():
+            p.unlink()
+
+    def test_single_scan_equals_two_independent_scans(self):
+        ra = self.ra
+        for kw in ("VLC小组", "Manuals", "MSO-X 3054A", "组会资料"):
+            with self.subTest(keyword=kw):
+                dirs_old = ra.find_best_matching_dirs(
+                    kw, self.root, limit=10, snapshot=self.snap, cfg={})
+                items_old = ra.list_fs_entries_by_keyword(
+                    kw, root_dir=self.root, limit=200, snapshot=self.snap, cfg={})
+                dirs_new, items_new = ra.catalog_matches(kw, self.snap, 10, 200)
+                self.assertEqual(dirs_old, dirs_new)
+                self.assertEqual(items_old, items_new)
+
+    def test_upper_bound_never_prunes_a_real_match(self):
+        ra = self.ra
+        q = ra.path_to_unix("VLC小组").lower().strip()
+        qtok = ra.normalize_query_tokens(q)
+        for _kind, _name, rel_path in self.snap:
+            c = ra.path_to_unix(rel_path).lower().strip()
+            base = c.rsplit("/", 1)[-1]
+            ub = ra._path_score_upper_bound(q, c, qtok, base)
+            real = ra.path_match_score("VLC小组", rel_path)
+            self.assertGreaterEqual(ub, real - 1e-9)
+
+    def test_disk_snapshot_roundtrip(self):
+        import time
+        ra = self.ra
+        ra._save_disk_catalog_snapshot(self.key, self.snap, time.time())
+        loaded = ra._load_disk_catalog_snapshot(self.key, 86400)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded[0], self.snap)
+        # 键不匹配必须拒绝，避免不同根目录/版本串用旧缓存
+        self.assertIsNone(ra._load_disk_catalog_snapshot("other-key", 86400))
+
+    def test_disk_snapshot_respects_max_age(self):
+        import time
+        ra = self.ra
+        ra._save_disk_catalog_snapshot(self.key, self.snap, time.time() - 100000)
+        self.assertIsNone(ra._load_disk_catalog_snapshot(self.key, 3600))
+
+    def test_stale_snapshot_returned_immediately_with_refresh(self):
+        """过期快照应立即返回旧值（不阻塞请求），并触发一次后台刷新。"""
+        import time
+        ra = self.ra
+        cfg = {"ENABLE_CATALOG_SNAPSHOT_CACHE": True,
+               "ENABLE_CATALOG_SNAPSHOT_DISK_CACHE": False,
+               "CATALOG_SNAPSHOT_TTL": 1,
+               "CATALOG_EXCLUDE_HIDDEN_DIRS": True,
+               "RETRIEVAL_INDEX_VERSION": "1"}
+        key = self.key
+        ra._catalog_snapshot_cache.set(key, (time.time() - 10, self.snap))
+        ra._catalog_refreshing.clear()
+        with patch.object(ra, "_schedule_catalog_refresh") as mock_refresh:
+            got = ra._get_catalog_snapshot(self.root, cfg)
+        self.assertEqual(got, self.snap)
+        mock_refresh.assert_called_once()
 
 
 class RetrievalOptimizationTests(unittest.TestCase):

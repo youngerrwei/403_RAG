@@ -4,6 +4,7 @@
 跨小组分别检索、目录未命中、正文答非所问、重复调用空转、步数预算耗尽。
 """
 
+import json
 import os
 import unittest
 from unittest.mock import Mock, patch
@@ -724,6 +725,79 @@ class EnlargedWindowTests(unittest.TestCase):
         self.assertFalse([e for e in events if e["type"] == "error"])
         self.assertEqual([e["tool"] for e in events if e["type"] == "step_tool"],
                          ["list_group_files", "rag_qa"])
+
+
+class CompoundIntentGuardTests(unittest.TestCase):
+    """复现「vlc小组有什么设备 怎么用」只列一轮目录就 Answer 的漏判。
+
+    根因：LLM 路由把复合意图判成 file_list，而旧守卫仅在 route==hybrid 时
+    强制「列目录后补读正文」。修复后守卫不依赖路由标签。
+    """
+
+    def test_intent_terms_classify_compound_and_pure(self):
+        self.assertTrue(ra.question_has_content_intent("vlc小组有什么设备 怎么用"))
+        self.assertTrue(ra.question_is_compound_intent("vlc小组有什么设备 怎么用"))
+        self.assertFalse(ra.question_has_content_intent("vlc小组有什么设备"))
+        self.assertFalse(ra.question_is_compound_intent("vlc小组有什么设备"))
+        self.assertTrue(ra.question_has_content_intent("周报格式是什么"))
+        self.assertFalse(ra.question_is_compound_intent("周报格式是什么"))
+
+    def test_route_query_corrects_file_list_to_hybrid(self):
+        """LLM 误判 file_list 时，通用纠偏应改为 hybrid。"""
+        from types import SimpleNamespace
+        # route_query 内部用 (prompt | llm).invoke(...)，需 mock 管道而非 llm.invoke
+        class _FakePrompt:
+            def __or__(self, _other):
+                return Mock(invoke=Mock(return_value=SimpleNamespace(content=json.dumps(
+                    {"route": "file_list", "target": "vlc小组", "reason": "查询设备清单"}))))
+
+        with patch.object(ra.ChatPromptTemplate, "from_template", return_value=_FakePrompt()):
+            out = ra.route_query(Mock(), "vlc小组有什么设备 怎么用", force_llm=True)
+            out2 = ra.route_query(Mock(), "vlc小组有什么设备", force_llm=True)
+        self.assertEqual(out["route"], "hybrid")
+        # 纯清单问题不受影响
+        self.assertEqual(out2["route"], "file_list")
+
+    def test_list_then_answer_forces_content_read_even_on_file_list_route(self):
+        """即使路由仍是 file_list，列目录后想直接 Answer 也必须补读正文。"""
+        outputs = [
+            'Thought: 列设备\nAction: list_group_files["VLC小组"]',
+            'Answer: 根据知识库内容可概括为：设备清单与使用方法',
+            'Answer: 根据知识库内容可概括为：设备清单与使用方法（已补读正文）',
+        ]
+        events, llm, rag, catalog = _drive(
+            outputs, "vlc小组有什么设备 怎么用", route="file_list")
+        tools = [e["tool"] for e in events if e["type"] == "step_tool"]
+        self.assertIn("list_group_files", tools)
+        self.assertIn("rag_qa", tools, "复合意图列目录后必须强制补读正文")
+        final = events[-1]
+        self.assertEqual(final["type"], "final")
+        self.assertTrue(final["agent_metrics"]["converged"])
+        self.assertTrue(final["agent_metrics"]["content_grounded"])
+
+    def test_pure_listing_does_not_force_content_read(self):
+        """纯目录问题不应被强制补读，避免无谓检索拖慢响应。"""
+        outputs = [
+            'Thought: 列设备\nAction: list_group_files["VLC小组"]',
+            'Answer: 设备清单如下',
+        ]
+        events, llm, rag, catalog = _drive(
+            outputs, "vlc小组有什么设备", route="file_list")
+        tools = [e["tool"] for e in events if e["type"] == "step_tool"]
+        self.assertEqual(tools, ["list_group_files"])
+        self.assertTrue(events[-1]["agent_metrics"]["converged"])
+
+    def test_catalog_only_never_counts_as_grounded_for_content_question(self):
+        """问题要求用法时，仅有目录清单不能作为作答依据（诚实收敛）。"""
+        outputs = ['Answer: 根据知识库内容可概括为：用法'] * 6
+        events, llm, rag, catalog = _drive(
+            outputs, "vlc小组有什么设备 怎么用", route="file_list")
+        final = events[-1]
+        self.assertEqual(final["type"], "final")
+        self.assertFalse(final["agent_metrics"]["content_grounded"])
+        self.assertFalse(final["agent_metrics"]["converged"])
+        # 守卫应在空转上限内提前收敛，不应耗尽全部 LLM 预算
+        self.assertLessEqual(final["agent_metrics"]["llm_calls"], 4)
 
 
 if __name__ == "__main__":
